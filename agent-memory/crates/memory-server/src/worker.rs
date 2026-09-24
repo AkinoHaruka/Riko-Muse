@@ -334,6 +334,86 @@ mod tests {
     }
 
     #[test]
+    fn forget_gate_v2_requires_target_quote_in_user_message() {
+        // doc2 卡 V2-4（G-13）：target_quote 必须在用户最新消息正文里，
+        // "忘记那个"+已知 ID 不能删未被明确指认的记忆。
+        let (store, scope) = setup("forgetgate");
+        let mut g = store.lock().unwrap();
+        let ev1 = ingest_user(&mut g, &scope, 1, "我喜欢Rust");
+        let o = memory_domain::Origin {
+            host_id: "dsh".into(),
+            agent_id: "agent-a".into(),
+            session_id: "s1".into(),
+        };
+        let created = g
+            .remember(&scope, &o, &ev1, "我喜欢Rust", memory_domain::MemoryKind::Preference)
+            .unwrap();
+        let memory_id = match created {
+            memory_store_sqlite::RememberOutcome::Created { memory_id, .. } => memory_id,
+            other => panic!("应创建: {:?}", matches!(other, memory_store_sqlite::RememberOutcome::Created { .. })),
+        };
+
+        // 1. 泛称"忘记那个"+已知 ID + target_quote 不在消息正文 → AmbiguousTarget。
+        let t = chrono::Utc::now();
+        let ev2 = g
+            .record_evidence(&scope, &o, 2, "user", "user", &t, "忘记那个")
+            .unwrap();
+        let evid2 = match ev2 {
+            memory_store_sqlite::IngestOutcome::Recorded(id) => id,
+            _ => panic!(),
+        };
+        let r = g.forget_memory(
+            &scope,
+            &memory_id,
+            &memory_store_sqlite::ForgetRequest {
+                expected_version: 1,
+                origin: o.clone(),
+                user_evidence_id: evid2.clone(),
+                target_quote: "我喜欢Rust".into(),
+            },
+        );
+        assert!(matches!(r, Err(memory_store_sqlite::StoreError::AmbiguousTarget)), "泛称拒绝");
+
+        // 2. 空 target_quote → 拒绝。
+        let r2 = g.forget_memory(
+            &scope,
+            &memory_id,
+            &memory_store_sqlite::ForgetRequest {
+                expected_version: 1,
+                origin: o.clone(),
+                user_evidence_id: evid2.clone(),
+                target_quote: "  ".into(),
+            },
+        );
+        assert!(matches!(r2, Err(memory_store_sqlite::StoreError::AmbiguousTarget)));
+
+        // 3. 明确消息"忘记我喜欢Rust" → 通过，立即不可见。
+        let t2 = chrono::Utc::now();
+        let ev3 = g
+            .record_evidence(&scope, &o, 3, "user", "user", &t2, "忘记我喜欢Rust，不要再记得")
+            .unwrap();
+        let evid3 = match ev3 {
+            memory_store_sqlite::IngestOutcome::Recorded(id) => id,
+            _ => panic!(),
+        };
+        let fout = g
+            .forget_memory(
+                &scope,
+                &memory_id,
+                &memory_store_sqlite::ForgetRequest {
+                    expected_version: 1,
+                    origin: o.clone(),
+                    user_evidence_id: evid3,
+                    target_quote: "我喜欢Rust".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(fout.version, 2);
+        let (hits, _) = g.search_memories(&scope, "Rust", 5, false).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
     fn fail_job_retries_then_dead() {
         let (store, scope) = setup("retry");
         let mut g = store.lock().unwrap();

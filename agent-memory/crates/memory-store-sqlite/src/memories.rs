@@ -730,6 +730,11 @@ impl Store {
         if !has_forget_cue(&content) {
             return Err(StoreError::AmbiguousTarget);
         }
+        // G-13（doc2/04 §3）：target_quote 必须同时定位到用户最新消息正文与目标 claim，
+        // 否则带 ID + 泛称"忘记"可能误删未被用户明确指认的记忆。
+        if req.target_quote.trim().is_empty() || find_quote_span(&content, &req.target_quote).is_none() {
+            return Err(StoreError::AmbiguousTarget);
+        }
         if find_quote_span(&claim, &req.target_quote).is_none() {
             return Err(StoreError::AmbiguousTarget);
         }
