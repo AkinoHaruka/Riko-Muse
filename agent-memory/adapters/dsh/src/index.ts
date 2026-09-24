@@ -1,37 +1,83 @@
 /**
- * DSH 薄适配器骨架（卡 0/卡 2 交付范围见 doc/15）。
+ * DSH 薄适配器装配（doc/14）。
  *
- * 职责边界（doc/03、doc/14）：
- * - 从宿主取得可信身份、会话事件与 Agent 生命周期；
- * - 将协议请求交给 Rust 内核；把返回的上下文接到 DSH；
- * - 不直接打开 SQLite；不改变用户作用域；旧 riko-memory 插件的作用域逻辑不复用。
+ * 职责边界：从宿主取得可信身份/会话事件/Agent 生命周期 → 协议请求交 Rust 内核 →
+ * 把上下文接到 DSH。不直接打开 SQLite；不复用旧 riko-memory 的 ownerNamespace+preset 作用域。
  *
- * 接线项（session/event、agent/pre-step、defineTool ×5、spool）在卡 2/卡 3
- * 按目标 DSH 版本的实际 Hook 类型填充；本文件只固定配置加载与协议版本握手。
+ * 宿主 glue（Hook 注册、createUserMessage、defineTool 包装）由目标 DSH 版本的装载层注入，
+ * 本包只依赖公开协议，便于独立 typecheck 与单元测试。
  */
-import { loadConfig } from "./config.js";
+import { MemoryClient } from "./client.js";
+import type { Config } from "./config.js";
+import { EventPipeline, type HostSessionEvent, type Logger } from "./events.js";
+import { makeComposeHook } from "./recall.js";
+import { Spool } from "./spool.js";
+import { registerMemoryTools, type ToolHost } from "./tools.js";
 
-export interface AdapterContext {
-  config: ReturnType<typeof loadConfig>;
-  /** 从令牌文件读取的 Bearer token；只在内存中短暂持有。 */
-  token: string;
+export interface HostGlue {
+  logger: Logger;
+  /** ctx.on('session/event', cb) */
+  onSessionEvent(cb: (session: unknown, event: HostSessionEvent) => void): void;
+  /** ctx.on('agent/pre-step', cb) */
+  onPreStep(cb: (args: { agent: { id: unknown }; messages: readonly unknown[]; signal: { aborted: boolean } }, next: () => Promise<never>) => Promise<unknown>): void;
+  createUserMessage(opts: {
+    content: { type: "text"; text: string }[];
+    source: { kind: string; plugin: string; form: string };
+  }): unknown;
+  toolHost: ToolHost;
 }
 
-export async function handshake(baseUrl: string, token: string): Promise<void> {
-  const res = await fetch(`${baseUrl}/v1/version`, {
-    headers: { authorization: `Bearer ${token}` },
+export interface Adapter {
+  dispose(): void;
+}
+
+export async function createAdapter(config: Config, glue: HostGlue): Promise<Adapter> {
+  // 启动校验（doc/14 §1）：令牌文件存在、URL 为 loopback、协议版本兼容、spool 可写。
+  const token = readTokenFile(config.userTokenFile);
+  const url = new URL(config.memoryUrl);
+  if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost" && url.hostname !== "::1") {
+    throw new Error(`memoryUrl=${config.memoryUrl} 不是 loopback；首版不允许远端内核`);
+  }
+  const client = new MemoryClient({
+    baseUrl: config.memoryUrl,
+    token,
+    writeTimeoutMs: 3000,
+    composeTimeoutMs: config.requestTimeoutMs,
   });
-  if (!res.ok) {
-    throw new Error(`memoryd /v1/version 返回 ${res.status}；请检查令牌与内核状态`);
+  const version = await client.version();
+  if (version.status !== 200) {
+    throw new Error(`memoryd /v1/version 返回 ${version.status}；请检查内核是否运行`);
   }
-  const body = (await res.json()) as { protocol_version?: number };
-  if (body.protocol_version !== 1) {
-    throw new Error(`协议版本不兼容：内核=${body.protocol_version ?? "unknown"}，适配器=1`);
+  const protocol = (version.body as { protocol_version?: number }).protocol_version;
+  if (protocol !== 1) {
+    throw new Error(`协议版本不兼容：内核=${protocol ?? "unknown"}，适配器=1`);
   }
+
+  const spool = new Spool(config.spoolDir);
+  const pipeline = new EventPipeline(spool, client, glue.logger, "dsh");
+  await pipeline.replayPending(); // 重启重放未 ack 操作（doc/14 §3）
+
+  let agentId = "unknown-agent";
+  glue.onSessionEvent((session, event) => {
+    const sessionId = glue.toolHost.sessionId(session);
+    glue.toolHost.latestUserText(session); // 保持宿主消息通道活跃（部分宿主惰性构造）
+    pipeline.observeSessionEvent(sessionId, event, agentId);
+  });
+  glue.onPreStep(makeComposeHook(client, glue, glue.logger, config.requestTimeoutMs) as never);
+  if (config.captureEnabled) {
+    registerMemoryTools(glue.toolHost, client, pipeline, glue.logger);
+  }
+
+  return {
+    dispose() {
+      pipeline.dispose();
+    },
+  };
 }
 
-export function createAdapter(rawConfig: Parameters<typeof loadConfig>[0]): AdapterContext {
-  const config = loadConfig(rawConfig);
-  // TODO(卡 2)：读取 userTokenFile → token；校验 loopback；核对 /v1/version；装载 Hook。
-  return { config, token: "" };
+function readTokenFile(path: string): string {
+  const { readFileSync } = require("node:fs") as typeof import("node:fs");
+  const token = readFileSync(path, "utf8").trim();
+  if (!token) throw new Error(`令牌文件为空: ${path}`);
+  return token;
 }
