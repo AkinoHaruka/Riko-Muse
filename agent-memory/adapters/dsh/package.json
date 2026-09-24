@@ -1,15 +1,36 @@
 {
   "name": "@agent-memory/dsh-adapter",
-  "version": "0.1.0",
-  "description": "Agent Memory 内核的 DSH 薄适配器（doc/14）",
+  "version": "0.2.0",
+  "description": "Agent Memory 内核的 DSH 宿主适配器（doc2/01-05，官方 deepseek-harness@477b4f4 形状）",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit"
   },
   "license": "Apache-2.0",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^0.1.7-rc.2",
+    "@deepseek-ai/dsh-agent": "^0.1.7-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.1.7-rc.2",
+    "@deepseek-ai/dsh-session": "^0.1.7-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.7-rc.2"
+  },
   "devDependencies": {
+    "@deepseek-ai/cordis": "file:../../../deepseek-harness/vendor/cordis",
+    "@deepseek-ai/dsh-agent": "file:../../../deepseek-harness/packages/core/agent",
+    "@deepseek-ai/dsh-llm": "file:../../../deepseek-harness/packages/llm/llm",
+    "@deepseek-ai/dsh-session": "file:../../../deepseek-harness/packages/core/session",
+    "@deepseek-ai/dsh-tools": "file:../../../deepseek-harness/packages/core/tools",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
   }

@@ -1,83 +1,160 @@
 /**
- * DSH 薄适配器装配（doc/14）。
+ * DSH 宿主插件入口（doc2/02，官方 Cordis 形状已核对 @477b4f4）。
  *
- * 职责边界：从宿主取得可信身份/会话事件/Agent 生命周期 → 协议请求交 Rust 内核 →
- * 把上下文接到 DSH。不直接打开 SQLite；不复用旧 riko-memory 的 ownerNamespace+preset 作用域。
- *
- * 宿主 glue（Hook 注册、createUserMessage、defineTool 包装）由目标 DSH 版本的装载层注入，
- * 本包只依赖公开协议，便于独立 typecheck 与单元测试。
+ * - 导出 name / inject / apply(ctx, config)：由官方 profile + --patch 装载。
+ * - token 用 ESM import 读取，只保存在进程内；日志不输出 token/hash/正文/密钥。
+ * - captureEnabled 只控 L0 捕获；injectionEnabled 只控注入；toolsEnabled 只控工具注册。
+ * - 卸载经 ctx.effect：停止接收 → 真实等待在途链 ≤5s → 释放句柄；未 ack spool 保留。
+ * - daemon 离线仍捕获落 spool；恢复后先核 protocol_version=1 再按序发送。
  */
+import { readFileSync } from "node:fs";
+import type { Context } from "@deepseek-ai/cordis";
+import type { Session, SessionEvent, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
+import type { PreStepPayload } from "./recall.js";
 import { MemoryClient } from "./client.js";
-import type { Config } from "./config.js";
-import { EventPipeline, type HostSessionEvent, type Logger } from "./events.js";
-import { makeComposeHook } from "./recall.js";
+import { loadConfig, type AdapterConfig } from "./config.js";
+import { EventPipeline, type GapChecker, type Logger } from "./events.js";
+import { makePreStepHook } from "./recall.js";
 import { Spool } from "./spool.js";
-import { registerMemoryTools, type ToolHost } from "./tools.js";
+import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
-export interface HostGlue {
-  logger: Logger;
-  /** ctx.on('session/event', cb) */
-  onSessionEvent(cb: (session: unknown, event: HostSessionEvent) => void): void;
-  /** ctx.on('agent/pre-step', cb) */
-  onPreStep(cb: (args: { agent: { id: unknown }; messages: readonly unknown[]; signal: { aborted: boolean } }, next: () => Promise<never>) => Promise<unknown>): void;
-  createUserMessage(opts: {
-    content: { type: "text"; text: string }[];
-    source: { kind: string; plugin: string; form: string };
-  }): unknown;
-  toolHost: ToolHost;
+export const name = "agent-memory";
+export const inject = ["tools"];
+
+// Cordis 插件配置（doc2/02 §3 字段见 config.ts；装载时非法即抛错拒绝加载）。
+export type Config = Record<string, unknown>;
+
+interface SessionQueryLike {
+  readEvent(request: { sessionId: SessionId; seq: SessionSeq }): Promise<{ target: SessionEvent }>;
 }
 
-export interface Adapter {
-  dispose(): void;
-}
-
-export async function createAdapter(config: Config, glue: HostGlue): Promise<Adapter> {
-  // 启动校验（doc/14 §1）：令牌文件存在、URL 为 loopback、协议版本兼容、spool 可写。
-  const token = readTokenFile(config.userTokenFile);
-  const url = new URL(config.memoryUrl);
-  if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost" && url.hostname !== "::1") {
-    throw new Error(`memoryUrl=${config.memoryUrl} 不是 loopback；首版不允许远端内核`);
-  }
-  const client = new MemoryClient({
-    baseUrl: config.memoryUrl,
-    token,
-    writeTimeoutMs: 3000,
-    composeTimeoutMs: config.requestTimeoutMs,
-  });
-  const version = await client.version();
-  if (version.status !== 200) {
-    throw new Error(`memoryd /v1/version 返回 ${version.status}；请检查内核是否运行`);
-  }
-  const protocol = (version.body as { protocol_version?: number }).protocol_version;
-  if (protocol !== 1) {
-    throw new Error(`协议版本不兼容：内核=${protocol ?? "unknown"}，适配器=1`);
-  }
-
-  const spool = new Spool(config.spoolDir);
-  const pipeline = new EventPipeline(spool, client, glue.logger, "dsh");
-  await pipeline.replayPending(); // 重启重放未 ack 操作（doc/14 §3）
-
-  let agentId = "unknown-agent";
-  glue.onSessionEvent((session, event) => {
-    const sessionId = glue.toolHost.sessionId(session);
-    glue.toolHost.latestUserText(session); // 保持宿主消息通道活跃（部分宿主惰性构造）
-    pipeline.observeSessionEvent(sessionId, event, agentId);
-  });
-  glue.onPreStep(makeComposeHook(client, glue, glue.logger, config.requestTimeoutMs) as never);
-  if (config.captureEnabled) {
-    registerMemoryTools(glue.toolHost, client, pipeline, glue.logger);
-  }
-
+function makeLogger(ctx: Context): Logger {
+  const anyCtx = ctx as { logger?: { warn(m: string): void; error(m: string): void; info(m: string): void } };
+  const l = anyCtx.logger;
   return {
-    dispose() {
-      pipeline.dispose();
-    },
+    warn: (m) => l?.warn(m),
+    error: (m) => l?.error(m),
+    info: (m) => l?.info(m),
   };
 }
 
-function readTokenFile(path: string): string {
-  const { readFileSync } = require("node:fs") as typeof import("node:fs");
+function readToken(path: string): string {
+  // ESM import（G-02 修复）：禁止裸 require。
   const token = readFileSync(path, "utf8").trim();
-  if (!token) throw new Error(`令牌文件为空: ${path}`);
+  if (!token) throw new Error(`agent-memory: 令牌文件为空: ${path}`);
   return token;
 }
+
+class AgentMemoryPlugin {
+  private readonly cfg: AdapterConfig;
+  private readonly logger: Logger;
+  private readonly client: MemoryClient;
+  private readonly spool: Spool;
+  private readonly pipeline: EventPipeline;
+  private disposed = false;
+
+  constructor(
+    private readonly ctx: Context,
+    rawConfig: Config,
+  ) {
+    this.cfg = loadConfig(rawConfig);
+    this.logger = makeLogger(ctx);
+    const token = readToken(this.cfg.userTokenFile);
+    this.client = new MemoryClient({
+      baseUrl: this.cfg.memoryUrl,
+      token,
+      writeTimeoutMs: this.cfg.writeTimeoutMs,
+      composeTimeoutMs: this.cfg.composeTimeoutMs,
+    });
+    this.spool = new Spool(this.cfg.spoolDir, this.cfg.spoolLimitBytes);
+    this.pipeline = new EventPipeline(
+      this.spool,
+      this.client,
+      this.logger,
+      this.cfg.hostId,
+      this.cfg.captureEnabled,
+    );
+  }
+
+  async start(): Promise<void> {
+    const gapChecker = this.resolveGapChecker();
+    await this.pipeline.start(gapChecker);
+
+    if (this.cfg.captureEnabled) {
+      // session/event 是提交后的同步受保护通知；回调只做有界入队（doc2/03 §2）。
+      this.ctx.on("session/event" as never, ((session: Session, event: SessionEvent) => {
+        this.pipeline.observeSessionEvent(String(session.id), event);
+      }) as never);
+    }
+
+    if (this.cfg.injectionEnabled) {
+      const hook = makePreStepHook(this.client, this.logger, this.cfg.composeTimeoutMs);
+      this.ctx.on("agent/pre-step" as never, (async (payload: PreStepPayload, next: () => Promise<never>) => {
+        return hook(payload, next);
+      }) as never);
+    }
+
+    if (this.cfg.toolsEnabled) {
+      const tools = buildMemoryTools({
+        client: this.client,
+        pipeline: this.pipeline,
+        logger: this.logger,
+        hostId: this.cfg.hostId,
+        writeTimeoutMs: this.cfg.writeTimeoutMs,
+      });
+      const registry = (this.ctx as { tools: { register(def: unknown): () => void } }).tools;
+      for (const tool of tools) {
+        registry.register(tool);
+      }
+    }
+
+    this.logger.info?.(
+      `agent-memory: 已加载 capture=${this.cfg.captureEnabled} injection=${this.cfg.injectionEnabled} tools=${this.cfg.toolsEnabled}`,
+    );
+  }
+
+  /** 官方异步定点读取：已知 session 的缺口对账用（doc2/03 §2 恢复边界）。 */
+  private resolveGapChecker(): GapChecker | undefined {
+    const anyCtx = this.ctx as { get?: (key: string) => unknown };
+    const sessionQuery = anyCtx.get?.("sessionQuery") as SessionQueryLike | undefined;
+    if (!sessionQuery || typeof sessionQuery.readEvent !== "function") return undefined;
+    return {
+      readEvent: async (sessionId: string, seq: number) => {
+        try {
+          const window = await sessionQuery.readEvent({ sessionId: sessionId as SessionId, seq: seq as SessionSeq });
+          return window.target;
+        } catch {
+          return undefined;
+        }
+      },
+    };
+  }
+
+  /** 真实收尾：等待在途发送链最多 5 秒，保留未 ack spool，释放文件句柄。 */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    await this.pipeline.dispose();
+    this.spool.dispose();
+  }
+}
+
+/** Cordis 插件入口：apply 必须同步完成装载契约，异步启动错误要可见。 */
+export function apply(ctx: Context, config: Config = {}): void {
+  const plugin = new AgentMemoryPlugin(ctx, config);
+  // ctx.effect：卸载时由宿主回收；dispose 返回 Promise，由 Cordis 等待真实收尾。
+  (ctx as { effect: (register: () => (() => void) | Promise<void>) => void }).effect(() => () => {
+    void plugin.dispose().catch((e: unknown) => {
+      // 收尾失败只记录：未 ack spool 已保留，不影响 DSH。
+      const anyCtx = ctx as { logger?: { error(m: string): void } };
+      anyCtx.logger?.error(`agent-memory: 卸载收尾异常: ${String(e)}`);
+    });
+  });
+  plugin.start().catch((e: unknown) => {
+    const anyCtx = ctx as { logger?: { error(m: string): void } };
+    anyCtx.logger?.error(`agent-memory: 启动失败: ${e instanceof Error ? e.message : String(e)}`);
+    throw e;
+  });
+}
+
+export type { AgentLike, ToolExecLike };
