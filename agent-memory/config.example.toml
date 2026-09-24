@@ -1,14 +1,14 @@
-# memoryd 非秘密配置示例。令牌与模型密钥严禁写入本文件（doc/09）。
-# 令牌由 `memoryd principal add` 生成到独立秘密文件；模型密钥从单独秘密文件读取。
+# memoryd 非秘密配置示例（doc/09）。令牌与模型密钥严禁写入本文件。
 
 listen_addr = "127.0.0.1:8791"
 db_path = "data/agent-memory.db"
 migrations_dir = "migrations"
 
-# ---- 以下键为首版已定义的非秘密默认项，serve 暂不强制要求 ----
-# spool_dir = "data/spool"
-# spool_limit_mb = 100
-# model_endpoint = "http://127.0.0.1:11434/v1"   # OpenAI 兼容端点（卡 4）
+# ---- 提取模型（OpenAI 兼容端点；未配置则不启动提取 worker，手工记忆与搜索仍可用）----
+# model_endpoint = "http://127.0.0.1:11434/v1/chat/completions"
 # model_name = "qwen2.5:7b"
-# model_request_timeout_secs = 30
+# model_key_file = "secrets/model.key"   # 文件内容为一行密钥；密钥不进配置、不进日志、不进 Prompt
+
+# ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500
+# spool_limit_mb = 100
