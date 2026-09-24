@@ -1,0 +1,19 @@
+# 三个上游参考仓库：各自是独立 git 仓库，只读参考，不做嵌套跟踪
+EverOS/
+hindsight/
+tencentdb-agent-memory/
+
+# WorkBuddy 项目数据（非临时缓存，但不应进入本项目 git）
+.workbuddy/
+
+# 构建产物
+target/
+dist/
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+
+# 本地密钥与令牌文件（严禁入库）
+*.token
+secrets/
