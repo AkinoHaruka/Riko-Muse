@@ -64,6 +64,18 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// 从 active 规范表重建 FTS/grams（不复活 forgotten）
+    RebuildIndex {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// SQLite 在线一致性备份（VACUUM INTO）
+    Backup {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -177,6 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/memories/remember", post(remember_memory))
                 .route("/v1/memories/search", post(search_memories))
                 .route("/v1/memories/{memory_id}", get(get_memory))
+                .route("/v1/memories/{memory_id}/correct", post(correct_memory))
+                .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/context/compose", post(compose_context))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
@@ -203,6 +217,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cfg = Config::load(&config)?;
             let store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
             println!("{}", store.doctor_summary()?);
+            Ok(())
+        }
+        Commands::RebuildIndex { config } => {
+            let cfg = Config::load(&config)?;
+            let mut store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
+            let (fts, grams) = store.rebuild_index()?;
+            println!("rebuild-index 完成：fts_rows={fts} grams_rows_deleted={grams}");
+            Ok(())
+        }
+        Commands::Backup { config, out } => {
+            let cfg = Config::load(&config)?;
+            let mut store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
+            store.backup_to(&out)?;
+            println!("备份完成：{}", out.display());
             Ok(())
         }
     }
@@ -710,6 +738,115 @@ async fn retry_job(
     match state.store.lock().unwrap().retry_dead_job(&scope, &job_id) {
         Ok(true) => Json(serde_json::json!({ "request_id": req_id.0, "job_id": job_id, "status": "queued" })).into_response(),
         Ok(false) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "仅 dead 状态作业可重试"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- POST /v1/memories/{id}/correct 与 /forget（doc/12 §6）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorrectRequestBody {
+    expected_version: i64,
+    origin: OriginDto,
+    user_evidence_id: String,
+    old_quote: String,
+    replacement_quote: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgetRequestBody {
+    expected_version: i64,
+    origin: OriginDto,
+    user_evidence_id: String,
+    target_quote: String,
+}
+
+async fn correct_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(memory_id): AxumPath<String>,
+    body: Result<Json<CorrectRequestBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let origin = match validate_origin(body.origin) {
+        Ok(o) => o,
+        Err((_c, m)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, m),
+    };
+    let req = memory_store_sqlite::CorrectRequest {
+        expected_version: body.expected_version,
+        origin,
+        user_evidence_id: body.user_evidence_id,
+        old_quote: body.old_quote,
+        replacement_quote: body.replacement_quote,
+    };
+    match state.store.lock().unwrap().correct_memory(&scope, &memory_id, &req) {
+        Ok(out) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "old_memory_id": out.old_memory_id,
+            "new_memory_id": out.new_memory_id,
+            "old_version": out.old_version,
+            "new_version": out.new_version
+        }))
+        .into_response(),
+        Err(StoreError::MemoryNotFound) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "记忆不存在或非 active"),
+        Err(StoreError::VersionConflict) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::VersionConflict, "版本冲突，请重读当前版本"),
+        Err(StoreError::StaleUserEvidence) | Err(StoreError::EvidenceNotFound) => {
+            err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件")
+        }
+        Err(StoreError::QuoteMismatch) => err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::QuoteMismatch, "最新用户消息缺少替代原文"),
+        Err(StoreError::AmbiguousTarget) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::AmbiguousTarget, "目标含糊，请用户更明确表达"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn forget_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(memory_id): AxumPath<String>,
+    body: Result<Json<ForgetRequestBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let origin = match validate_origin(body.origin) {
+        Ok(o) => o,
+        Err((_c, m)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, m),
+    };
+    let req = memory_store_sqlite::ForgetRequest {
+        expected_version: body.expected_version,
+        origin,
+        user_evidence_id: body.user_evidence_id,
+        target_quote: body.target_quote,
+    };
+    match state.store.lock().unwrap().forget_memory(&scope, &memory_id, &req) {
+        Ok(out) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "memory_id": out.memory_id,
+            "status": "forgotten",
+            "version": out.version,
+            "raw_evidence_retained": true
+        }))
+        .into_response(),
+        Err(StoreError::MemoryNotFound) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "记忆不存在"),
+        Err(StoreError::VersionConflict) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::VersionConflict, "版本冲突，请重读当前版本"),
+        Err(StoreError::StaleUserEvidence) | Err(StoreError::EvidenceNotFound) => {
+            err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件")
+        }
+        Err(StoreError::AmbiguousTarget) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::AmbiguousTarget, "含糊请求：需明确遗忘动词与目标原话"),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }

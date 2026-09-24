@@ -50,6 +50,43 @@ pub struct ComposeResult {
     pub index_degraded: bool,
 }
 
+/// POST /v1/memories/{id}/correct 请求（doc/12 §6）。
+pub struct CorrectRequest {
+    pub expected_version: i64,
+    pub origin: Origin,
+    pub user_evidence_id: String,
+    pub old_quote: String,
+    pub replacement_quote: String,
+}
+
+pub struct CorrectOutcome {
+    pub old_memory_id: String,
+    pub old_version: i64,
+    pub new_memory_id: String,
+    pub new_version: i64,
+}
+
+/// POST /v1/memories/{id}/forget 请求（doc/12 §6）。
+pub struct ForgetRequest {
+    pub expected_version: i64,
+    pub origin: Origin,
+    pub user_evidence_id: String,
+    pub target_quote: String,
+}
+
+pub struct ForgetOutcome {
+    pub memory_id: String,
+    pub version: i64,
+}
+
+/// 遗忘动词（doc/12 §6）：首版中文/英文固定集。
+pub fn has_forget_cue(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["忘记", "删除记忆", "不要再记得", "forget", "delete this memory"]
+        .iter()
+        .any(|w| t.contains(w))
+}
+
 /// 历史词（doc/12 §7）：include_history 仅当 query 含明确历史词。
 pub fn has_history_cue(query: &str) -> bool {
     let q = query.to_lowercase();
@@ -406,6 +443,32 @@ impl Store {
             }
         }
 
+        // 历史路：派生索引按 doc/11 §1 排除 superseded/expired，历史查询直接对
+        // 规范表做有界子串扫描（forgotten 永不返回）。
+        let mut history_hits: Vec<(String, f64)> = Vec::new();
+        if include_history {
+            let tokens = latin_tokens(query);
+            let needle = normalize_v1(query);
+            let mut stmt = self.conn().prepare(
+                "SELECT id, claim FROM memories
+                 WHERE tenant_id=? AND user_id=? AND status IN ('superseded','expired')
+                 ORDER BY updated_at DESC LIMIT ?",
+            )?;
+            let rows = stmt.query_map(
+                params![scope.tenant_id, scope.user_id, memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            for row in rows {
+                let (id, claim) = row?;
+                let nclaim = normalize_v1(&claim);
+                let token_match = !tokens.is_empty() && tokens.iter().all(|t| nclaim.contains(t));
+                let substring_match = !needle.is_empty() && nclaim.contains(&needle);
+                if token_match || substring_match {
+                    history_hits.push((id, 0.5));
+                }
+            }
+        }
+
         // 融合排序
         let mut scores: std::collections::HashMap<String, (f64, &'static str)> = std::collections::HashMap::new();
         if !fts_hits.is_empty() && !gram_hits.is_empty() {
@@ -441,6 +504,9 @@ impl Store {
             for (id, s) in contains_hits {
                 scores.insert(id, (s, "contains"));
             }
+        }
+        for (id, s) in history_hits {
+            scores.entry(id).or_insert((s, "history"));
         }
 
         // 组装：join 规范表、强制 scope+状态过滤，取 limit
@@ -489,7 +555,277 @@ impl Store {
         Ok((hits, self.index_degraded()))
     }
 
-    /// POST /v1/context/compose（doc/12 §7）。仅 active；指令类优先 2 名额；不截断语义。
+    fn memory_row_for_update(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<(String, String, i64, String, String)>, StoreError> {
+        // (kind, claim, version, status, claim_sha256)
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT kind, claim, version, status, claim_sha256 FROM memories
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, memory_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 校验「最新真实用户消息」前提（correct/forget 共用）。
+    fn check_latest_user_evidence(
+        &self,
+        scope: &ScopeKey,
+        origin: &Origin,
+        user_evidence_id: &str,
+    ) -> Result<(String, i64, i64), StoreError> {
+        let (host, session, role, source_kind, content) = self
+            .get_evidence(scope, user_evidence_id)?
+            .ok_or(StoreError::EvidenceNotFound)?;
+        if role != "user" || source_kind != "user" || host != origin.host_id || session != origin.session_id {
+            return Err(StoreError::StaleUserEvidence);
+        }
+        let (latest_id, _, _) = self
+            .latest_user_event(scope, &origin.host_id, &origin.session_id)?
+            .ok_or(StoreError::StaleUserEvidence)?;
+        if latest_id != user_evidence_id {
+            return Err(StoreError::StaleUserEvidence);
+        }
+        // 返回 content 与 span（整个事件）
+        let len = content.len() as i64;
+        Ok((content, 0, len))
+    }
+
+    /// POST /v1/memories/{id}/correct（doc/12 §6）。
+    pub fn correct_memory(
+        &mut self,
+        scope: &ScopeKey,
+        memory_id: &str,
+        req: &CorrectRequest,
+    ) -> Result<CorrectOutcome, StoreError> {
+        let Some((kind, claim, version, status, claim_hash)) = self.memory_row_for_update(scope, memory_id)? else {
+            return Err(StoreError::MemoryNotFound);
+        };
+        if status != "active" {
+            return Err(StoreError::MemoryNotFound);
+        }
+        if version != req.expected_version {
+            return Err(StoreError::VersionConflict);
+        }
+        let (content, _, _) = self.check_latest_user_evidence(scope, &req.origin, &req.user_evidence_id)?;
+        // 最新用户事件须同时包含 old_quote 与 replacement_quote；old_quote 须在旧 claim 中出现。
+        let Some((rstart, rend)) = find_quote_span(&content, &req.replacement_quote) else {
+            return Err(StoreError::QuoteMismatch);
+        };
+        if find_quote_span(&content, &req.old_quote).is_none() {
+            return Err(StoreError::QuoteMismatch);
+        }
+        if find_quote_span(&claim, &req.old_quote).is_none() {
+            return Err(StoreError::AmbiguousTarget);
+        }
+        let new_claim = fold_whitespace(&req.replacement_quote);
+        let new_hash = claim_sha256(
+            match kind.as_str() {
+                "preference" => MemoryKind::Preference,
+                "instruction" => MemoryKind::Instruction,
+                "episode" => MemoryKind::Episode,
+                _ => MemoryKind::Fact,
+            },
+            &new_claim,
+        );
+        let now = now_rfc3339()?;
+        let new_memory_id = Uuid::now_v7().to_string();
+        let tx = self.conn_mut().transaction()?;
+        // 旧记忆 superseded + 乐观锁。
+        let n = tx.execute(
+            "UPDATE memories SET status='superseded', version=version+1, updated_at=?1
+             WHERE tenant_id=?2 AND user_id=?3 AND id=?4 AND version=?5",
+            params![now, scope.tenant_id, scope.user_id, memory_id, req.expected_version],
+        )?;
+        if n == 0 {
+            return Err(StoreError::VersionConflict);
+        }
+        tx.execute(
+            "INSERT INTO memory_revisions
+             (tenant_id, user_id, memory_id, version, previous_claim, new_claim, previous_status, new_status,
+              actor_kind, actor_id, reason_code, changed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'active','superseded','user',?7,'user_correct',?8)",
+            params![scope.tenant_id, scope.user_id, memory_id, version + 1, claim, new_claim, req.user_evidence_id, now],
+        )?;
+        // 新记忆 active。
+        tx.execute(
+            "INSERT INTO memories
+             (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256, source_class,
+              status, version, occurred_at, valid_from, valid_until, origin_host_id, origin_agent_id, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11)",
+            params![
+                new_memory_id, scope.tenant_id, scope.user_id, kind, new_claim,
+                normalize_v1(&new_claim), new_hash, req.origin.host_id, req.origin.agent_id, now, now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_evidence (id, tenant_id, user_id, memory_id, evidence_id, start_byte, end_byte)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, new_memory_id, req.user_evidence_id, rstart as i64, rend as i64],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_revisions
+             (tenant_id, user_id, memory_id, version, previous_claim, new_claim, previous_status, new_status,
+              actor_kind, actor_id, reason_code, changed_at)
+             VALUES (?1,?2,?3,1,NULL,?4,NULL,'active','user',?5,'user_correct',?6)",
+            params![scope.tenant_id, scope.user_id, new_memory_id, new_claim, req.user_evidence_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_relations (tenant_id, user_id, from_memory_id, to_memory_id, kind, created_at)
+             VALUES (?1,?2,?3,?4,'supersedes',?5)",
+            params![scope.tenant_id, scope.user_id, new_memory_id, memory_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_events (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
+             VALUES (?1,?2,?3,'user',?4,'memory_correct',?5,?6,?7)",
+            params![
+                Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, req.user_evidence_id,
+                new_memory_id, now,
+                format!("{{\"old_memory_id\":\"{memory_id}\",\"old_claim_hash\":\"{claim_hash}\"}}")
+            ],
+        )?;
+        Self::mark_index_dirty(&tx)?;
+        tx.commit()?;
+        // 索引事务：旧删新插。
+        if let Err(e) = self.reindex_memory(scope, memory_id, &claim, false) {
+            eprintln!("[memoryd] 索引删除失败 memory_id={memory_id}: {e}");
+        }
+        if let Err(e) = self.reindex_memory(scope, &new_memory_id, &new_claim, true) {
+            eprintln!("[memoryd] 索引插入失败 memory_id={new_memory_id}: {e}");
+        }
+        Ok(CorrectOutcome {
+            old_memory_id: memory_id.to_string(),
+            old_version: version + 1,
+            new_memory_id,
+            new_version: 1,
+        })
+    }
+
+    /// POST /v1/memories/{id}/forget（doc/12 §6）。已 forgotten 的幂等确认不卡版本。
+    pub fn forget_memory(
+        &mut self,
+        scope: &ScopeKey,
+        memory_id: &str,
+        req: &ForgetRequest,
+    ) -> Result<ForgetOutcome, StoreError> {
+        let Some((kind, claim, version, status, claim_hash)) = self.memory_row_for_update(scope, memory_id)? else {
+            return Err(StoreError::MemoryNotFound);
+        };
+        let _ = kind;
+        let (content, _, _) = self.check_latest_user_evidence(scope, &req.origin, &req.user_evidence_id)?;
+        if !has_forget_cue(&content) {
+            return Err(StoreError::AmbiguousTarget);
+        }
+        if find_quote_span(&claim, &req.target_quote).is_none() {
+            return Err(StoreError::AmbiguousTarget);
+        }
+        if status == "forgotten" {
+            // 幂等确认：同一目标再次明确请求 → 返回当前状态（doc/12 §6）。
+            return Ok(ForgetOutcome { memory_id: memory_id.to_string(), version });
+        }
+        if status != "active" {
+            return Err(StoreError::MemoryNotFound);
+        }
+        if version != req.expected_version {
+            return Err(StoreError::VersionConflict);
+        }
+        let now = now_rfc3339()?;
+        let refs = self.evidence_refs_of(scope, memory_id)?;
+        let tx = self.conn_mut().transaction()?;
+        let n = tx.execute(
+            "UPDATE memories SET status='forgotten', version=version+1, updated_at=?1
+             WHERE tenant_id=?2 AND user_id=?3 AND id=?4 AND version=?5",
+            params![now, scope.tenant_id, scope.user_id, memory_id, req.expected_version],
+        )?;
+        if n == 0 {
+            return Err(StoreError::VersionConflict);
+        }
+        tx.execute(
+            "INSERT INTO memory_revisions
+             (tenant_id, user_id, memory_id, version, previous_claim, new_claim, previous_status, new_status,
+              actor_kind, actor_id, reason_code, changed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'active','forgotten','user',?7,'user_forget',?8)",
+            params![scope.tenant_id, scope.user_id, memory_id, version + 1, claim, claim, req.user_evidence_id, now],
+        )?;
+        // 抑制源：每个证据引用一行，防后台重放复活（doc/13 §7）。
+        for (evidence_id, _, _) in &refs {
+            tx.execute(
+                "INSERT OR IGNORE INTO suppressed_sources
+                 (tenant_id, user_id, evidence_id, claim_sha256, forgotten_memory_id, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![scope.tenant_id, scope.user_id, evidence_id, claim_hash, memory_id, now],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO audit_events (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
+             VALUES (?1,?2,?3,'user',?4,'memory_forget',?5,?6,'{\"raw_evidence_retained\":true}')",
+            params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, req.user_evidence_id, memory_id, now],
+        )?;
+        Self::mark_index_dirty(&tx)?;
+        tx.commit()?;
+        if let Err(e) = self.reindex_memory(scope, memory_id, &claim, false) {
+            eprintln!("[memoryd] 索引删除失败 memory_id={memory_id}: {e}");
+        }
+        Ok(ForgetOutcome { memory_id: memory_id.to_string(), version: version + 1 })
+    }
+
+    /// 从 active 规范表全量重建派生索引（CLI rebuild-index，doc/09）。
+    pub fn rebuild_index(&mut self) -> Result<(u64, u64), StoreError> {
+        let tx = self.conn_mut().transaction()?;
+        tx.execute("DELETE FROM memory_fts", [])?;
+        let grams = tx.execute("DELETE FROM memory_grams", [])?;
+        let mut rows: Vec<(String, String, String, String)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT m.id, m.claim, m.tenant_id, m.user_id FROM memories m WHERE m.status='active'",
+            )?;
+            let mut q = stmt.query([])?;
+            while let Some(row) = q.next()? {
+                rows.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+            }
+        }
+        let mut fts = 0u64;
+        for (id, claim, tenant_id, user_id) in &rows {
+            tx.execute(
+                "INSERT INTO memory_fts (memory_id, claim) VALUES (?1, ?2)",
+                params![id, normalize_v1(claim)],
+            )?;
+            fts += 1;
+            for gram in cjk_bigrams(claim) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_grams (tenant_id, user_id, memory_id, gram) VALUES (?1,?2,?3,?4)",
+                    params![tenant_id, user_id, id, gram],
+                )?;
+            }
+        }
+        Self::clear_index_dirty(&tx)?;
+        tx.commit()?;
+        Ok((fts, grams as u64))
+    }
+
+    /// SQLite 在线一致性备份：VACUUM INTO（停机维护语义见 doc/09）。
+    pub fn backup_to(&mut self, target: &std::path::Path) -> Result<(), StoreError> {
+        let path = target.to_string_lossy().replace('\'', "''");
+        self.conn_mut()
+            .execute(&format!("VACUUM INTO '{path}'"), [])?;
+        Ok(())
+    }
+
+    /// POST /v1/context/compose（doc/12 §7）。仅 active；指令类优先；不截断语义。
     pub fn compose_context(
         &self,
         scope: &ScopeKey,

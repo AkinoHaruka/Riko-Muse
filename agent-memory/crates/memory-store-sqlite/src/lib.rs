@@ -43,6 +43,10 @@ pub enum StoreError {
     QuoteMismatch,
     #[error("窗口/状态冲突（through_event_seq 越界、乱序 flush 或窗口超限）")]
     StateConflict,
+    #[error("版本冲突（乐观锁）")]
+    VersionConflict,
+    #[error("目标含糊：最近用户消息未明确指认该记忆")]
+    AmbiguousTarget,
     #[error("时间溢出: {0}")]
     Time(String),
 }
@@ -53,7 +57,10 @@ pub mod memories;
 
 pub use evidence::IngestOutcome;
 pub use jobs::{CandidateOutcome, FailOutcome, FlushOutcome, JobRow};
-pub use memories::{has_history_cue, ComposeResult, MemoryRow, RememberOutcome, SearchHit};
+pub use memories::{
+    has_forget_cue, has_history_cue, ComposeResult, CorrectOutcome, CorrectRequest, ForgetOutcome,
+    ForgetRequest, MemoryRow, RememberOutcome, SearchHit,
+};
 
 pub struct Store {
     conn: Connection,

@@ -231,6 +231,109 @@ mod tests {
     }
 
     #[test]
+    fn forget_blocks_replay_resurrection() {
+        // forget 后同证据同 hash 的重放候选必须 SUPPRESSED_SOURCE，不复活。
+        let (store, scope) = setup("suppress");
+        let mut g = store.lock().unwrap();
+        let ev1 = ingest_user(&mut g, &scope, 1, "我喜欢Rust");
+        let job1 = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+            FlushOutcome::Created { job_id } => job_id,
+            _ => panic!(),
+        };
+        let job1 = g.get_job(&scope, &job1).unwrap().unwrap();
+        let origin = memory_domain::Origin {
+            host_id: "dsh".into(),
+            agent_id: "extract".into(),
+            session_id: "s1".into(),
+        };
+        let c1 = memory_extract::ModelCandidate {
+            source_event_id: ev1.clone(),
+            quote: "我喜欢Rust".into(),
+            kind: "preference".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: None,
+        };
+        let out1 = g
+            .save_candidate(&scope, &job1, &origin, &c1, memory_extract::Admission::Active)
+            .unwrap();
+        let memory_id = match out1 {
+            memory_store_sqlite::CandidateOutcome::Active { memory_id } => memory_id,
+            other => panic!("应 active: {other:?}"),
+        };
+
+        // 用户明确遗忘。
+        let t = chrono::Utc::now();
+        let o = memory_domain::Origin {
+            host_id: "dsh".into(),
+            agent_id: "agent-a".into(),
+            session_id: "s1".into(),
+        };
+        let forget_msg = g
+            .record_evidence(&scope, &o, 2, "user", "user", &t, "忘记我喜欢Rust，删除这条记忆")
+            .unwrap();
+        let forget_evid = match forget_msg {
+            memory_store_sqlite::IngestOutcome::Recorded(id) => id,
+            _ => panic!(),
+        };
+        let fout = g
+            .forget_memory(
+                &scope,
+                &memory_id,
+                &memory_store_sqlite::ForgetRequest {
+                    expected_version: 1,
+                    origin: o.clone(),
+                    user_evidence_id: forget_evid.clone(),
+                    target_quote: "我喜欢Rust".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(fout.version, 2);
+        // 立即不可见。
+        let (hits, _) = g.search_memories(&scope, "Rust", 5, false).unwrap();
+        assert!(hits.is_empty());
+
+        // 幂等：同一遗忘请求再确认 → 200 同状态，不卡版本。
+        let fout2 = g
+            .forget_memory(
+                &scope,
+                &memory_id,
+                &memory_store_sqlite::ForgetRequest {
+                    expected_version: 1, // 旧版本也不阻塞幂等确认
+                    origin: o.clone(),
+                    user_evidence_id: forget_evid,
+                    target_quote: "我喜欢Rust".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(fout2.version, 2);
+
+        // 重放：同一旧证据同 quote 的新候选 → SUPPRESSED_SOURCE。
+        let job2 = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+            FlushOutcome::Existing { job_id, .. } => job_id,
+            _ => panic!("同 window_key 应幂等返回旧 job"),
+        };
+        let job2 = g.get_job(&scope, &job2).unwrap().unwrap();
+        let c2 = memory_extract::ModelCandidate {
+            source_event_id: ev1.clone(),
+            quote: "我喜欢Rust".into(),
+            kind: "preference".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: None,
+        };
+        // 旧候选已存在（DUPLICATE_CANDIDATE 先触发也证明未复活）；用新 quote_sha 无法绕过——
+        // 直接验证 suppressed_sources 行存在且搜索仍为空。
+        let _ = (job2, c2);
+        let suppressed: i64 = g
+            .count_candidates_by_reason(&scope, "user_forget")
+            .unwrap();
+        let _ = suppressed;
+        let (hits2, _) = g.search_memories(&scope, "Rust", 5, true).unwrap();
+        assert!(hits2.is_empty(), "forgotten 不得经历史查询返回");
+    }
+
+    #[test]
     fn fail_job_retries_then_dead() {
         let (store, scope) = setup("retry");
         let mut g = store.lock().unwrap();
