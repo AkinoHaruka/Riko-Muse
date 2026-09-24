@@ -7,20 +7,21 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Json, Request, State};
+use axum::extract::{Json, Path as AxumPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
-use axum::{Router};
+use axum::Router;
 use clap::{Parser, Subcommand};
 use memory_contract::{
-    ErrorCode, ErrorResponse, HealthResponse, VersionResponse, EVIDENCE_CONTENT_MAX_BYTES,
-    HOST_ID_MAX_CHARS, PROTOCOL_VERSION, SCHEMA_VERSION,
+    ErrorCode, ErrorResponse, HealthResponse, VersionResponse, COMPOSE_MAX_CHARS_DEFAULT,
+    COMPOSE_MAX_ITEMS_DEFAULT, EVIDENCE_CONTENT_MAX_BYTES, HOST_ID_MAX_CHARS, PROTOCOL_VERSION,
+    SCHEMA_VERSION, SEARCH_QUERY_MAX_CHARS,
 };
-use memory_domain::{Origin, ScopeKey};
-use memory_store_sqlite::{IngestOutcome, Store, StoreError};
+use memory_domain::{MemoryKind, Origin, ScopeKey};
+use memory_store_sqlite::{ComposeResult, IngestOutcome, RememberOutcome, SearchHit, Store, StoreError};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -141,6 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/health", get(health))
                 .route("/v1/version", get(version))
                 .route("/v1/evidence/events", post(ingest_events))
+                .route("/v1/memories/remember", post(remember_memory))
+                .route("/v1/memories/search", post(search_memories))
+                .route("/v1/memories/{memory_id}", get(get_memory))
+                .route("/v1/context/compose", post(compose_context))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
@@ -260,7 +265,7 @@ struct IngestResponse {
 }
 
 fn validate_origin(dto: OriginDto) -> Result<Origin, (&'static str, &'static str)> {
-    for (name, v) in [
+    for (_name, v) in [
         ("host_id", &dto.host_id),
         ("agent_id", &dto.agent_id),
         ("session_id", &dto.session_id),
@@ -295,7 +300,7 @@ async fn ingest_events(
     };
     let origin = match validate_origin(body.origin) {
         Ok(o) => o,
-        Err((code, msg)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg),
+        Err((_code, msg)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg),
     };
     if body.event_seq < 0 {
         return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "event_seq 必须非负");
@@ -341,6 +346,249 @@ async fn ingest_events(
             .into_response(),
         Err(StoreError::EventConflict) => {
             err(&req_id.0, StatusCode::CONFLICT, ErrorCode::EventConflict, "事件键已存在且内容哈希不同")
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- POST /v1/memories/remember（doc/12 §5）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RememberRequest {
+    origin: OriginDto,
+    user_evidence_id: String,
+    quote: String,
+    kind: String,
+}
+
+async fn remember_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<RememberRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let origin = match validate_origin(body.origin) {
+        Ok(o) => o,
+        Err((_, msg)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg),
+    };
+    let kind = match body.kind.as_str() {
+        "fact" => MemoryKind::Fact,
+        "preference" => MemoryKind::Preference,
+        "instruction" => MemoryKind::Instruction,
+        "episode" => MemoryKind::Episode,
+        _ => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "kind 必须是 fact/preference/instruction/episode"),
+    };
+    let quote_chars = body.quote.chars().count();
+    if quote_chars == 0 || quote_chars > 512 {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "quote 必须 1～512 个 Unicode 标量字符");
+    }
+    let outcome = {
+        let mut guard = state.store.lock().unwrap();
+        guard.remember(&scope, &origin, &body.user_evidence_id, &body.quote, kind)
+    };
+    match outcome {
+        Ok(RememberOutcome::Created { memory_id, version }) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "memory_id": memory_id,
+                "version": version,
+                "status": "active"
+            })),
+        )
+            .into_response(),
+        Ok(RememberOutcome::Dedup { memory_id, version }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "memory_id": memory_id,
+                "version": version,
+                "status": "active",
+                "deduplicated": true
+            })),
+        )
+            .into_response(),
+        Err(StoreError::QuoteMismatch) => err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::QuoteMismatch, "quote 不是该用户消息的连续原文子串"),
+        Err(StoreError::StaleUserEvidence) | Err(StoreError::EvidenceNotFound) => {
+            err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件或角色不符")
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- GET /v1/memories/{id}（doc/12 §5）----
+
+#[derive(Debug, serde::Serialize)]
+struct MemoryDetailResponse {
+    request_id: String,
+    memory_id: String,
+    kind: String,
+    claim: String,
+    status: String,
+    version: i64,
+    occurred_at: Option<String>,
+    valid_until: Option<String>,
+    origin_agent_id: String,
+    evidence_refs: Vec<serde_json::Value>,
+}
+
+async fn get_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(memory_id): AxumPath<String>,
+) -> Response {
+    let row = state.store.lock().unwrap().get_memory(&scope, &memory_id);
+    match row {
+        Ok(Some(m)) => {
+            let refs: Vec<serde_json::Value> = m
+                .evidence_refs
+                .into_iter()
+                .map(|(evidence_id, start, end)| {
+                    serde_json::json!({"evidence_id": evidence_id, "start_byte": start, "end_byte": end})
+                })
+                .collect();
+            Json(MemoryDetailResponse {
+                request_id: req_id.0,
+                memory_id: m.memory_id,
+                kind: m.kind,
+                claim: m.claim,
+                status: m.status,
+                version: m.version,
+                occurred_at: m.occurred_at,
+                valid_until: m.valid_until,
+                origin_agent_id: m.origin_agent_id,
+                evidence_refs: refs,
+            })
+            .into_response()
+        }
+        Ok(None) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "记忆不存在或不可见"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- POST /v1/memories/search（doc/12 §7）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchRequest {
+    query: String,
+    limit: Option<usize>,
+    include_history: Option<bool>,
+}
+
+async fn search_memories(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<SearchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let q_chars = body.query.chars().count();
+    if q_chars == 0 || q_chars > SEARCH_QUERY_MAX_CHARS {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "query 必须 1～2048 个 Unicode 标量字符");
+    }
+    let limit = body.limit.unwrap_or(5);
+    if !(1..=20).contains(&limit) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "limit 必须 1～20");
+    }
+    let include_history = body.include_history.unwrap_or(false);
+    if include_history && !memory_store_sqlite::has_history_cue(&body.query) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "include_history=true 要求 query 含明确历史词（以前/过去/曾经/当时 等）");
+    }
+    let result = state.store.lock().unwrap().search_memories(&scope, &body.query, limit, include_history);
+    match result {
+        Ok((hits, degraded)) => {
+            let items: Vec<serde_json::Value> = hits
+                .into_iter()
+                .map(|h: SearchHit| {
+                    serde_json::json!({
+                        "memory_id": h.memory_id,
+                        "kind": h.kind,
+                        "claim": h.claim,
+                        "status": h.status,
+                        "score": h.score,
+                        "match_reason": h.match_reason,
+                        "evidence_refs": h.evidence_refs,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "items": items,
+                "index_degraded": degraded
+            }))
+            .into_response()
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- POST /v1/context/compose（doc/12 §7）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeRequest {
+    agent_id: String,
+    query: String,
+    max_items: Option<usize>,
+    max_chars: Option<usize>,
+}
+
+async fn compose_context(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<ComposeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let max_items = body.max_items.unwrap_or(COMPOSE_MAX_ITEMS_DEFAULT);
+    if !(1..=5).contains(&max_items) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "max_items 必须 1～5");
+    }
+    let max_chars = body.max_chars.unwrap_or(COMPOSE_MAX_CHARS_DEFAULT);
+    if !(100..=2000).contains(&max_chars) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "max_chars 必须 100～2000");
+    }
+    let result = state
+        .store
+        .lock()
+        .unwrap()
+        .compose_context(&scope, &body.agent_id, &body.query, max_items, max_chars);
+    match result {
+        Ok(ComposeResult { text, items, truncated, index_degraded }) => {
+            let item_objs: Vec<serde_json::Value> = items
+                .into_iter()
+                .map(|(memory_id, evidence_ids)| serde_json::json!({"memory_id": memory_id, "evidence_ids": evidence_ids}))
+                .collect();
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "text": text,
+                "items": item_objs,
+                "truncated": truncated,
+                "index_degraded": index_degraded
+            }))
+            .into_response()
         }
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }

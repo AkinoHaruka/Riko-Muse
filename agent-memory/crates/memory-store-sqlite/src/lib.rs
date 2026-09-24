@@ -49,6 +49,7 @@ pub mod evidence;
 pub mod memories;
 
 pub use evidence::IngestOutcome;
+pub use memories::{has_history_cue, ComposeResult, MemoryRow, RememberOutcome, SearchHit};
 
 pub struct Store {
     conn: Connection,
