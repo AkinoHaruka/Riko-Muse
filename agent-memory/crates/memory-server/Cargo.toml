@@ -1,0 +1,23 @@
+[package]
+name = "memory-server"
+description = "memoryd：HTTP、认证、生命周期与观测（doc/09、doc/12）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "memoryd"
+path = "src/main.rs"
+
+[dependencies]
+memory-contract.workspace = true
+memory-domain.workspace = true
+memory-store-sqlite.workspace = true
+memory-extract.workspace = true
+memory-recall.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"

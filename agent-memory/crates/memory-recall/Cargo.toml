@@ -1,0 +1,10 @@
+[package]
+name = "memory-recall"
+description = "查询解析、过滤、排序、上下文编译（doc/13 §6；卡 3 交付）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memory-contract.workspace = true
+memory-domain.workspace = true

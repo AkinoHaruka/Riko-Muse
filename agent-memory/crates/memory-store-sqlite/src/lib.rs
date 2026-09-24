@@ -1,0 +1,376 @@
+//! SQLite 规范存储：连接管理、有序迁移、principals（doc/11）。
+//!
+//! SQLite 是首版唯一规范存储；WAL、外键、busy timeout 在打开时开启；
+//! 所有迁移在事务内执行并记录 `schema_migrations` checksum。
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use memory_domain::ScopeKey;
+use rand::RngCore;
+use rusqlite::{Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("数据库打开失败: {0}")]
+    Open(#[from] rusqlite::Error),
+    #[error("当前构建缺少 ENABLE_FTS5，无法创建 memory_fts；请调整 Rust 构建特性，不能静默退化为无索引")]
+    Fts5Missing,
+    #[error("迁移目录不可读: {0}")]
+    MigrationsIo(String),
+    #[error("迁移 {name} 内容已改变: 数据库记录 {recorded}，当前 {current}。禁止修改已发布的迁移")]
+    MigrationChecksum { name: String, recorded: String, current: String },
+    #[error("迁移文件版本跳跃或重复: {0}")]
+    MigrationOrder(String),
+    #[error("principal ({tenant}, {user}) 已存在，拒绝覆盖")]
+    PrincipalExists { tenant: String, user: String },
+    #[error("principal ({tenant}, {user}) 不存在")]
+    PrincipalNotFound { tenant: String, user: String },
+    #[error("令牌输出文件已存在，拒绝覆盖: {0}")]
+    TokenFileExists(String),
+    #[error("写令牌文件失败: {0}")]
+    TokenFileIo(String),
+    #[error("时间溢出: {0}")]
+    Time(String),
+}
+
+pub struct Store {
+    conn: Connection,
+    path: PathBuf,
+}
+
+fn now_rfc3339() -> Result<String, StoreError> {
+    chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        .pipe(Ok)
+}
+
+// 小工具：避免引入 tap crate
+trait Pipe: Sized {
+    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
+
+/// 迁移描述：版本号来自文件名前缀，sha256 为文件内容哈希。
+struct Migration {
+    version: u32,
+    name: String,
+    sql: String,
+    sha256: String,
+}
+
+fn load_migrations(dir: &Path) -> Result<Vec<Migration>, StoreError> {
+    let mut out = Vec::new();
+    let entries = fs::read_dir(dir).map_err(|e| StoreError::MigrationsIo(format!("{dir:?}: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| StoreError::MigrationsIo(e.to_string()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| StoreError::MigrationsIo(format!("非法迁移文件名: {path:?}")))?
+            .to_string();
+        let version: u32 = stem
+            .split('_')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| StoreError::MigrationOrder(stem.clone()))?;
+        let sql = fs::read_to_string(&path)
+            .map_err(|e| StoreError::MigrationsIo(format!("读取 {path:?} 失败: {e}")))?;
+        let sha256 = hex::encode(Sha256::digest(sql.as_bytes()));
+        out.push(Migration { version, name: stem, sql, sha256 });
+    }
+    out.sort_by_key(|m| m.version);
+    // 版本号必须严格递增无重复
+    for (i, m) in out.iter().enumerate() {
+        if m.version as usize != i + 1 {
+            return Err(StoreError::MigrationOrder(format!(
+                "期望版本 {}，实际 {}",
+                i + 1,
+                m.version
+            )));
+        }
+    }
+    Ok(out)
+}
+
+impl Store {
+    /// 打开（必要时创建）数据库并应用全部未执行迁移。迁移失败则整体失败、不开放 HTTP。
+    pub fn open(db_path: &Path, migrations_dir: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open(db_path)?;
+        Self::finish_open(conn, db_path, migrations_dir)
+    }
+
+    /// 内存库（仅测试与诊断用）。
+    pub fn open_in_memory(migrations_dir: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        Self::finish_open(conn, Path::new(":memory:"), migrations_dir)
+    }
+
+    fn finish_open(
+        mut conn: Connection,
+        db_path: &Path,
+        migrations_dir: &Path,
+    ) -> Result<Self, StoreError> {
+        // 事务外先设 WAL；busy timeout 与 foreign_keys 随后常驻。
+        let journal: String =
+            conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") && db_path != Path::new(":memory:") {
+            // 内存库返回 memory，属正常；文件库必须 WAL。
+            return Err(StoreError::Open(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!("无法启用 WAL，当前 journal_mode={journal}")),
+            )));
+        }
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
+
+        // FTS5 是 D-03 的硬要求，缺失必须明确失败。
+        let fts5: i32 =
+            conn.query_row("SELECT sqlite_compileoption_used('ENABLE_FTS5')", [], |r| r.get(0))?;
+        if fts5 != 1 {
+            return Err(StoreError::Fts5Missing);
+        }
+
+        Self::migrate(&mut conn, migrations_dir)?;
+
+        Ok(Store { conn, path: db_path.to_path_buf() })
+    }
+
+    fn migrate(conn: &mut Connection, migrations_dir: &Path) -> Result<(), StoreError> {
+        let migrations = load_migrations(migrations_dir)?;
+        if migrations.is_empty() {
+            return Ok(());
+        }
+        let applied: Vec<(u32, String)> = {
+            // schema_migrations 可能尚不存在（首次启动）。
+            let exists: i32 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+                [],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                Vec::new()
+            } else {
+                let mut stmt = conn.prepare("SELECT version, sha256 FROM schema_migrations ORDER BY version")?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        for m in &migrations {
+            if let Some((_, recorded)) = applied.iter().find(|(v, _)| *v == m.version) {
+                if recorded != &m.sha256 {
+                    return Err(StoreError::MigrationChecksum {
+                        name: m.name.clone(),
+                        recorded: recorded.clone(),
+                        current: m.sha256.clone(),
+                    });
+                }
+                continue;
+            }
+            let tx = conn.transaction()?;
+            tx.execute_batch(&m.sql)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, sha256, applied_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![m.version, m.name, m.sha256, now_rfc3339()?],
+            )?;
+            // index_state 单例行由迁移执行器写入。
+            tx.execute(
+                "INSERT OR IGNORE INTO index_state (singleton, generation, dirty, updated_at) VALUES (1, 0, 0, ?1)",
+                rusqlite::params![now_rfc3339()?],
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `memoryd principal add`：生成 32 字节随机令牌，base64url 写入只允许当前用户读取的新文件；
+    /// 数据库只存 SHA-256 哈希；令牌只显示一次。
+    pub fn principal_add(
+        &mut self,
+        tenant_id: &str,
+        user_id: &str,
+        token_out: &Path,
+    ) -> Result<(), StoreError> {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            bytes,
+        );
+        self.insert_principal(tenant_id, user_id, &token, token_out)
+    }
+
+    /// `memoryd principal rotate-token`：换令牌，原令牌立即失效。
+    pub fn principal_rotate_token(
+        &mut self,
+        tenant_id: &str,
+        user_id: &str,
+        token_out: &Path,
+    ) -> Result<(), StoreError> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM principals WHERE tenant_id=?1 AND user_id=?2",
+                rusqlite::params![tenant_id, user_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Err(StoreError::PrincipalNotFound {
+                tenant: tenant_id.to_string(),
+                user: user_id.to_string(),
+            });
+        }
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            bytes,
+        );
+        let hash = hex::encode(Sha256::digest(token.as_bytes()));
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE principals SET token_sha256=?3 WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![tenant_id, user_id, hash],
+        )?;
+        tx.commit()?;
+        write_token_file(token_out, &token)
+    }
+
+    fn insert_principal(
+        &mut self,
+        tenant_id: &str,
+        user_id: &str,
+        token: &str,
+        token_out: &Path,
+    ) -> Result<(), StoreError> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM principals WHERE tenant_id=?1 AND user_id=?2",
+                rusqlite::params![tenant_id, user_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if exists {
+            return Err(StoreError::PrincipalExists {
+                tenant: tenant_id.to_string(),
+                user: user_id.to_string(),
+            });
+        }
+        let hash = hex::encode(Sha256::digest(token.as_bytes()));
+        self.conn.execute(
+            "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",
+            rusqlite::params![tenant_id, user_id, hash, now_rfc3339()?],
+        )?;
+        write_token_file(token_out, token)
+    }
+
+    /// 每个请求最前面调用：由令牌哈希查出 scope。disabled 或不存在返回 None（统一 401）。
+    pub fn verify_token(&self, token: &str) -> Result<Option<ScopeKey>, StoreError> {
+        let hash = hex::encode(Sha256::digest(token.as_bytes()));
+        let row = self
+            .conn
+            .query_row(
+                "SELECT tenant_id, user_id FROM principals WHERE token_sha256=?1 AND status='active'",
+                rusqlite::params![hash],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(tenant_id, user_id)| ScopeKey { tenant_id, user_id }))
+    }
+
+    /// 诊断：迁移状态。
+    pub fn doctor_summary(&self) -> Result<String, StoreError> {
+        let applied: u32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        let principals: u64 = self
+            .conn
+            .query_row("SELECT count(*) FROM principals", [], |r| r.get(0))?;
+        let (gen, dirty): (u64, i64) = self.conn.query_row(
+            "SELECT generation, dirty FROM index_state WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(format!(
+            "schema_version={applied} principals={principals} index_generation={gen} index_dirty={dirty}"
+        ))
+    }
+}
+
+fn write_token_file(path: &Path, token: &str) -> Result<(), StoreError> {
+    use std::io::Write;
+    if path.exists() {
+        return Err(StoreError::TokenFileExists(path.display().to_string()));
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| StoreError::TokenFileIo(format!("{}: {e}", path.display())))?;
+    // 文件内容：单行令牌 + 换行；权限依赖 OS 默认（Windows 下无 POSIX 权限位，属已知差异）。
+    f.write_all(token.as_bytes())
+        .and_then(|_| f.write_all(b"\n"))
+        .map_err(|e| StoreError::TokenFileIo(format!("{}: {e}", path.display())))?;
+    f.flush().map_err(|e| StoreError::TokenFileIo(format!("{}: {e}", path.display())))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn migrations_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+    }
+
+    #[test]
+    fn migrate_and_verify_principal() {
+        let dir = std::env::temp_dir().join(format!(
+            "am-store-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db");
+        let token_file = dir.join("user_a.token");
+
+        let mut store = Store::open(&db, &migrations_dir()).unwrap();
+        store.principal_add("t1", "user-a", &token_file).unwrap();
+        let token = fs::read_to_string(&token_file).unwrap().trim().to_string();
+        let scope = store.verify_token(&token).unwrap().unwrap();
+        assert_eq!(scope.tenant_id, "t1");
+        assert_eq!(scope.user_id, "user-a");
+        // 错误令牌 → None
+        assert!(store.verify_token("bogus").unwrap().is_none());
+
+        // rotate 后旧令牌失效
+        let token_file2 = dir.join("user_a_rotated.token");
+        store.principal_rotate_token("t1", "user-a", &token_file2).unwrap();
+        assert!(store.verify_token(&token).unwrap().is_none());
+        let token2 = fs::read_to_string(&token_file2).unwrap().trim().to_string();
+        assert_eq!(store.verify_token(&token2).unwrap().unwrap().user_id, "user-a");
+
+        // 重复 add 拒绝
+        let dup = dir.join("dup.token");
+        let err = store.principal_add("t1", "user-a", &dup).unwrap_err();
+        assert!(matches!(err, StoreError::PrincipalExists { .. }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

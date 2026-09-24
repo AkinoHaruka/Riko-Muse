@@ -1,0 +1,12 @@
+[package]
+name = "memory-extract"
+description = "模型适配协议、extract_v1 Prompt 输入输出校验（doc/13 §3-5；卡 4 交付）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memory-contract.workspace = true
+memory-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true

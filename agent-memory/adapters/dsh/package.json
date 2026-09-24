@@ -1,0 +1,12 @@
+{
+  "name": "@agent-memory/dsh-adapter",
+  "version": "0.1.0",
+  "description": "Agent Memory 内核的 DSH 薄适配器（doc/14）",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "Apache-2.0"
+}

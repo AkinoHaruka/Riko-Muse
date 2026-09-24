@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/memory-contract",
+    "crates/memory-domain",
+    "crates/memory-store-sqlite",
+    "crates/memory-extract",
+    "crates/memory-recall",
+    "crates/memory-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+memory-contract = { path = "crates/memory-contract" }
+memory-domain = { path = "crates/memory-domain" }
+memory-store-sqlite = { path = "crates/memory-store-sqlite" }
+memory-extract = { path = "crates/memory-extract" }
+memory-recall = { path = "crates/memory-recall" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

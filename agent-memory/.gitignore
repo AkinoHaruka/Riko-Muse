@@ -1,0 +1,10 @@
+target/
+dist/
+node_modules/
+data/
+spool/
+*.db
+*.db-wal
+*.db-shm
+*.token
+secrets/

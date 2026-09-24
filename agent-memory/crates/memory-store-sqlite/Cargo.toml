@@ -1,0 +1,16 @@
+[package]
+name = "memory-store-sqlite"
+description = "事务、迁移、任务队列、索引维护（doc/11）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memory-domain.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+thiserror.workspace = true
