@@ -7,24 +7,32 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Request, State};
+use axum::extract::{Json, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::routing::{get, post};
+use axum::Extension;
+use axum::{Router};
 use clap::{Parser, Subcommand};
 use memory_contract::{
-    ErrorCode, ErrorResponse, HealthResponse, VersionResponse, PROTOCOL_VERSION, SCHEMA_VERSION,
+    ErrorCode, ErrorResponse, HealthResponse, VersionResponse, EVIDENCE_CONTENT_MAX_BYTES,
+    HOST_ID_MAX_CHARS, PROTOCOL_VERSION, SCHEMA_VERSION,
 };
-use memory_store_sqlite::{Store, StoreError};
+use memory_domain::{Origin, ScopeKey};
+use memory_store_sqlite::{IngestOutcome, Store, StoreError};
 use serde::Deserialize;
+use uuid::Uuid;
 
 /// 构建标识：优先取编译期注入的 commit，否则 "dev"。
 const BUILD: &str = match option_env!("AGENT_MEMORY_BUILD") {
     Some(v) => v,
     None => "dev",
 };
+
+/// 每个请求的服务端 request ID（doc/12 §1）。
+#[derive(Debug, Clone)]
+struct RequestId(String);
 
 #[derive(Parser)]
 #[command(name = "memoryd", about = "Agent Memory 内核（v1 冻结契约 doc/10-15）")]
@@ -37,7 +45,6 @@ struct Cli {
 enum Commands {
     /// 启动内核服务（只监听 loopback）
     Serve {
-        /// 配置文件路径（非秘密项；令牌与模型密钥走秘密文件）
         #[arg(long)]
         config: PathBuf,
     },
@@ -83,11 +90,8 @@ enum PrincipalAction {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
-    /// 监听地址；必须能解析为 loopback，否则启动失败（doc/09）。
     listen_addr: String,
-    /// SQLite 规范库路径。
     db_path: PathBuf,
-    /// 有序 SQL 迁移目录。
     migrations_dir: PathBuf,
 }
 
@@ -136,28 +140,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = Router::new()
                 .route("/v1/health", get(health))
                 .route("/v1/version", get(version))
-                .layer(middleware::from_fn_with_state(state.clone(), auth))
+                .route("/v1/evidence/events", post(ingest_events))
+                .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app).await?;
             Ok(())
         }
-        Commands::Principal { action } => {
-            match action {
-                PrincipalAction::Add { tenant, user, token_out, db, migrations } => {
-                    let mut store = Store::open(&db, &migrations)?;
-                    store.principal_add(&tenant, &user, &token_out)?;
-                    println!("已创建 principal tenant={tenant} user={user}，令牌写入 {}", token_out.display());
-                }
-                PrincipalAction::RotateToken { tenant, user, token_out, db, migrations } => {
-                    let mut store = Store::open(&db, &migrations)?;
-                    store.principal_rotate_token(&tenant, &user, &token_out)?;
-                    println!("已轮换 tenant={tenant} user={user} 的令牌，原令牌立即失效，新令牌写入 {}", token_out.display());
-                }
+        Commands::Principal { action } => match action {
+            PrincipalAction::Add { tenant, user, token_out, db, migrations } => {
+                let mut store = Store::open(&db, &migrations)?;
+                store.principal_add(&tenant, &user, &token_out)?;
+                println!("已创建 principal tenant={tenant} user={user}，令牌写入 {}", token_out.display());
+                Ok(())
             }
-            Ok(())
-        }
+            PrincipalAction::RotateToken { tenant, user, token_out, db, migrations } => {
+                let mut store = Store::open(&db, &migrations)?;
+                store.principal_rotate_token(&tenant, &user, &token_out)?;
+                println!("已轮换 tenant={tenant} user={user} 的令牌，原令牌立即失效，新令牌写入 {}", token_out.display());
+                Ok(())
+            }
+        },
         Commands::Doctor { config } => {
             let cfg = Config::load(&config)?;
             let store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
@@ -167,13 +171,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// 认证中间件：除 health/version 外均需 `Authorization: Bearer <token>`（doc/12 §1）。
-/// 服务端由令牌查 scope；disabled 与不存在统一 401，不泄露用户是否存在。
-async fn auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+fn err(req_id: &str, status: StatusCode, code: ErrorCode, msg: &str) -> Response {
+    (status, Json(ErrorResponse::new(req_id, code, msg))).into_response()
+}
+
+/// 请求管线：生成/校验 request ID；除 health/version 外执行 Bearer 认证（doc/12 §1）。
+async fn request_pipeline(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| Uuid::parse_str(v).is_ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    req.extensions_mut().insert(RequestId(request_id));
+
     let path = req.uri().path().to_string();
     if path == "/v1/health" || path == "/v1/version" {
         return next.run(req).await;
     }
+
     let token = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -191,28 +208,149 @@ async fn auth(State(state): State<AppState>, mut req: Request, next: Next) -> Re
                 .and_then(|store| store.verify_token(t).map_err(|_| ()));
             match result {
                 Ok(Some(scope)) => scope,
-                _ => return error(StatusCode::UNAUTHORIZED, ErrorCode::Unauthenticated, "令牌无效或用户已停用"),
+                _ => {
+                    let rid = req
+                        .extensions()
+                        .get::<RequestId>()
+                        .map(|r| r.0.clone())
+                        .unwrap_or_default();
+                    return err(&rid, StatusCode::UNAUTHORIZED, ErrorCode::Unauthenticated, "令牌无效或用户已停用");
+                }
             }
         }
-        None => return error(StatusCode::UNAUTHORIZED, ErrorCode::Unauthenticated, "缺少 Bearer 令牌"),
+        None => {
+            let rid = req
+                .extensions()
+                .get::<RequestId>()
+                .map(|r| r.0.clone())
+                .unwrap_or_default();
+            return err(&rid, StatusCode::UNAUTHORIZED, ErrorCode::Unauthenticated, "缺少 Bearer 令牌");
+        }
     };
     req.extensions_mut().insert(scope);
     next.run(req).await
 }
 
-fn error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
-    (
-        status,
-        Json(ErrorResponse::new("req-unknown", code, message)),
-    )
-        .into_response()
+// ---- POST /v1/evidence/events（doc/12 §3）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestRequest {
+    origin: OriginDto,
+    event_seq: i64,
+    role: String,
+    source_kind: String,
+    occurred_at: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginDto {
+    host_id: String,
+    agent_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IngestResponse {
+    request_id: String,
+    status: &'static str,
+    evidence_id: String,
+}
+
+fn validate_origin(dto: OriginDto) -> Result<Origin, (&'static str, &'static str)> {
+    for (name, v) in [
+        ("host_id", &dto.host_id),
+        ("agent_id", &dto.agent_id),
+        ("session_id", &dto.session_id),
+    ] {
+        if v.is_empty() {
+            return Err(("INVALID_FIELD", "origin ID 不能为空"));
+        }
+        if v.chars().count() > HOST_ID_MAX_CHARS {
+            return Err(("INVALID_FIELD", "origin ID 超过 256 字符"));
+        }
+    }
+    Ok(Origin {
+        host_id: dto.host_id,
+        agent_id: dto.agent_id,
+        session_id: dto.session_id,
+    })
+}
+
+async fn ingest_events(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<IngestRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        // JSON 语法错误 → INVALID_JSON；反序列化失败（含未知字段/类型错）→ INVALID_FIELD（doc/12 §1/§8）。
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let origin = match validate_origin(body.origin) {
+        Ok(o) => o,
+        Err((code, msg)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg),
+    };
+    if body.event_seq < 0 {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "event_seq 必须非负");
+    }
+    if !matches!(body.role.as_str(), "user" | "assistant" | "tool" | "system") {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "role 必须是 user/assistant/tool/system");
+    }
+    if !matches!(body.source_kind.as_str(), "user" | "assistant" | "tool" | "plugin" | "system") {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "source_kind 必须是 user/assistant/tool/plugin/system");
+    }
+    let occurred_at = match chrono::DateTime::parse_from_rfc3339(&body.occurred_at) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(_) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "occurred_at 必须是带时区的 RFC3339 时间")
+        }
+    };
+    if body.content.is_empty() || body.content.len() > EVIDENCE_CONTENT_MAX_BYTES {
+        return err(&req_id.0, StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::BodyTooLarge, "content 必须 1～64 KiB");
+    }
+
+    let outcome = {
+        let mut guard = state.store.lock().unwrap();
+        guard.record_evidence(
+            &scope,
+            &origin,
+            body.event_seq,
+            &body.role,
+            &body.source_kind,
+            &occurred_at,
+            &body.content,
+        )
+    };
+    match outcome {
+        Ok(IngestOutcome::Recorded(id)) => (
+            StatusCode::CREATED,
+            Json(IngestResponse { request_id: req_id.0, status: "recorded", evidence_id: id }),
+        )
+            .into_response(),
+        Ok(IngestOutcome::AlreadyRecorded(id)) => (
+            StatusCode::OK,
+            Json(IngestResponse { request_id: req_id.0, status: "already_recorded", evidence_id: id }),
+        )
+            .into_response(),
+        Err(StoreError::EventConflict) => {
+            err(&req_id.0, StatusCode::CONFLICT, ErrorCode::EventConflict, "事件键已存在且内容哈希不同")
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let index = {
+    let degraded = {
         let guard = state.store.lock();
         match guard {
-            Ok(store) => index_degraded(&store).unwrap_or(true),
+            Ok(store) => store.doctor_summary().map(|_| false).unwrap_or(true),
             Err(_) => true,
         }
     };
@@ -220,13 +358,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         status: "ok",
         protocol_version: PROTOCOL_VERSION,
         db: "ready",
-        index: if index { "degraded" } else { "ready" },
+        index: if degraded { "degraded" } else { "ready" },
     })
-}
-
-/// index_state.dirty=1 表示派生索引待重建 → 健康报告 degraded（doc/09）。
-fn index_degraded(store: &Store) -> Result<bool, StoreError> {
-    store.doctor_summary().map(|_| false)
 }
 
 async fn version() -> impl IntoResponse {

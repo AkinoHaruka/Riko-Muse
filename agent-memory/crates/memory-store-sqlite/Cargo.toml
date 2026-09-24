@@ -13,4 +13,5 @@ hex = "0.4"
 rand = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v7"] }
 thiserror.workspace = true

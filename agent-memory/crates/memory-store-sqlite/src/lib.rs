@@ -31,28 +31,43 @@ pub enum StoreError {
     TokenFileExists(String),
     #[error("写令牌文件失败: {0}")]
     TokenFileIo(String),
+    #[error("事件键已存在但内容哈希不同（拒绝静默改写证据）")]
+    EventConflict,
+    #[error("证据不存在或不属于当前 scope")]
+    EvidenceNotFound,
+    #[error("记忆不存在或不属于当前 scope")]
+    MemoryNotFound,
+    #[error("引用的用户证据不是该会话最新用户事件")]
+    StaleUserEvidence,
+    #[error("quote 不是原文连续子串")]
+    QuoteMismatch,
     #[error("时间溢出: {0}")]
     Time(String),
 }
+
+pub mod evidence;
+pub mod memories;
+
+pub use evidence::IngestOutcome;
 
 pub struct Store {
     conn: Connection,
     path: PathBuf,
 }
 
-fn now_rfc3339() -> Result<String, StoreError> {
-    chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-        .pipe(Ok)
-}
+impl Store {
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
 
-// 小工具：避免引入 tap crate
-trait Pipe: Sized {
-    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
-        f(self)
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 }
-impl<T> Pipe for T {}
+
+pub(crate) fn now_rfc3339() -> Result<String, StoreError> {
+    Ok(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+}
 
 /// 迁移描述：版本号来自文件名前缀，sha256 为文件内容哈希。
 struct Migration {

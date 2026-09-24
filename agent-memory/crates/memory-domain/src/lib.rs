@@ -78,10 +78,15 @@ pub enum SourceClass {
 /// 不删除中文标点，不做同义词替换（doc/13 §1）。
 pub fn normalize_v1(s: &str) -> String {
     let nfkc: String = s.nfkc().collect();
-    let lower = nfkc.to_lowercase();
-    let mut out = String::with_capacity(lower.len());
-    let mut last_was_ws = true; // 首尾去空白
-    for ch in lower.chars() {
+    fold_whitespace(&nfkc.to_lowercase())
+}
+
+/// 仅折叠连续空白为一个空格并去首尾空白（doc/12 §5：claim = 折叠空白后的 quote）。
+/// 不做 NFKC、不做小写——保存的 claim 保持用户原话的字面。
+pub fn fold_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_ws = true;
+    for ch in s.chars() {
         if ch.is_whitespace() {
             if !last_was_ws {
                 out.push(' ');

@@ -21,3 +21,5 @@ serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+uuid = { version = "1", features = ["v7"] }
