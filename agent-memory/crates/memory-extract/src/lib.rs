@@ -61,14 +61,23 @@ pub enum ExtractError {
     Timeout,
 }
 
+/// 一次成功调用的模型输出（doc2/05 §2：usage 有则记录，无则 NULL 不估算）。
+#[derive(Debug, Clone)]
+pub struct ExtractOutput {
+    pub content: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
 /// 模型提供者协议。OpenAI 兼容客户端在 memory-server 侧实现并注入 worker。
 pub trait ExtractModel: Send {
-    /// system=EXTRACT_SYSTEM_PROMPT；user=按 seq 排序的事件 JSON。返回原始响应文本（由内核解析校验）。
+    /// system=EXTRACT_SYSTEM_PROMPT；user=按 seq 排序的事件 JSON。
+    /// 返回原始响应文本与可选用量（由内核解析校验）。
     fn extract(
         &self,
         system: &str,
         user: &str,
-    ) -> impl std::future::Future<Output = Result<String, ExtractError>> + Send;
+    ) -> impl std::future::Future<Output = Result<ExtractOutput, ExtractError>> + Send;
 }
 
 /// doc/13 §5 的确定性准入规则第 1～7 步（第 8、9 步需查库，由 store 层完成）。

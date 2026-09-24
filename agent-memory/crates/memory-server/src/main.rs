@@ -116,6 +116,8 @@ struct Config {
     model_name: Option<String>,
     /// 模型密钥文件路径（密钥不进配置、不进日志）。
     model_key_file: Option<PathBuf>,
+    /// 是否允许空密钥（doc2/05 §2：默认 false，不能把空字符串当真实授权）。
+    model_allow_empty_key: Option<bool>,
 }
 
 impl Config {
@@ -166,6 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|e| format!("读取模型密钥文件失败 {}: {e}", key_file.display()))?
                         .trim()
                         .to_string();
+                    // doc2/05 §2：空 key 是否允许由配置显式决定，不能把空字符串当真实授权。
+                    if api_key.is_empty() && !cfg.model_allow_empty_key.unwrap_or(false) {
+                        return Err("模型密钥文件为空；如确需无密钥端点请显式设置 model_allow_empty_key=true".into());
+                    }
                     Some(worker::ModelConfig {
                         endpoint: endpoint.clone(),
                         model: name.clone(),

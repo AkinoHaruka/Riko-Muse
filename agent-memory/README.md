@@ -18,7 +18,7 @@ cargo run -p memory-server --bin memoryd -- principal add \
 cargo run -p memory-server --bin memoryd -- serve --config config.toml
 
 # 4. 检查
-curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":1,...}
+curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":2,...}
 curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"ready|degraded"}
 ```
 
@@ -81,7 +81,9 @@ TypeScript 薄适配器，已通过 `tsc --noEmit` 类型检查。宿主 Hook �
 - `crates/memory-recall`：词法（latin tokens / CJK bigrams）、RRF
 - `crates/memory-server`：`memoryd` 二进制（CLI + HTTP + worker）
 - `adapters/dsh`：DSH TypeScript 薄适配器
-- `migrations/0001_init.sql`：规范库蓝图
+- `migrations/0001_init.sql`：规范库蓝图（schema 1，已发布、checksum 固定，禁止回改）
+- `migrations/0002_prompt_version.sql`：schema 2——`extraction_jobs.prompt_version`（doc2/05 §3）；
+  旧库启动时自动有序升级，旧作业回填 `extract_v1`。**升级前先用 `memoryd backup` 备份**。
 
 ## 已验证与未验证
 

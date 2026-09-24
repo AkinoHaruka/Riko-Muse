@@ -5,9 +5,12 @@ db_path = "data/agent-memory.db"
 migrations_dir = "migrations"
 
 # ---- 提取模型（OpenAI 兼容端点；未配置则不启动提取 worker，手工记忆与搜索仍可用）----
-# model_endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+# v2（doc2/05 §2）：model_endpoint 必须是完整 Chat Completions URL（含路径），支持 https:// 与域名；
+# 启动时校验 scheme=http/https、主机与路径明确；空密钥默认拒绝，确需无密钥端点时显式置 true。
+# model_endpoint = "https://api.example.com/v1/chat/completions"
 # model_name = "qwen2.5:7b"
 # model_key_file = "secrets/model.key"   # 文件内容为一行密钥；密钥不进配置、不进日志、不进 Prompt
+# model_allow_empty_key = false
 
 # ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500

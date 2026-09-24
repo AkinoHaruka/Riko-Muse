@@ -35,6 +35,8 @@ pub struct JobRow {
     pub run_after: String,
     pub created_at: String,
     pub updated_at: String,
+    /// 生成该作业时的提取规则版本（doc2/05 §3），随作业持久化。
+    pub prompt_version: String,
 }
 
 /// 候选落库结果（审计/诊断用）。
@@ -108,9 +110,12 @@ impl Store {
         self.conn_mut().execute(
             "INSERT INTO extraction_jobs
              (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
-              status, attempts, run_after, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',0,?8,?9,?10)",
-            params![job_id, scope.tenant_id, scope.user_id, host_id, session_id, window_key, through_event_seq, now, now, now],
+              status, attempts, run_after, created_at, updated_at, prompt_version)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',0,?8,?9,?10,?11)",
+            params![
+                job_id, scope.tenant_id, scope.user_id, host_id, session_id, window_key,
+                through_event_seq, now, now, now, memory_contract::EXTRACT_PROMPT_VERSION
+            ],
         )?;
         Ok(FlushOutcome::Created { job_id })
     }
@@ -143,7 +148,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
-                        status, attempts, run_after, created_at, updated_at
+                        status, attempts, run_after, created_at, updated_at, prompt_version
                  FROM extraction_jobs
                  WHERE (status='queued' AND run_after<=?1)
                     OR (status='retryable_failed' AND (lease_until IS NULL OR lease_until<=?1))
@@ -289,7 +294,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
-                        status, attempts, run_after, created_at, updated_at
+                        status, attempts, run_after, created_at, updated_at, prompt_version
                  FROM extraction_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, job_id],
                 job_row_mapper(),
@@ -560,6 +565,7 @@ fn job_row_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
             run_after: r.get(9)?,
             created_at: r.get(10)?,
             updated_at: r.get(11)?,
+            prompt_version: r.get(12)?,
         })
     }
 }

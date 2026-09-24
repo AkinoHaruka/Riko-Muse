@@ -400,4 +400,58 @@ mod tests {
         assert!(matches!(err, StoreError::PrincipalExists { .. }));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn migrate_v1_db_to_v2_prompt_version() {
+        // doc2/05 §3：旧库有序升级到 schema 2，已有 v1 作业与候选仍可读，
+        // prompt_version 由 DEFAULT 回填 'extract_v1'。
+        let dir = std::env::temp_dir().join(format!(
+            "am-store-v2-migrate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v1.db");
+        let token_file = dir.join("u.token");
+
+        // 手工构造"仅 0001"的旧库（模拟 v1 现场）。
+        let migrations = migrations_dir();
+        let v1_sql = fs::read_to_string(migrations.join("0001_init.sql")).unwrap();
+        let mut conn = Connection::open(&db).unwrap();
+        conn.execute_batch(&v1_sql).unwrap();
+        // 与迁移加载器同一算法，避免硬编码哈希随文件换行变化而脆断。
+        let v1_sha = hex::encode(sha2::Sha256::digest(v1_sql.as_bytes()));
+        conn.execute_batch(&format!(
+            "INSERT INTO schema_migrations (version, name, sha256, applied_at)
+             VALUES (1, '0001_init', '{v1_sha}', '2026-09-24T00:00:00Z');"
+        )).unwrap();
+        // 旧 v1 数据：principal + 一条已 succeeded 的 v1 作业。
+        conn.execute_batch(
+            "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at)
+             VALUES ('t1', 'u1', 'x', 'active', '2026-09-24T00:00:00Z');
+             INSERT INTO extraction_jobs
+               (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
+                status, attempts, run_after, created_at, updated_at)
+             VALUES ('j1', 't1', 'u1', 'dsh', 's1', 'v1:5', 5, 'succeeded', 1,
+                     '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z');",
+        ).unwrap();
+        drop(conn);
+
+        // Store::open 应用 0002 升级。
+        let mut store = Store::open(&db, &migrations).unwrap();
+        let schema_v: u32 = store.conn().query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(schema_v, 2);
+        let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
+        let job = store.get_job(&scope, "j1").unwrap().unwrap();
+        assert_eq!(job.status, "succeeded");
+        assert_eq!(job.prompt_version, "extract_v1", "旧作业必须回填 extract_v1");
+        // 新 flush 在同一事务写入当前版本。
+        assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v1");
+        let _ = token_file;
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

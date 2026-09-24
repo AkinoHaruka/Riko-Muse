@@ -23,3 +23,6 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 uuid = { version = "1", features = ["v7"] }
+# v2 模型客户端（doc2/05 §2）：HTTPS/TLS、DNS、超时、有界响应、标准编码。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "stream"] }
+futures-util = "0.3"

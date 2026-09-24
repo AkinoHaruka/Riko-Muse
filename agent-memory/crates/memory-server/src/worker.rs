@@ -4,16 +4,14 @@
 //! 模型失败只影响派生速度，不丢已提交 L0；重试 3 次后 dead（5/15/45s 延迟）。
 //! 模型密钥从文件读取，不进日志、不进 Prompt。
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use memory_domain::{Origin, ScopeKey};
 use memory_extract::{
-    admit, ExtractError, ExtractModel, Extraction, EXTRACT_PROMPT_VERSION, EXTRACT_SYSTEM_PROMPT,
+    admit, ExtractError, ExtractModel, Extraction, ExtractOutput, EXTRACT_PROMPT_VERSION,
+    EXTRACT_SYSTEM_PROMPT,
 };
 use memory_store_sqlite::JobRow;
-use serde::Serialize;
 
 use crate::AppState;
 
@@ -34,10 +32,14 @@ mod tests {
     }
 
     impl ExtractModel for MockModel {
-        async fn extract(&self, _system: &str, _user: &str) -> Result<String, ExtractError> {
+        async fn extract(&self, _system: &str, _user: &str) -> Result<memory_extract::ExtractOutput, ExtractError> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self.response.clone())
+            Ok(memory_extract::ExtractOutput {
+                content: self.response.clone(),
+                input_tokens: None,
+                output_tokens: None,
+            })
         }
     }
 
@@ -446,117 +448,125 @@ mod tests {
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
+    /// 完整 Chat Completions URL（doc2/05 §2：不自行拼路径）。
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
     pub timeout: Duration,
 }
 
-/// OpenAI 兼容提取客户端。手写最小 HTTP/1.1（本机/内网端点，避免外部依赖）。
+/// 模型响应正文上限（doc2/05 §2：有界响应，防异常大包）。
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// v2 模型客户端（doc2/05 §2）：reqwest 处理 HTTPS/TLS、DNS、超时与标准响应编码；
+/// 只接受 2xx + `choices[0].message.content` 字符串；usage 有则返回。
 pub struct OpenAiCompatibleClient {
     cfg: ModelConfig,
+    http: reqwest::Client,
 }
 
 impl OpenAiCompatibleClient {
-    pub fn new(cfg: ModelConfig) -> Self {
-        Self { cfg }
+    pub fn new(cfg: ModelConfig) -> Result<Self, String> {
+        // 启动校验：scheme http/https、主机与路径明确（完整 endpoint，不猜路径）。
+        let url = reqwest::Url::parse(&cfg.endpoint)
+            .map_err(|e| format!("model_endpoint 不是合法 URL: {e}"))?;
+        match url.scheme() {
+            "http" | "https" => {}
+            other => return Err(format!("model_endpoint scheme 必须是 http/https，实际 {other}")),
+        }
+        if url.host_str().is_none() || url.path().len() <= 1 {
+            return Err("model_endpoint 必须包含主机与具体路径（完整 Chat Completions URL）".into());
+        }
+        let http = reqwest::Client::builder()
+            .connect_timeout(cfg.timeout)
+            .timeout(cfg.timeout)
+            .build()
+            .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+        Ok(Self { cfg, http })
     }
 }
 
 impl ExtractModel for OpenAiCompatibleClient {
-    async fn extract(&self, system: &str, user: &str) -> Result<String, ExtractError> {
-        let cfg = self.cfg.clone();
-        let system = system.to_string();
-        let user = user.to_string();
-        tokio::task::spawn_blocking(move || http_post_json(&cfg, &system, &user))
+    async fn extract(&self, system: &str, user: &str) -> Result<ExtractOutput, ExtractError> {
+        #[derive(serde::Serialize)]
+        struct Msg<'a> {
+            role: &'a str,
+            content: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            model: &'a str,
+            messages: [Msg<'a>; 2],
+            temperature: f32,
+        }
+        let req = Req {
+            model: &self.cfg.model,
+            messages: [Msg { role: "system", content: system }, Msg { role: "user", content: user }],
+            temperature: 0.0,
+        };
+        let resp = self
+            .http
+            .post(&self.cfg.endpoint)
+            .bearer_auth(&self.cfg.api_key)
+            .json(&req)
+            .send()
             .await
-            .map_err(|e| ExtractError::Transport(format!("spawn_blocking 失败: {e}")))?
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ExtractError::Timeout
+                } else {
+                    ExtractError::Transport(format!("模型端点请求失败: {e}"))
+                }
+            })?;
+        let status = resp.status();
+        if status.as_u16() == 408 || status.as_u16() == 504 {
+            return Err(ExtractError::Timeout);
+        }
+        if !status.is_success() {
+            return Err(ExtractError::Transport(format!("模型端点返回 {status}")));
+        }
+        // 有界读取正文（流式累积，超限即失败，不静默截断）。
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut raw: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ExtractError::Transport(format!("读取响应失败: {e}")))?;
+            if raw.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(ExtractError::Transport(format!(
+                    "模型响应超过 {MAX_RESPONSE_BYTES} 字节上限"
+                )));
+            }
+            raw.extend_from_slice(&chunk);
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|_| ExtractError::BadJson)?;
+        let content = parsed
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .ok_or(ExtractError::BadJson)?
+            .to_string();
+        // usage 有则记录；提供者未给时保持 None，不估算（doc2/05 §2）。
+        let usage = parsed.get("usage");
+        let input_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_i64());
+        let output_tokens = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_i64());
+        Ok(ExtractOutput { content, input_tokens, output_tokens })
     }
 }
 
-fn http_post_json(cfg: &ModelConfig, system: &str, user: &str) -> Result<String, ExtractError> {
-    let url = cfg
-        .endpoint
-        .strip_prefix("http://")
-        .ok_or_else(|| ExtractError::Transport("首版仅支持 http:// 模型端点".into()))?;
-    let (hostport, path) = url
-        .split_once('/')
-        .map(|(h, p)| (h, format!("/{p}")))
-        .unwrap_or((url, "/v1/chat/completions".into()));
-    let (host, port) = hostport
-        .split_once(':')
-        .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(80)))
-        .unwrap_or((hostport, 80));
-
-    #[derive(Serialize)]
-    struct Msg<'a> {
-        role: &'a str,
-        content: &'a str,
-    }
-    #[derive(Serialize)]
-    struct Req<'a> {
-        model: &'a str,
-        messages: [Msg<'a>; 2],
-        temperature: f32,
-    }
-    let body = serde_json::to_string(&Req {
-        model: &cfg.model,
-        messages: [Msg { role: "system", content: system }, Msg { role: "user", content: user }],
-        temperature: 0.0,
-    })
-    .map_err(|e| ExtractError::Transport(e.to_string()))?;
-
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect_timeout(
-        &addr.parse().map_err(|e: std::net::AddrParseError| ExtractError::Transport(e.to_string()))?,
-        cfg.timeout,
-    )
-    .map_err(|e| ExtractError::Transport(format!("连接模型端点失败: {e}")))?;
-    stream
-        .set_read_timeout(Some(cfg.timeout))
-        .map_err(|e| ExtractError::Transport(e.to_string()))?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nAuthorization: Bearer {key}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        key = cfg.api_key,
-        len = body.len()
-    );
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| ExtractError::Transport(format!("写入请求失败: {e}")))?;
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| ExtractError::Transport(format!("读取响应失败: {e}")))?;
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let (head, resp_body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| ExtractError::Transport("响应缺少头部分隔".into()))?;
-    let status_line = head.lines().next().unwrap_or("");
-    let status_code: u32 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ExtractError::Transport(format!("无法解析状态行: {status_line}")))?;
-    if status_code == 408 || status_code == 504 {
-        return Err(ExtractError::Timeout);
-    }
-    if !(200..300).contains(&status_code) {
-        return Err(ExtractError::Transport(format!("模型端点返回 {status_code}")));
-    }
-    // 解析 OpenAI chat completion：choices[0].message.content。
-    let parsed: serde_json::Value =
-        serde_json::from_str(resp_body).map_err(|_| ExtractError::BadJson)?;
-    let content = parsed
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .ok_or(ExtractError::BadJson)?;
-    Ok(content.to_string())
-}
-
-/// 启动单 worker 串行循环（D-10）。模型未配置时不开线程。
+/// 启动单 worker 串行循环（D-10）。模型未配置或客户端构建失败时不开线程并报明确错误。
 pub fn spawn_worker(state: AppState, model: Option<ModelConfig>) {
     let Some(cfg) = model else { return };
-    let client = OpenAiCompatibleClient::new(cfg.clone());
+    let client = match OpenAiCompatibleClient::new(cfg.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[worker] 模型客户端初始化失败，自动提取不可用: {e}");
+            return;
+        }
+    };
     tokio::spawn(async move {
         loop {
             let claimed = {
@@ -589,7 +599,21 @@ async fn process_job<M: ExtractModel>(
     job: &JobRow,
 ) -> Result<(), String> {
     let scope = ScopeKey { tenant_id: job.tenant_id.clone(), user_id: job.user_id.clone() };
-    let (events, origin, attempts) = {
+    let attempts = job.attempts + 1;
+    // doc2/05 §3：worker 按作业行 prompt_version 选规则；未知版本显式失败并保留可诊断状态，
+    // 不能用"最新规则"处理旧作业。
+    if job.prompt_version != EXTRACT_PROMPT_VERSION {
+        let mut guard = state.store.lock().unwrap();
+        let code = "UNKNOWN_PROMPT_VERSION";
+        match guard.fail_job(&job.id, attempts, code).map_err(|x| x.to_string())? {
+            memory_store_sqlite::FailOutcome::Retryable { .. } => {}
+            memory_store_sqlite::FailOutcome::Dead => {
+                eprintln!("[worker] job {} 已 dead（{code}）", job.id);
+            }
+        }
+        return Err(format!("作业 prompt_version={} 无对应规则实现", job.prompt_version));
+    }
+    let (events, origin) = {
         let guard = state.store.lock().unwrap();
         let lower = guard
             .window_lower_bound(&scope, &job.host_id, &job.session_id, &job.window_key)
@@ -597,13 +621,12 @@ async fn process_job<M: ExtractModel>(
         let events = guard
             .load_window_events(&scope, job, lower)
             .map_err(|e| e.to_string())?;
-        let attempts = job.attempts + 1;
         let origin = Origin {
             host_id: job.host_id.clone(),
             agent_id: "extract-worker".into(),
             session_id: job.session_id.clone(),
         };
-        (events, origin, attempts)
+        (events, origin)
     };
 
     // 输入：按 seq 排序的事件 JSON（doc/13 §4）。
@@ -623,9 +646,9 @@ async fn process_job<M: ExtractModel>(
     let result = client.extract(EXTRACT_SYSTEM_PROMPT, &input).await;
     let mut guard = state.store.lock().unwrap();
     match result {
-        Ok(text) => {
+        Ok(output) => {
             let extraction: Result<Extraction, String> =
-                serde_json::from_str(&text).map_err(|e| e.to_string());
+                serde_json::from_str(&output.content).map_err(|e| e.to_string());
             match extraction {
                 Ok(ex) => {
                     let mut last_err: Option<String> = None;
@@ -648,9 +671,15 @@ async fn process_job<M: ExtractModel>(
                         let _ = guard.fail_job(&job.id, attempts, "CANDIDATE_WRITE_FAILED");
                         return Err(e);
                     }
-                    // 用量：手写客户端未解析 usage，留空（提供者返回时记录，doc/09）。
+                    // 用量：提供者给了 usage 就持久化，没给保持 NULL 不估算（doc2/05 §2）。
                     guard
-                        .complete_job(&job.id, attempts, &cfg.model, None, None)
+                        .complete_job(
+                            &job.id,
+                            attempts,
+                            &cfg.model,
+                            output.input_tokens,
+                            output.output_tokens,
+                        )
                         .map_err(|e| e.to_string())?;
                     Ok(())
                 }
