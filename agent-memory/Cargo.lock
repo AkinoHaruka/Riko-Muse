@@ -621,6 +621,7 @@ dependencies = [
  "memory-domain",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -659,6 +660,7 @@ dependencies = [
  "hex",
  "memory-contract",
  "memory-domain",
+ "memory-extract",
  "memory-recall",
  "rand",
  "rusqlite",

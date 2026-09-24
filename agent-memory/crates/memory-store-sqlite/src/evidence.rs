@@ -174,9 +174,9 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
     }
 
-    fn setup() -> (Store, ScopeKey) {
+    fn setup(tag: &str) -> (Store, ScopeKey) {
         let mut store = Store::open_in_memory(&migrations_dir()).unwrap();
-        let dir = std::env::temp_dir().join(format!("am-ev-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("am-ev-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         store
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn replay_is_idempotent_and_conflict_detected() {
-        let (mut store, scope) = setup();
+        let (mut store, scope) = setup("replay");
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
         let r1 = store
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn latest_user_event_skips_plugin_and_assistant() {
-        let (mut store, scope) = setup();
+        let (mut store, scope) = setup("latest");
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
         store.record_evidence(&scope, &o, 0, "user", "user", &t, "第一句").unwrap();

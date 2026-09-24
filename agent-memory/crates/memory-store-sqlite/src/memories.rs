@@ -79,7 +79,7 @@ fn is_active_clause(include_history: bool) -> &'static str {
 }
 
 impl Store {
-    fn mark_index_dirty(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+    pub(crate) fn mark_index_dirty(conn: &rusqlite::Connection) -> Result<(), StoreError> {
         conn.execute(
             "UPDATE index_state SET dirty=1, updated_at=?1 WHERE singleton=1",
             params![now_rfc3339()?],
@@ -105,7 +105,7 @@ impl Store {
     }
 
     /// 索引事务：删除旧派生行，插入当前 active 行（doc/13 §7）。
-    fn reindex_memory(
+    pub(crate) fn reindex_memory(
         &mut self,
         scope: &ScopeKey,
         memory_id: &str,

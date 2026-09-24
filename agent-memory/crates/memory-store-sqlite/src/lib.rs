@@ -41,14 +41,18 @@ pub enum StoreError {
     StaleUserEvidence,
     #[error("quote 不是原文连续子串")]
     QuoteMismatch,
+    #[error("窗口/状态冲突（through_event_seq 越界、乱序 flush 或窗口超限）")]
+    StateConflict,
     #[error("时间溢出: {0}")]
     Time(String),
 }
 
 pub mod evidence;
+pub mod jobs;
 pub mod memories;
 
 pub use evidence::IngestOutcome;
+pub use jobs::{CandidateOutcome, FailOutcome, FlushOutcome, JobRow};
 pub use memories::{has_history_cue, ComposeResult, MemoryRow, RememberOutcome, SearchHit};
 
 pub struct Store {

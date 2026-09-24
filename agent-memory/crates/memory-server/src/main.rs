@@ -21,9 +21,14 @@ use memory_contract::{
     SCHEMA_VERSION, SEARCH_QUERY_MAX_CHARS,
 };
 use memory_domain::{MemoryKind, Origin, ScopeKey};
-use memory_store_sqlite::{ComposeResult, IngestOutcome, RememberOutcome, SearchHit, Store, StoreError};
+use memory_store_sqlite::{
+    ComposeResult, FlushOutcome, IngestOutcome, JobRow, RememberOutcome, SearchHit, Store,
+    StoreError,
+};
 use serde::Deserialize;
 use uuid::Uuid;
+
+mod worker;
 
 /// 构建标识：优先取编译期注入的 commit，否则 "dev"。
 const BUILD: &str = match option_env!("AGENT_MEMORY_BUILD") {
@@ -94,6 +99,11 @@ struct Config {
     listen_addr: String,
     db_path: PathBuf,
     migrations_dir: PathBuf,
+    /// OpenAI 兼容提取端点（http://host:port/path）。未配置则不启动提取 worker。
+    model_endpoint: Option<String>,
+    model_name: Option<String>,
+    /// 模型密钥文件路径（密钥不进配置、不进日志）。
+    model_key_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -137,11 +147,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store.doctor_summary().unwrap_or_else(|e| format!("诊断失败: {e}"))
             );
             let state = AppState { store: Arc::new(Mutex::new(store)) };
+            // 提取 worker：模型配置齐全才启动；端点不可达时作业可见失败，不影响手工记忆（doc/09）。
+            let model_cfg = match (&cfg.model_endpoint, &cfg.model_name, &cfg.model_key_file) {
+                (Some(endpoint), Some(name), Some(key_file)) => {
+                    let api_key = std::fs::read_to_string(key_file)
+                        .map_err(|e| format!("读取模型密钥文件失败 {}: {e}", key_file.display()))?
+                        .trim()
+                        .to_string();
+                    Some(worker::ModelConfig {
+                        endpoint: endpoint.clone(),
+                        model: name.clone(),
+                        api_key,
+                        timeout: std::time::Duration::from_secs(
+                            memory_contract::MODEL_CALL_TIMEOUT_SECS,
+                        ),
+                    })
+                }
+                _ => None,
+            };
+            worker::spawn_worker(state.clone(), model_cfg);
             let addr: SocketAddr = cfg.listen_addr.parse().expect("配置已校验为 loopback");
             let app = Router::new()
                 .route("/v1/health", get(health))
                 .route("/v1/version", get(version))
                 .route("/v1/evidence/events", post(ingest_events))
+                .route("/v1/extraction/flush", post(flush_window))
+                .route("/v1/jobs/{job_id}", get(get_job))
+                .route("/v1/jobs/{job_id}/retry", post(retry_job))
                 .route("/v1/memories/remember", post(remember_memory))
                 .route("/v1/memories/search", post(search_memories))
                 .route("/v1/memories/{memory_id}", get(get_memory))
@@ -590,6 +622,94 @@ async fn compose_context(
             }))
             .into_response()
         }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- POST /v1/extraction/flush + /v1/jobs（doc/12 §4）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlushRequest {
+    host_id: String,
+    session_id: String,
+    through_event_seq: i64,
+}
+
+async fn flush_window(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<FlushRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    if body.host_id.is_empty() || body.session_id.is_empty() || body.through_event_seq < 0 {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "host_id/session_id 非空且 through_event_seq 非负");
+    }
+    let outcome = {
+        let mut guard = state.store.lock().unwrap();
+        guard.flush_window(&scope, &body.host_id, &body.session_id, body.through_event_seq)
+    };
+    match outcome {
+        Ok(FlushOutcome::NothingToExtract) => Json(serde_json::json!({
+            "request_id": req_id.0, "status": "nothing_to_extract"
+        }))
+        .into_response(),
+        Ok(FlushOutcome::Created { job_id }) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "request_id": req_id.0, "job_id": job_id, "status": "queued" })),
+        )
+            .into_response(),
+        Ok(FlushOutcome::Existing { job_id, status }) => Json(serde_json::json!({
+            "request_id": req_id.0, "job_id": job_id, "status": status
+        }))
+        .into_response(),
+        Err(StoreError::StateConflict) => {
+            err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "through_event_seq 越界或乱序 flush")
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+fn job_json(req_id: &str, j: &JobRow) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": req_id,
+        "job_id": j.id,
+        "status": j.status,
+        "attempts": j.attempts,
+        "created_at": j.created_at,
+        "updated_at": j.updated_at
+    })
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    match state.store.lock().unwrap().get_job(&scope, &job_id) {
+        Ok(Some(j)) => Json(job_json(&req_id.0, &j)).into_response(),
+        Ok(None) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "作业不存在"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn retry_job(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    match state.store.lock().unwrap().retry_dead_job(&scope, &job_id) {
+        Ok(true) => Json(serde_json::json!({ "request_id": req_id.0, "job_id": job_id, "status": "queued" })).into_response(),
+        Ok(false) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "仅 dead 状态作业可重试"),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }

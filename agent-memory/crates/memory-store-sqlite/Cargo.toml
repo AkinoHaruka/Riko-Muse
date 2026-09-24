@@ -9,6 +9,7 @@ license.workspace = true
 memory-contract.workspace = true
 memory-domain.workspace = true
 memory-recall.workspace = true
+memory-extract.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 hex = "0.4"
