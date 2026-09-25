@@ -15,20 +15,21 @@
 | [03 待办与已知冲突](03-待办与已知冲突.md) | 剩下的活、最后一个失败现象与假设、文档冲突、禁区 |
 | [08 收口复验](08-收口复验记录.md) | doc4 收口：真实 DSH 宿主复验、dana 库副本迁移 0003 演练、定向源码复核发现与分类 |
 | [09 D5 交付记录](09-D5交付记录.md) | doc5 记忆质量规则实施（D5-0—D5-6）、迁移 0004 副本演练、HTTP 冒烟、离线召回探针 |
-| [10 D5 真实模型验证](10-D5真实模型验证.md) | **最新事实（doc5 之后）**：真实 DSH 闭环复验（mock）+ 真实模型首轮观察（extract_v3/admit_v2 真实候选分布、remember 拒绝的宿主表现、召回探针） |
+| [10 D5 真实模型验证](10-D5真实模型验证.md) | 真实 DSH 闭环复验（mock）+ 真实模型首轮观察（extract_v3/admit_v2 真实候选分布、remember 拒绝的宿主表现、召回探针） |
+| [11 决策 A/B 实施与凭据闸门设计](11-决策AB实施与凭据闸门设计.md) | **最新事实（doc5/09 之后）**：决策 A 端点窄映射（ea23c29）、决策 B 直写单命题粒度门（4cb7eb5）实施与验收；保存凭据闸门源码核对与最小设计提案（未实现） |
 
 ## 30 秒状态
 
 ```
-根仓库 HEAD：D5-6（git log 查 feat(D5-x)/fix(D5-0)，2026-09-25 晚）
+根仓库 HEAD：D5-09B（git log 查 feat(D5-09A)/feat(D5-09B)，2026-09-25 深夜）
 工作区未跟踪：deepseek-harness/（官方 clone，只读参考，禁止 git add）、doc2/、doc3/、doc5/
 未提交改动：无（工作区干净，除上述未跟踪目录）
-Rust：68 个单测全过；memoryd schema_version=4（迁移 0004 已在 schema 3 文件副本演练通过，dana/realtest 原库未升级）
+Rust：71 个单测全过；memoryd schema_version=4（迁移 0004 已在 schema 3 文件副本演练通过，dana/realtest 原库未升级）
 准入版本：新作业 extract_v3/admit_v2，旧作业冻结 admit_v1；未知版本确定性立即 dead
-直写窄门：凭据永不 active、时间性暂拒、健康/第三人需「请记住：<原话>」相邻保存指令（HTTP 冒烟 409/201 实测）
-真实 DSH 闭环：doc5 改动已复验（10 §1，mock 模型，官方宿主进程）
-真实模型：SiliconFlow Qwen3.5-4B 双链路连通；extract_v3/admit_v2 首轮真实观察完成（10 §2，小样本，不引申为质量提升）
-未做：dana/realtest 原库 0003+0004 实际升级（独立决策；须先只读快照 + 处理 dana index_dirty=1）、STATE_CONFLICT 是否入适配器 USER_FIXABLE（契约决策，10 §1）、直写复合命题粒度（产品决策，10 §2.2）
+直写窄门：凭据永不 active、时间性暂拒、健康/第三人需「请记住：<原话>」相邻保存指令、复合命题一次拒绝（D5-09B）
+适配器：memory_remember 的 409 STATE_CONFLICT 端点窄映射为 {ok:false,error}（D5-09A）；其他工具同名错误仍 throw
+真实模型：SiliconFlow Qwen3.5-4B 双链路已连通并完成首轮观察（10 §2，小样本不引申为质量提升）
+待做：保存凭据闸门机制（设计提案在 11 §3，待用户定稿后实施）、dana/realtest 原库 0003+0004 实际升级（独立决策；先只读快照 + 处理 dana index_dirty=1）
 ```
 
 ## 最重要的三条禁区
