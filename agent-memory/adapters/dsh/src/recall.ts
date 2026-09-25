@@ -5,7 +5,12 @@
  * - 查询只从本次 args.messages 选最后一条 source.kind==='user' 的原始用户消息；
  *   缺少明确 source 不提升为用户。
  * - compose 与 args.signal 共同取消，默认 500ms；空/离线/错误 → 原 decision。
- * - 注入用官方 createUserMessage，source.kind='plugin' + 稳定插件名 → 事件线不会回流为用户证据。
+ * - 注入用官方 createUserMessage。
+ *   冲突记录（doc2/04 §4 写 source.kind='plugin'，官方 v4 会话格式已退役该 kind，
+ *   session-format-v3-to-v4/src/message-sources.ts 明确拒绝 kind==='plugin'）：
+ *   按一方惯例（agent-instructions/time-context）使用 producer 自有 kind 名
+ *   {kind:'agent-memory', form:'recall'}；事件线只认 source.kind==='user'，
+ *   故注入不会回流为用户证据。
  * - 同一 decision 已有本插件消息 → 跳过，防重复注入。
  */
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -17,13 +22,12 @@ import type { Logger } from "./events.js";
 
 declare module "@deepseek-ai/dsh-llm" {
   interface MessageSourceMap {
-    /** 记忆上下文注入：producer 为本适配器；kind='plugin' 使事件线拒绝其为用户证据。 */
-    "agent-memory": { kind: "plugin"; plugin: "@agent-memory/dsh-adapter"; form: "agent-memory" };
+    /** 记忆上下文注入：producer 自有 kind（v4 格式要求），事件线拒绝其为用户证据。 */
+    "agent-memory": { kind: "agent-memory"; form: "recall" };
   }
 }
 
-export const PLUGIN_NAME = "@agent-memory/dsh-adapter";
-export const INJECTION_FORM = "agent-memory";
+export const PLUGIN_KIND = "agent-memory";
 
 export interface PreStepPayload {
   agent: Agent;
@@ -53,7 +57,7 @@ export function latestOriginalUserText(messages: readonly UserMessage[]): string
 
 function alreadyInjected(decision: PreStepDecision): boolean {
   if (decision.kind !== "enter") return false;
-  return decision.messages.some((m) => m.source?.kind === "plugin" && (m.source as { plugin?: string }).plugin === PLUGIN_NAME);
+  return decision.messages.some((m) => m.source?.kind === PLUGIN_KIND);
 }
 
 export function makePreStepHook(client: MemoryClient, logger: Logger, composeTimeoutMs: number) {
@@ -81,7 +85,7 @@ export function makePreStepHook(client: MemoryClient, logger: Logger, composeTim
         if (!body.text) return decision; // 无可用记忆不加占位
         const memoryMessage = createUserMessage({
           content: [{ type: "text", text: body.text }],
-          source: { kind: "plugin", plugin: PLUGIN_NAME, form: INJECTION_FORM },
+          source: { kind: PLUGIN_KIND, form: "recall" },
         });
         return { ...decision, messages: [...decision.messages, memoryMessage] };
       } finally {
