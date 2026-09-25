@@ -17,3 +17,6 @@ node_modules/
 # 本地密钥与令牌文件（严禁入库）
 *.token
 secrets/
+
+# 用户提供的模型凭据便签（真实密钥在 %LOCALAPPDATA%/AgentMemory/v2/realtest/model.key）
+模型.txt
