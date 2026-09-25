@@ -10,7 +10,7 @@ use memory_domain::{Origin, ScopeKey};
 use memory_extract::{
     admit, ExtractError, ExtractModel, Extraction, ExtractOutput,
 };
-use memory_store_sqlite::JobRow;
+use memory_store_sqlite::{FailOutcome, JobRow, StoreError};
 
 use crate::AppState;
 
@@ -85,6 +85,15 @@ mod tests {
         }
     }
 
+    /// 以某 RFC3339 时刻为基准加秒（相对已落库时间戳推导，保证确定性）。
+    fn plus_secs(rfc3339: &str, secs: i64) -> String {
+        (chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::seconds(secs))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    }
+
     #[tokio::test]
     async fn flush_idempotent_and_worker_promotes_candidates() {
         let (store, scope) = setup("promote");
@@ -143,7 +152,14 @@ mod tests {
             max_tokens: 1024,
             extra_body: None,
         };
-        process_job(&state, &mock, cfg, &job).await.unwrap();
+        // 先领取（claim 置 running + generation），worker 只处理已领取作业。
+        let claimed = store
+            .lock()
+            .unwrap()
+            .claim_next_ordered_job(&plus_secs(&job.run_after, 1))
+            .unwrap()
+            .unwrap();
+        process_job(&state, &mock, cfg, &claimed).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // 提取结果：候选被准为 active 并建成记忆。
@@ -184,9 +200,15 @@ mod tests {
             max_tokens: 1024,
             extra_body: None,
         };
-        let r = process_job(&state, &mock, cfg, &job).await;
+        let claimed = store
+            .lock()
+            .unwrap()
+            .claim_next_ordered_job(&plus_secs(&job.run_after, 1))
+            .unwrap()
+            .unwrap();
+        let r = process_job(&state, &mock, cfg, &claimed).await;
         assert!(r.is_err());
-        // L0 仍在；作业 retryable。
+        // L0 仍在；作业 retryable（BAD_JSON 按退避重试，状态已落地）。
         let j = store.lock().unwrap().get_job(&scope, &job_id).unwrap().unwrap();
         assert_eq!(j.status, "retryable_failed");
         assert_eq!(j.attempts, 1);
@@ -199,11 +221,17 @@ mod tests {
         let (store, scope) = setup("dedup");
         let mut g = store.lock().unwrap();
         let ev1 = ingest_user(&mut g, &scope, 1, "以后用中文回答");
-        let job_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        let job1_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
             FlushOutcome::Created { job_id } => job_id,
             _ => panic!(),
         };
-        let job = g.get_job(&scope, &job_id).unwrap().unwrap();
+        // save_candidate 事务内核对 running+generation，必须先真实领取。
+        let run_after1 = g.get_job(&scope, &job1_id).unwrap().unwrap().run_after;
+        let job = g
+            .claim_next_ordered_job(&plus_secs(&run_after1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, job1_id);
         let origin = memory_domain::Origin {
             host_id: "dsh".into(),
             agent_id: "extract".into(),
@@ -221,14 +249,21 @@ mod tests {
             .save_candidate(&scope, &job, &origin, &c1, memory_extract::Admission::Active)
             .unwrap();
         assert!(matches!(out1, memory_store_sqlite::CandidateOutcome::Active { .. }), "首个候选应 active");
+        // job1 完成后 job2 才可领取（前窗规则：through 1 未完成会阻断 through 2）。
+        g.complete_job(&job1_id, job.claim_generation, 1, "mock", None, None).unwrap();
 
         // 规则 9：同属性键（response_language=以后用...回答）不同值 → POSSIBLE_CONFLICT held。
         let ev2 = ingest_user(&mut g, &scope, 2, "以后用英文回答");
-        let job2 = match g.flush_window(&scope, "dsh", "s1", 2).unwrap() {
+        let job2_id = match g.flush_window(&scope, "dsh", "s1", 2).unwrap() {
             FlushOutcome::Created { job_id } => job_id,
             _ => panic!(),
         };
-        let job2 = g.get_job(&scope, &job2).unwrap().unwrap();
+        let run_after2 = g.get_job(&scope, &job2_id).unwrap().unwrap().run_after;
+        let job2 = g
+            .claim_next_ordered_job(&plus_secs(&run_after2, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job2.id, job2_id);
         let c2 = memory_extract::ModelCandidate {
             source_event_id: ev2,
             quote: "以后用英文回答".into(),
@@ -257,11 +292,16 @@ mod tests {
         let (store, scope) = setup("suppress");
         let mut g = store.lock().unwrap();
         let ev1 = ingest_user(&mut g, &scope, 1, "我喜欢Rust");
-        let job1 = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        let job1_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
             FlushOutcome::Created { job_id } => job_id,
             _ => panic!(),
         };
-        let job1 = g.get_job(&scope, &job1).unwrap().unwrap();
+        let run_after = g.get_job(&scope, &job1_id).unwrap().unwrap().run_after;
+        let job1 = g
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job1.id, job1_id);
         let origin = memory_domain::Origin {
             host_id: "dsh".into(),
             agent_id: "extract".into(),
@@ -443,22 +483,25 @@ mod tests {
             FlushOutcome::Created { job_id } => job_id,
             _ => panic!(),
         };
-        let _ = scope;
-        // 第 1、2 次失败 → retryable；第 3 次 → dead。
-        assert!(matches!(
-            g.fail_job(&job_id, 1, "MODEL_UNAVAILABLE").unwrap(),
-            memory_store_sqlite::FailOutcome::Retryable { .. }
-        ));
-        assert!(matches!(
-            g.fail_job(&job_id, 2, "MODEL_UNAVAILABLE").unwrap(),
-            memory_store_sqlite::FailOutcome::Retryable { .. }
-        ));
-        assert!(matches!(
-            g.fail_job(&job_id, 3, "MODEL_UNAVAILABLE").unwrap(),
-            memory_store_sqlite::FailOutcome::Dead
-        ));
+        // 第 1、2 次失败 → retryable；第 3 次 → dead。fail/complete 只在
+        // running + generation 匹配时生效（doc4/02 §5），每轮先真实领取。
+        for round in 1..=3i32 {
+            let run_after = g.get_job(&scope, &job_id).unwrap().unwrap().run_after;
+            let claimed = g
+                .claim_next_ordered_job(&plus_secs(&run_after, 1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.id, job_id);
+            let outcome = g.fail_job(&job_id, claimed.claim_generation, round, "MODEL_UNAVAILABLE");
+            if round < 3 {
+                assert!(matches!(outcome, Ok(memory_store_sqlite::FailOutcome::Retryable { .. })));
+            } else {
+                assert!(matches!(outcome, Ok(memory_store_sqlite::FailOutcome::Dead)));
+            }
+        }
         let j = g.get_job(&scope.clone(), &job_id).unwrap().unwrap();
         assert_eq!(j.status, "dead");
+        assert_eq!(j.attempts, 3);
         // 幂等窗口键仍生效：重试 dead 后 requeue。
         assert!(g.retry_dead_job(&memory_domain::ScopeKey { tenant_id: "t".into(), user_id: "u".into() }, &job_id).unwrap());
     }
@@ -496,23 +539,38 @@ mod tests {
         // 未知版本显式失败，不得用"最新规则"处理旧作业。
         let (store, scope) = setup("dispatch");
         let state = AppState { store: store.clone() };
-        let job_id = {
-            let mut g = store.lock().unwrap();
-            ingest_user(&mut g, &scope, 1, "以后回答我用中文");
-            match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
-                FlushOutcome::Created { job_id } => job_id,
-                _ => panic!(),
-            }
-        };
-        let get_job = |store: &Arc<Mutex<Store>>, id: &str| {
+        // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
+        for (session, content) in [
+            ("sv2", "以后回答我用中文"),
+            ("sv1", "以后回答我用中文"),
+            ("sv0", "以后回答我用中文"),
+        ] {
+            let t = chrono::Utc::now();
+            let origin = memory_domain::Origin {
+                host_id: "dsh".into(),
+                agent_id: "agent-a".into(),
+                session_id: session.into(),
+            };
             store
                 .lock()
                 .unwrap()
-                .get_job(&memory_domain::ScopeKey { tenant_id: "t".into(), user_id: "u".into() }, id)
+                .record_evidence(&scope, &origin, 1, "user", "user", &t, content)
+                .unwrap();
+        }
+        let flush_job = |store: &Arc<Mutex<Store>>, session: &str| {
+            let mut g = store.lock().unwrap();
+            let job_id = match g.flush_window(&scope, "dsh", session, 1).unwrap() {
+                FlushOutcome::Created { job_id } => job_id,
+                _ => panic!(),
+            };
+            let run_after = g.get_job(&scope, &job_id).unwrap().unwrap().run_after;
+            let claimed = g
+                .claim_next_ordered_job(&plus_secs(&run_after, 1))
                 .unwrap()
-                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.id, job_id);
+            claimed
         };
-        let mut job = get_job(&store, &job_id);
         let cfg = ModelConfig {
             endpoint: "http://unused".into(),
             model: "mock".into(),
@@ -524,22 +582,25 @@ mod tests {
         let empty = Arc::new(Mutex::new(String::new()));
 
         // 当前版本（extract_v2）作业 → 当前提示词。
+        let mut job = flush_job(&store, "sv2");
+        assert_eq!(job.prompt_version, memory_contract::EXTRACT_PROMPT_VERSION);
         let sys2 = empty.clone();
         let mock2 = SysCapture { system: sys2.clone(), response: "{\"candidates\":[]}".into() };
-        job.prompt_version = memory_contract::EXTRACT_PROMPT_VERSION.into();
         process_job(&state, &mock2, cfg.clone(), &job).await.unwrap();
         assert_eq!(*sys2.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT);
 
         // 老版本（extract_v1）作业 → 老提示词。
+        let mut job = flush_job(&store, "sv1");
+        job.prompt_version = memory_contract::EXTRACT_PROMPT_VERSION_V1.into();
         let sys1 = empty.clone();
         let mock1 = SysCapture { system: sys1.clone(), response: "{\"candidates\":[]}".into() };
-        job.prompt_version = memory_contract::EXTRACT_PROMPT_VERSION_V1.into();
         process_job(&state, &mock1, cfg.clone(), &job).await.unwrap();
         assert_eq!(*sys1.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT_V1);
 
         // 未知版本 → 显式失败，不改用最新规则。
-        let mock0 = SysCapture { system: empty.clone(), response: "{\"candidates\":[]}".into() };
+        let mut job = flush_job(&store, "sv0");
         job.prompt_version = "extract_v0".into();
+        let mock0 = SysCapture { system: empty.clone(), response: "{\"candidates\":[]}".into() };
         let err = process_job(&state, &mock0, cfg, &job).await.unwrap_err();
         assert!(err.contains("UNKNOWN_PROMPT_VERSION") || err.contains("无对应规则实现"), "实际错误: {err}");
     }
@@ -708,7 +769,40 @@ pub fn spawn_worker(state: AppState, model: Option<ModelConfig>) {
     });
 }
 
+/// 处理一个已领取作业：处理期间每 `JOB_HEARTBEAT_SECS` 条件化续租（doc4/02 §4）；
+/// 任务结束（成功/失败/丢弃）即停止心跳。续租失败只停止心跳并放弃续租，
+/// 作业结果是否可提交由数据库 generation 校验裁决（`process_job_inner`）。
 async fn process_job<M: ExtractModel>(
+    state: &AppState,
+    client: &M,
+    cfg: ModelConfig,
+    job: &JobRow,
+) -> Result<(), String> {
+    let heartbeat = {
+        let hb_state = state.clone();
+        let hb_job_id = job.id.clone();
+        let hb_generation = job.claim_generation;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(memory_contract::JOB_HEARTBEAT_SECS)).await;
+                let renewed = {
+                    // 只短暂持有 DB 锁；不在此等待模型。
+                    let mut guard = hb_state.store.lock().unwrap();
+                    guard.renew_job_lease(&hb_job_id, hb_generation).unwrap_or(false)
+                };
+                if !renewed {
+                    eprintln!("[worker] job {hb_job_id} 续租失败（失去执行权），停止心跳");
+                    break;
+                }
+            }
+        })
+    };
+    let result = process_job_inner(state, client, cfg, job).await;
+    heartbeat.abort();
+    result
+}
+
+async fn process_job_inner<M: ExtractModel>(
     state: &AppState,
     client: &M,
     cfg: ModelConfig,
@@ -716,38 +810,61 @@ async fn process_job<M: ExtractModel>(
 ) -> Result<(), String> {
     let scope = ScopeKey { tenant_id: job.tenant_id.clone(), user_id: job.user_id.clone() };
     let attempts = job.attempts + 1;
-    // doc2/05 §3：worker 按作业行 prompt_version 选规则；未知版本显式失败并保留可诊断状态，
-    // 不能用"最新规则"处理旧作业。
+
+    // 外层结果处理（doc4/02 §5）：一旦已 claim，任何错误离开本函数前都按类别落状态；
+    // 不再有"直接返回、作业留在 running"的路径。
+    // 确定性失败：未知 prompt 版本，同输入重试不会改变 → 立即 dead，不调用模型。
     let Some(system_prompt) = memory_extract::system_prompt_for(&job.prompt_version) else {
         let mut guard = state.store.lock().unwrap();
         let code = "UNKNOWN_PROMPT_VERSION";
-        match guard.fail_job(&job.id, attempts, code).map_err(|x| x.to_string())? {
-            memory_store_sqlite::FailOutcome::Retryable { .. } => {}
-            memory_store_sqlite::FailOutcome::Dead => {
+        match guard.fail_job(&job.id, job.claim_generation, attempts, code) {
+            Ok(FailOutcome::Retryable { .. }) => {}
+            Ok(FailOutcome::Dead) => {
                 eprintln!("[worker] job {} 已 dead（{code}）", job.id);
+            }
+            Err(e) => {
+                eprintln!("[worker] job {} 失败写入未生效（{e}），交由 lease 恢复", job.id);
             }
         }
         return Err(format!("作业 prompt_version={} 无对应规则实现", job.prompt_version));
     };
+
+    // 加载窗口 + 下界：窗口超限为确定性失败（不调用模型，直接 dead）；下界查询/读库
+    // 的暂态错误按退避重试（WINDOW_READ_FAILED）。锁在模型调用前释放。
     let (events, origin) = {
-        let guard = state.store.lock().unwrap();
-        let lower = guard
+        let mut guard = state.store.lock().unwrap();
+        let loaded = guard
             .window_lower_bound(&scope, &job.host_id, &job.session_id, job.through_event_seq)
-            .map_err(|e| e.to_string())?;
-        let events = guard
-            .load_window_events(&scope, job, lower)
-            .map_err(|e| e.to_string())?;
+            .and_then(|lower| Ok((lower, guard.load_window_events(&scope, job, lower)?)));
+        let (lower, events) = match loaded {
+            Ok(v) => v,
+            Err(StoreError::WindowTooLarge) => {
+                match guard.fail_job(&job.id, job.claim_generation, attempts, "WINDOW_TOO_LARGE") {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[worker] job {} 失败写入未生效（{e}），交由 lease 恢复", job.id),
+                }
+                return Err(format!("窗口超限（job {}，不调用模型，已 dead）", job.id));
+            }
+            Err(e) => {
+                match guard.fail_job(&job.id, job.claim_generation, attempts, "WINDOW_READ_FAILED") {
+                    Ok(_) => {}
+                    Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
+                }
+                return Err(format!("窗口加载失败: {e}"));
+            }
+        };
         let origin = Origin {
             host_id: job.host_id.clone(),
             agent_id: "extract-worker".into(),
             session_id: job.session_id.clone(),
         };
+        let _ = lower;
         (events, origin)
     };
 
-    // 输入：按 seq 排序的事件 JSON（doc/13 §4）。
-    let input = serde_json::to_string(
-        &events
+    // 输入：按 seq 排序的事件 JSON（doc/13 §4）。序列化失败按暂态处理。
+    let input = {
+        let payload: Vec<serde_json::Value> = events
             .iter()
             .map(|e| {
                 serde_json::json!({
@@ -755,12 +872,36 @@ async fn process_job<M: ExtractModel>(
                     "time": e.occurred_at, "text": e.content
                 })
             })
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|e| e.to_string())?;
+            .collect();
+        match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut guard = state.store.lock().unwrap();
+                match guard.fail_job(&job.id, job.claim_generation, attempts, "WINDOW_READ_FAILED") {
+                    Ok(_) => {}
+                    Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
+                }
+                return Err(format!("窗口输入序列化失败: {e}"));
+            }
+        }
+    };
 
+    // 模型网络调用不持锁。
     let result = client.extract(system_prompt, &input).await;
     let mut guard = state.store.lock().unwrap();
+    // 旧执行者隔离：提交任何结果前核当前代际；失败/查不动时丢弃本轮结果，
+    // 不改候选与作业状态，交由 lease 到期恢复（doc4/02 §5）。
+    match guard.job_generation_current(&job.id, job.claim_generation) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("[worker] job {} 失去执行权（STALE_CLAIM），丢弃模型结果", job.id);
+            return Err("STALE_CLAIM: 作业执行权已被恢复或接管".into());
+        }
+        Err(e) => {
+            eprintln!("[worker] job {} 执行权核验失败（{e}），丢弃本轮结果，等待 lease 恢复", job.id);
+            return Err(format!("执行权核验失败: {e}"));
+        }
+    }
     match result {
         Ok(output) => {
             let extraction: Result<Extraction, String> =
@@ -777,6 +918,13 @@ async fn process_job<M: ExtractModel>(
                                     job.id, outcome, job.prompt_version
                                 );
                             }
+                            Err(StoreError::StaleClaim) => {
+                                eprintln!(
+                                    "[worker] job {} 候选写入前失去执行权（STALE_CLAIM），丢弃剩余候选",
+                                    job.id
+                                );
+                                return Err("STALE_CLAIM: 候选写入前失去执行权".into());
+                            }
                             Err(e) => {
                                 eprintln!("[worker] save_candidate 失败 job={}: {e}", job.id);
                                 last_err = Some(e.to_string());
@@ -784,23 +932,34 @@ async fn process_job<M: ExtractModel>(
                         }
                     }
                     if let Some(e) = last_err {
-                        let _ = guard.fail_job(&job.id, attempts, "CANDIDATE_WRITE_FAILED");
+                        match guard.fail_job(&job.id, job.claim_generation, attempts, "CANDIDATE_WRITE_FAILED") {
+                            Ok(_) => {}
+                            Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
+                        }
                         return Err(e);
                     }
                     // 用量：提供者给了 usage 就持久化，没给保持 NULL 不估算（doc2/05 §2）。
-                    guard
-                        .complete_job(
-                            &job.id,
-                            attempts,
-                            &cfg.model,
-                            output.input_tokens,
-                            output.output_tokens,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    Ok(())
+                    match guard.complete_job(
+                        &job.id,
+                        job.claim_generation,
+                        attempts,
+                        &cfg.model,
+                        output.input_tokens,
+                        output.output_tokens,
+                    ) {
+                        Ok(()) => Ok(()),
+                        Err(StoreError::StaleClaim) => {
+                            eprintln!("[worker] job {} 完成提交时失去执行权（STALE_CLAIM），不改状态", job.id);
+                            Err("STALE_CLAIM: 完成提交未生效".into())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
                 }
                 Err(e) => {
-                    let _ = guard.fail_job(&job.id, attempts, "BAD_JSON");
+                    match guard.fail_job(&job.id, job.claim_generation, attempts, "BAD_JSON") {
+                        Ok(_) => {}
+                        Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
+                    }
                     Err(format!("模型响应不合法: {e}"))
                 }
             }
@@ -811,11 +970,12 @@ async fn process_job<M: ExtractModel>(
                 ExtractError::BadJson => "BAD_JSON",
                 ExtractError::Transport(_) => "MODEL_UNAVAILABLE",
             };
-            match guard.fail_job(&job.id, attempts, code).map_err(|x| x.to_string())? {
-                memory_store_sqlite::FailOutcome::Retryable { .. } => {}
-                memory_store_sqlite::FailOutcome::Dead => {
+            match guard.fail_job(&job.id, job.claim_generation, attempts, code) {
+                Ok(FailOutcome::Retryable { .. }) => {}
+                Ok(FailOutcome::Dead) => {
                     eprintln!("[worker] job {} 已 dead（{} 次尝试）", job.id, attempts);
                 }
+                Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
             }
             Err(format!("模型调用失败: {e}"))
         }

@@ -303,43 +303,95 @@ impl Store {
             },
         )?;
         let events = rows.collect::<Result<Vec<_>, _>>()?;
-        // 窗口上限（doc/13 §3）：100 事件 / 32 KiB，超限不悄悄截断。
+        // 窗口上限（doc/13 §3、doc4/03）：100 事件 / 32 KiB，超限不悄悄截断。
+        // 返回 WindowTooLarge：同输入重试不会改变，worker 侧确定性 dead，不空转重试。
         if events.len() > memory_contract::EXTRACTION_WINDOW_MAX_EVENTS {
-            return Err(StoreError::StateConflict);
+            return Err(StoreError::WindowTooLarge);
         }
         let total: usize = events.iter().map(|e| e.content.len()).sum();
         if total > memory_contract::EXTRACTION_INPUT_MAX_BYTES {
-            return Err(StoreError::StateConflict);
+            return Err(StoreError::WindowTooLarge);
         }
         Ok(events)
     }
 
+    /// 心跳续租（doc4/02 §4）：仅当前代际的 running 可续；返回 false 表示失去
+    /// 所有权，worker 应停止心跳并忽略后续模型结果。只做一次条件 UPDATE，
+    /// 短暂持有 DB 锁；模型网络调用绝不持锁。
+    pub fn renew_job_lease(&mut self, job_id: &str, generation: i64) -> Result<bool, StoreError> {
+        let now = now_rfc3339()?;
+        let lease = (chrono::Utc::now()
+            + chrono::Duration::seconds(memory_contract::JOB_LEASE_SECS as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let n = self.conn_mut().execute(
+            "UPDATE extraction_jobs SET lease_until=?1, updated_at=?2
+             WHERE id=?3 AND status='running' AND claim_generation=?4",
+            params![lease, now, job_id, generation],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 快查：作业是否仍处于指定代际的 running（只读；事务内校验由 save_candidate 承担）。
+    pub fn job_generation_current(&self, job_id: &str, generation: i64) -> Result<bool, StoreError> {
+        let ok: bool = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM extraction_jobs
+                 WHERE id=?1 AND status='running' AND claim_generation=?2",
+                params![job_id, generation],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(ok)
+    }
+
+    /// 完成提交（doc4/02 §2/§5）：generation 匹配才生效；影响 0 行返回
+    /// `StaleClaim`——旧执行者不得覆盖新执行者，也不能假装成功。
     pub fn complete_job(
         &mut self,
         job_id: &str,
+        generation: i64,
         attempts: i32,
         model_name: &str,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
     ) -> Result<(), StoreError> {
         let now = now_rfc3339()?;
-        self.conn_mut().execute(
+        let n = self.conn_mut().execute(
             "UPDATE extraction_jobs SET status='succeeded', attempts=?1, model_name=?2,
-             input_tokens=?3, output_tokens=?4, lease_until=NULL, updated_at=?5 WHERE id=?6",
-            params![attempts, model_name, input_tokens, output_tokens, now, job_id],
+             input_tokens=?3, output_tokens=?4, lease_until=NULL, updated_at=?5
+             WHERE id=?6 AND status='running' AND claim_generation=?7",
+            params![attempts, model_name, input_tokens, output_tokens, now, job_id, generation],
         )?;
+        if n == 0 {
+            return Err(StoreError::StaleClaim);
+        }
         Ok(())
     }
 
-    pub fn fail_job(&mut self, job_id: &str, attempts: i32, error_code: &str) -> Result<FailOutcome, StoreError> {
+    /// 失败落状态（doc4/02 §2/§5）：generation 匹配才生效；影响 0 行返回
+    /// `StaleClaim`。`attempts` 为本次执行结束后的累计次数（领取时 attempts+1）。
+    pub fn fail_job(
+        &mut self,
+        job_id: &str,
+        generation: i64,
+        attempts: i32,
+        error_code: &str,
+    ) -> Result<FailOutcome, StoreError> {
         let max = memory_contract::JOB_MAX_ATTEMPTS as i32;
         let now_dt = chrono::Utc::now();
         let now = now_dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         if attempts >= max {
-            self.conn_mut().execute(
-                "UPDATE extraction_jobs SET status='dead', attempts=?1, error_code=?2, lease_until=NULL, updated_at=?3 WHERE id=?4",
-                params![attempts, error_code, now, job_id],
+            let n = self.conn_mut().execute(
+                "UPDATE extraction_jobs SET status='dead', attempts=?1, error_code=?2,
+                 lease_until=NULL, updated_at=?3
+                 WHERE id=?4 AND status='running' AND claim_generation=?5",
+                params![attempts, error_code, now, job_id, generation],
             )?;
+            if n == 0 {
+                return Err(StoreError::StaleClaim);
+            }
             return Ok(FailOutcome::Dead);
         }
         let delay = memory_contract::JOB_RETRY_DELAYS_SECS
@@ -348,11 +400,15 @@ impl Store {
             .unwrap_or(45);
         let run_after = (now_dt + chrono::Duration::seconds(delay as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        self.conn_mut().execute(
+        let n = self.conn_mut().execute(
             "UPDATE extraction_jobs SET status='retryable_failed', attempts=?1, error_code=?2,
-             run_after=?3, lease_until=NULL, updated_at=?4 WHERE id=?5",
-            params![attempts, error_code, run_after, now, job_id],
+             run_after=?3, lease_until=NULL, updated_at=?4
+             WHERE id=?5 AND status='running' AND claim_generation=?6",
+            params![attempts, error_code, run_after, now, job_id, generation],
         )?;
+        if n == 0 {
+            return Err(StoreError::StaleClaim);
+        }
         Ok(FailOutcome::Retryable { run_after })
     }
 
@@ -448,6 +504,17 @@ impl Store {
             return Ok(CandidateOutcome::Rejected { reason: "DUPLICATE_CANDIDATE" });
         }
         let tx = self.conn_mut().transaction()?;
+        // 事务内核对作业仍为当前代际的 running（doc4/02 §5）——仅函数入口检查不够；
+        // 校验失败在此返回，事务不写任何行。
+        let (job_status, job_gen): (String, i64) = tx.query_row(
+            "SELECT status, claim_generation FROM extraction_jobs
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            params![scope.tenant_id, scope.user_id, job.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if job_status != "running" || job_gen != job.claim_generation {
+            return Err(StoreError::StaleClaim);
+        }
         tx.execute(
             "INSERT INTO memory_candidates
              (id, tenant_id, user_id, job_id, primary_evidence_id, kind, quote, quote_sha256, claim,
@@ -708,6 +775,18 @@ mod tests {
             .unwrap_or_else(|| "<NULL>".into())
     }
 
+    /// 夹具助手：直接布置作业状态，仅用于构造 dead 前驱等"被测行为之外"的初始态；
+    /// 被测行为本身（领取/退避/恢复）仍走真实路径。
+    fn force_status(store: &mut Store, job_id: &str, status: &str, error_code: &str) {
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE extraction_jobs SET status=?1, error_code=?2, lease_until=NULL WHERE id=?3",
+                params![status, error_code, job_id],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn backoff_retryable_requires_run_after_expiry() {
         // doc4/02 §2：retryable_failed 的到期只看 run_after，退避不可被绕过。
@@ -715,8 +794,12 @@ mod tests {
         let scope = scope_of(&store, "t", "u");
         ingest(&mut store, &scope, "s1", 1, "我叫洛溪");
         let job_id = flush(&mut store, &scope, "s1", 1);
+        let run_after0 = job_field(&store, &job_id, "run_after");
+        // 真实领取后失败落 retryable（fail 仅在 running + generation 匹配时生效）。
+        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after0, 1)).unwrap().unwrap();
+        assert_eq!(claimed.claim_generation, 1);
         assert!(matches!(
-            store.fail_job(&job_id, 1, "MODEL_TIMEOUT").unwrap(),
+            store.fail_job(&job_id, claimed.claim_generation, 1, "MODEL_TIMEOUT").unwrap(),
             FailOutcome::Retryable { .. }
         ));
         let run_after = job_field(&store, &job_id, "run_after");
@@ -727,11 +810,11 @@ mod tests {
         assert_eq!(job_field(&store, &job_id, "status"), "retryable_failed");
         assert_eq!(job_field(&store, &job_id, "lease_until"), "<NULL>");
 
-        // 到期：可领取，running + generation 0→1。
+        // 到期：可领取，running + generation 1→2。
         let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
         assert_eq!(job.id, job_id);
         assert_eq!(job.status, "running");
-        assert_eq!(job.claim_generation, 1);
+        assert_eq!(job.claim_generation, 2);
         assert_eq!(job.attempts, 1, "领取不加 attempts，由执行结束写入");
     }
 
@@ -798,7 +881,9 @@ mod tests {
         // 前窗 running 未完成：后窗不可领，返回 None（不是还原占位循环）。
         assert!(store.claim_next_ordered_job(&plus_secs(&now, 1)).unwrap().is_none());
         // 前窗成功后后窗可领。
-        store.complete_job(&job_a, 1, "mock", None, None).unwrap();
+        store
+            .complete_job(&job_a, first.claim_generation, 1, "mock", None, None)
+            .unwrap();
         let second = store.claim_next_ordered_job(&plus_secs(&now, 2)).unwrap().unwrap();
         assert_eq!(second.through_event_seq, 10);
     }
@@ -810,10 +895,7 @@ mod tests {
         let scope = scope_of(&store, "t", "u");
         ingest(&mut store, &scope, "s1", 1, "s1-事件1");
         let dead_job = flush(&mut store, &scope, "s1", 1);
-        assert!(matches!(
-            store.fail_job(&dead_job, 3, "MODEL_TIMEOUT").unwrap(),
-            FailOutcome::Dead
-        ));
+        force_status(&mut store, &dead_job, "dead", "MODEL_TIMEOUT");
         ingest(&mut store, &scope, "s1", 2, "s1-事件2");
         let blocked_job = flush(&mut store, &scope, "s1", 2);
         ingest(&mut store, &scope, "s2", 1, "s2-事件1");
@@ -822,7 +904,9 @@ mod tests {
         let now = plus_secs(&job_field(&store, &other_job, "run_after"), 1);
         let claimed = store.claim_next_ordered_job(&now).unwrap().unwrap();
         assert_eq!(claimed.session_id, "s2", "受阻 session 被跳过，其他 session 前进");
-        store.complete_job(&other_job, 1, "mock", None, None).unwrap();
+        store
+            .complete_job(&other_job, claimed.claim_generation, 1, "mock", None, None)
+            .unwrap();
 
         // 只剩受阻作业：返回 None 且不反复取出、不写 lease。
         assert!(store.claim_next_ordered_job(&plus_secs(&now, 2)).unwrap().is_none());
@@ -843,10 +927,7 @@ mod tests {
         let scope2 = scope_of(&store, "t", "u2");
         ingest(&mut store, &scope1, "s1", 1, "u1-事件");
         let dead_job = flush(&mut store, &scope1, "s1", 1);
-        assert!(matches!(
-            store.fail_job(&dead_job, 3, "MODEL_TIMEOUT").unwrap(),
-            FailOutcome::Dead
-        ));
+        force_status(&mut store, &dead_job, "dead", "MODEL_TIMEOUT");
         ingest(&mut store, &scope2, "s1", 1, "u2-事件");
         let job2 = flush(&mut store, &scope2, "s1", 1);
 
@@ -865,7 +946,13 @@ mod tests {
         }
         let job_99 = flush(&mut store, &scope, "s1", 99);
         assert_eq!(store.window_lower_bound(&scope, "dsh", "s1", 99).unwrap(), -1);
-        store.complete_job(&job_99, 1, "mock", None, None).unwrap();
+        // 真实领取并成功，使 through 99 成为已越过前窗。
+        let run_after = job_field(&store, &job_99, "run_after");
+        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        assert_eq!(claimed.id, job_99);
+        store
+            .complete_job(&job_99, claimed.claim_generation, 1, "mock", None, None)
+            .unwrap();
         let _job_100 = flush(&mut store, &scope, "s1", 100);
         assert_eq!(
             store.window_lower_bound(&scope, "dsh", "s1", 100).unwrap(),
@@ -876,7 +963,7 @@ mod tests {
         // 未跳过的 dead 不计入下界；succeeded 计入。
         ingest(&mut store, &scope, "s2", 1, "s2-事件1");
         let dead_job = flush(&mut store, &scope, "s2", 1);
-        assert!(matches!(store.fail_job(&dead_job, 3, "MODEL_TIMEOUT").unwrap(), FailOutcome::Dead));
+        force_status(&mut store, &dead_job, "dead", "MODEL_TIMEOUT");
         ingest(&mut store, &scope, "s2", 2, "s2-事件2");
         let _job_2 = flush(&mut store, &scope, "s2", 2);
         assert_eq!(

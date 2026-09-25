@@ -37,6 +37,9 @@ pub const QUOTE_MAX_CHARS: usize = 512;
 pub const MODEL_CALL_TIMEOUT_SECS: u64 = 30;
 /// worker lease 90 s。
 pub const JOB_LEASE_SECS: u64 = 90;
+/// worker 处理期间心跳续租间隔 30 s（doc4/02 §4：模型 timeout 可配置超过 90 s，
+/// 执行中必须续租；续租只短暂持锁，模型网络调用绝不持锁）。
+pub const JOB_HEARTBEAT_SECS: u64 = 30;
 /// 最大 3 次调用。
 pub const JOB_MAX_ATTEMPTS: u32 = 3;
 /// 重试延迟序列 5/15/45 s（doc/13 §3，取自 TencentDB 思想）。

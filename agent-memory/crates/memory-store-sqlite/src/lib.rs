@@ -45,6 +45,10 @@ pub enum StoreError {
     QuoteMismatch,
     #[error("窗口/状态冲突（through_event_seq 越界、乱序 flush 或窗口超限）")]
     StateConflict,
+    #[error("提取窗口超过事件数/字节上限（同输入重试不变，确定性失败）")]
+    WindowTooLarge,
+    #[error("执行权已失效（claim_generation 不匹配或状态非 running），本次写入未生效")]
+    StaleClaim,
     #[error("版本冲突（乐观锁）")]
     VersionConflict,
     #[error("目标含糊：最近用户消息未明确指认该记忆")]
@@ -603,7 +607,7 @@ mod tests {
         }
         // 排除冲突后同一库可升级。
         {
-            let mut conn = Connection::open(&db).unwrap();
+            let conn = Connection::open(&db).unwrap();
             conn.execute_batch("DELETE FROM extraction_jobs WHERE id='jB';").unwrap();
         }
         let store = Store::open(&db, &migrations_dir()).unwrap();
