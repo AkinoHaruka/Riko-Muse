@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use memory_domain::{Origin, ScopeKey};
 use memory_extract::{
-    admit, ExtractError, ExtractModel, Extraction, ExtractOutput, EXTRACT_PROMPT_VERSION,
-    EXTRACT_SYSTEM_PROMPT,
+    admit, ExtractError, ExtractModel, Extraction, ExtractOutput,
 };
 use memory_store_sqlite::JobRow;
 
@@ -35,6 +34,22 @@ mod tests {
         async fn extract(&self, _system: &str, _user: &str) -> Result<memory_extract::ExtractOutput, ExtractError> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(memory_extract::ExtractOutput {
+                content: self.response.clone(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    struct SysCapture {
+        response: String,
+        system: Arc<Mutex<String>>,
+    }
+
+    impl ExtractModel for SysCapture {
+        async fn extract(&self, system: &str, _user: &str) -> Result<memory_extract::ExtractOutput, ExtractError> {
+            *self.system.lock().unwrap() = system.to_string();
             Ok(memory_extract::ExtractOutput {
                 content: self.response.clone(),
                 input_tokens: None,
@@ -474,6 +489,60 @@ mod tests {
         assert_eq!(body2["temperature"], 0.2);
         assert_eq!(body2["max_tokens"], 1024);
     }
+
+    #[tokio::test]
+    async fn prompt_dispatch_uses_job_version_and_fails_unknown() {
+        // doc2/05 §3：worker 按作业行 prompt_version 选提示词——老版本作业用老提示词，
+        // 未知版本显式失败，不得用"最新规则"处理旧作业。
+        let (store, scope) = setup("dispatch");
+        let state = AppState { store: store.clone() };
+        let job_id = {
+            let mut g = store.lock().unwrap();
+            ingest_user(&mut g, &scope, 1, "以后回答我用中文");
+            match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+                FlushOutcome::Created { job_id } => job_id,
+                _ => panic!(),
+            }
+        };
+        let get_job = |store: &Arc<Mutex<Store>>, id: &str| {
+            store
+                .lock()
+                .unwrap()
+                .get_job(&memory_domain::ScopeKey { tenant_id: "t".into(), user_id: "u".into() }, id)
+                .unwrap()
+                .unwrap()
+        };
+        let mut job = get_job(&store, &job_id);
+        let cfg = ModelConfig {
+            endpoint: "http://unused".into(),
+            model: "mock".into(),
+            api_key: "unused".into(),
+            timeout: Duration::from_secs(1),
+            max_tokens: 1024,
+            extra_body: None,
+        };
+        let empty = Arc::new(Mutex::new(String::new()));
+
+        // 当前版本（extract_v2）作业 → 当前提示词。
+        let sys2 = empty.clone();
+        let mock2 = SysCapture { system: sys2.clone(), response: "{\"candidates\":[]}".into() };
+        job.prompt_version = memory_contract::EXTRACT_PROMPT_VERSION.into();
+        process_job(&state, &mock2, cfg.clone(), &job).await.unwrap();
+        assert_eq!(*sys2.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT);
+
+        // 老版本（extract_v1）作业 → 老提示词。
+        let sys1 = empty.clone();
+        let mock1 = SysCapture { system: sys1.clone(), response: "{\"candidates\":[]}".into() };
+        job.prompt_version = memory_contract::EXTRACT_PROMPT_VERSION_V1.into();
+        process_job(&state, &mock1, cfg.clone(), &job).await.unwrap();
+        assert_eq!(*sys1.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT_V1);
+
+        // 未知版本 → 显式失败，不改用最新规则。
+        let mock0 = SysCapture { system: empty.clone(), response: "{\"candidates\":[]}".into() };
+        job.prompt_version = "extract_v0".into();
+        let err = process_job(&state, &mock0, cfg, &job).await.unwrap_err();
+        assert!(err.contains("UNKNOWN_PROMPT_VERSION") || err.contains("无对应规则实现"), "实际错误: {err}");
+    }
 }
 
 
@@ -649,7 +718,7 @@ async fn process_job<M: ExtractModel>(
     let attempts = job.attempts + 1;
     // doc2/05 §3：worker 按作业行 prompt_version 选规则；未知版本显式失败并保留可诊断状态，
     // 不能用"最新规则"处理旧作业。
-    if job.prompt_version != EXTRACT_PROMPT_VERSION {
+    let Some(system_prompt) = memory_extract::system_prompt_for(&job.prompt_version) else {
         let mut guard = state.store.lock().unwrap();
         let code = "UNKNOWN_PROMPT_VERSION";
         match guard.fail_job(&job.id, attempts, code).map_err(|x| x.to_string())? {
@@ -659,7 +728,7 @@ async fn process_job<M: ExtractModel>(
             }
         }
         return Err(format!("作业 prompt_version={} 无对应规则实现", job.prompt_version));
-    }
+    };
     let (events, origin) = {
         let guard = state.store.lock().unwrap();
         let lower = guard
@@ -690,7 +759,7 @@ async fn process_job<M: ExtractModel>(
     )
     .map_err(|e| e.to_string())?;
 
-    let result = client.extract(EXTRACT_SYSTEM_PROMPT, &input).await;
+    let result = client.extract(system_prompt, &input).await;
     let mut guard = state.store.lock().unwrap();
     match result {
         Ok(output) => {
@@ -705,7 +774,7 @@ async fn process_job<M: ExtractModel>(
                             Ok(outcome) => {
                                 eprintln!(
                                     "[worker] candidate job={} outcome={:?} prompt={}",
-                                    job.id, outcome, EXTRACT_PROMPT_VERSION
+                                    job.id, outcome, job.prompt_version
                                 );
                             }
                             Err(e) => {

@@ -5,7 +5,15 @@
 
 use serde::Deserialize;
 
-/// 系统提示词（doc/13 §4）。响应 Schema 逐字写进提示词——真实模型（尤其 4B 级）
+/// extract_v1 原始系统提示词（doc/13 §4）。仅供按作业行版本处理历史作业
+/// （doc2/05 §3：保留老版本）；对真实推理模型有缺 Schema 的已知缺陷，勿用于新作业。
+pub const EXTRACT_SYSTEM_PROMPT_V1: &str = "从给定对话提取可能对未来 Agent 有持续用途的用户事实、偏好、长期指令和事件。
+只引用 role=user 且 source_kind=user 的 event_id。
+quote 必须逐字复制同一条用户消息中的连续原文；不要改写、补充或拼接多条消息。
+临时请求、假设、引用他人的话、助手推断不要提取。没有合格内容时输出空数组。
+只输出 JSON，不输出解释或 Markdown。";
+
+/// 当前系统提示词（extract_v2，doc/13 §4）。响应 Schema 逐字写进提示词——真实模型（尤其 4B 级）
 /// 无法从散文约束可靠猜出字段名，缺 schema 会自造字段或包 Markdown 围栏（2026-09-25 实测）。
 /// 事实类引导与示例：真实模型对平叙事实系统性漏提取（两个独立窗口空候选，2026-09-25
 /// 日常观察 F2），对指令/偏好句式正常——示例给出事实也应提取的明确信号。示例内容
@@ -23,6 +31,16 @@ quote 必须逐字复制同一条用户消息中的连续原文；不要改写�
 没有合格内容时输出 {\"candidates\":[]}。";
 
 pub const EXTRACT_PROMPT_VERSION: &str = memory_contract::EXTRACT_PROMPT_VERSION;
+
+/// 按作业行 prompt_version 分派系统提示词；未知版本返回 None（worker 显式失败，
+/// 不用"最新规则"处理旧作业，doc2/05 §3）。
+pub fn system_prompt_for(version: &str) -> Option<&'static str> {
+    match version {
+        memory_contract::EXTRACT_PROMPT_VERSION_V1 => Some(EXTRACT_SYSTEM_PROMPT_V1),
+        memory_contract::EXTRACT_PROMPT_VERSION => Some(EXTRACT_SYSTEM_PROMPT),
+        _ => None,
+    }
+}
 
 /// 模型响应 Schema（doc/13 §4）。confidence 仅作诊断，不能驱动准入。
 #[derive(Debug, Clone, Deserialize)]

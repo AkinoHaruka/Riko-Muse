@@ -8,8 +8,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 数据库模式版本：随迁移文件递增（0001→1，0002→2）。worker 按作业行 prompt_version 选规则。
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// 提取 Prompt 版本（doc/13 §4），随任务保存。
-pub const EXTRACT_PROMPT_VERSION: &str = "extract_v1";
+/// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
+/// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
+/// V1 常量仅为按版本分派历史作业而保留（0002 迁移的列默认值同为 extract_v1）。
+pub const EXTRACT_PROMPT_VERSION_V1: &str = "extract_v1";
+pub const EXTRACT_PROMPT_VERSION: &str = "extract_v2";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----
 /// 自动上下文默认最多 5 条原子记忆。

@@ -449,8 +449,9 @@ mod tests {
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "succeeded");
         assert_eq!(job.prompt_version, "extract_v1", "旧作业必须回填 extract_v1");
-        // 新 flush 在同一事务写入当前版本。
-        assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v1");
+        // 新 flush 写入当前版本（extract_v2）；0002 的列默认值保持 extract_v1（迁移已冻结，
+        // 仅对不带该列插入的历史行生效，flush 一律显式写当前常量）。
+        assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v2");
         let _ = token_file;
         let _ = fs::remove_dir_all(&dir);
     }
