@@ -53,6 +53,10 @@ const RETRY_CAP_MS = 15_000;
 const GAP_CHECK_MAX_READS = 500;
 const GAP_CHECK_MAX_MS = 30_000;
 const PROTOCOL_CACHE_MS = 60_000;
+/** 主动 flush 阈值（doc4/03 §5）：每 session 已接受正文事件达 80 条或估算 24 KiB
+ * （低于内核 32 KiB 窗口上限的保守值）即排一次 flush；正确性由服务端分窗兜底。 */
+const FLUSH_THRESHOLD_EVENTS = 80;
+const FLUSH_THRESHOLD_BYTES = 24 * 1024;
 
 interface QueueItem {
   op: SpooledOp;
@@ -85,6 +89,10 @@ export class EventPipeline {
   private unauthorizedPaused = false;
   private protocolOkAt = 0;
   private readonly permanentlyBroken = new Set<string>();
+  /** 每 session 距上次 flush 已接受的正文事件数与估算字节（doc4/03 §5；不持久化，
+   * 重启后未 ack 操作靠 spool 复送，服务端按实际已收证据分窗）。 */
+  private readonly segEvents = new Map<string, number>();
+  private readonly segBytes = new Map<string, number>();
 
   constructor(
     private readonly spool: Spool,
@@ -115,7 +123,9 @@ export class EventPipeline {
       bodySeq: mapped.event_seq,
       bytes: Buffer.byteLength(JSON.stringify(mapped)),
     };
-    this.push(item);
+    // 队列满拒收：不推进 lastBodySeq/latestUser/阈值计数（doc4/03 §5），
+    // 未接收的 seq 不会被后续 flush 越过。
+    if (!this.push(item)) return;
     this.lastBodySeq.set(sessionId, mapped.event_seq);
     if (mapped.role === "user" && mapped.source_kind === "user") {
       const data = ev.data as { id?: unknown };
@@ -124,6 +134,15 @@ export class EventPipeline {
         messageId: typeof data.id === "string" ? data.id : "",
         content: mapped.content,
       });
+    }
+    // 主动 flush 阈值：达到即按当前最后 seq 排 flush 并清本段计数。
+    const segEv = (this.segEvents.get(sessionId) ?? 0) + 1;
+    const segBy = (this.segBytes.get(sessionId) ?? 0) + item.bytes;
+    if (segEv >= FLUSH_THRESHOLD_EVENTS || segBy >= FLUSH_THRESHOLD_BYTES) {
+      this.enqueueFlush(sessionId);
+    } else {
+      this.segEvents.set(sessionId, segEv);
+      this.segBytes.set(sessionId, segBy);
     }
   }
 
@@ -220,11 +239,12 @@ export class EventPipeline {
 
   // ---------------------------------------------------------------- 内部：队列与写入者
 
-  private push(item: QueueItem): void {
+  /** 入内存队列；返回是否被接受。满时记 CAPTURE_GAP 并拒收（调用方不得推进光标）。 */
+  private push(item: QueueItem): boolean {
     if (this.queue.length >= QUEUE_MAX_ENTRIES || this.queueBytes + item.bytes > QUEUE_MAX_BYTES) {
       const seq = item.bodySeq ?? "flush";
       this.logger.warn(`CAPTURE_GAP: 内存队列已满（${QUEUE_MAX_ENTRIES} 条/8 MiB），拒收 ${item.sessionId}/${seq}`);
-      return;
+      return false;
     }
     this.queue.push(item);
     this.queueBytes += item.bytes;
@@ -233,6 +253,7 @@ export class EventPipeline {
       this.writerWakeup = undefined;
       wakeup();
     }
+    return true;
   }
 
   private isPending(opId: string): boolean {
@@ -299,6 +320,10 @@ export class EventPipeline {
   private enqueueFlush(sessionId: string): void {
     const through = this.lastBodySeq.get(sessionId);
     if (through === undefined) return; // 无正文证据，无需 flush
+    // 本段计数覆盖的事件都 ≤ through；无论本次是否去重，一律清零（doc4/03 §5）。
+    // 阈值触发的多次 flush：through 随新事件递增 → opId 递增，不重复排已 ack 窗口。
+    this.segEvents.set(sessionId, 0);
+    this.segBytes.set(sessionId, 0);
     const opId = `${this.hostId}/${sessionId}/flush:${through}`;
     if (this.spool.isAcked(opId) || this.isPending(opId)) return;
     this.push({
