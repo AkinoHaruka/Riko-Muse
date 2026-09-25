@@ -839,9 +839,41 @@ impl Store {
         max_items: usize,
         max_chars: usize,
     ) -> Result<ComposeResult, StoreError> {
-        let (mut hits, degraded) = self.search_memories(scope, query, 20, false)?;
-        // 指令类优先占最多 2 个名额（doc/13 §6）；stable sort 保留 score 序。
-        hits.sort_by_key(|h| if h.kind == "instruction" { 0 } else { 1 });
+        let (hits, degraded) = self.search_memories(scope, query, 20, false)?;
+        // doc/13 §6：长期指令先占最多 2 个名额，再填当前查询相关记录。
+        // 指令名额独立于查询——词法未命中的 active 指令也必须进入，否则
+        // 「以后回答请始终用中文」在无关查询（如闲聊）下失效
+        //（2026-09-25 真实模型实测暴露的契约落差）。
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered: Vec<SearchHit> = Vec::new();
+        let mut instruction_slots = 0usize;
+        // 先收查询命中的指令（既是指令又相关，按 score 序）。
+        for h in hits.iter().filter(|h| h.kind == "instruction") {
+            if instruction_slots >= 2 {
+                break;
+            }
+            seen.insert(h.memory_id.clone());
+            ordered.push(h.clone());
+            instruction_slots += 1;
+        }
+        // 名额未满时按 updated_at DESC 补齐未命中的 active 指令。
+        if instruction_slots < 2 {
+            for h in self.active_instruction_hits(scope, 2)? {
+                if seen.insert(h.memory_id.clone()) {
+                    ordered.push(h);
+                    instruction_slots += 1;
+                    if instruction_slots >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        // 再填非指令的查询相关记录。
+        for h in hits.iter().filter(|h| h.kind != "instruction") {
+            if seen.insert(h.memory_id.clone()) {
+                ordered.push(h.clone());
+            }
+        }
         let mut items: Vec<(String, Vec<String>)> = Vec::new();
         let mut lines: Vec<String> = Vec::new();
         let mut truncated = false;
@@ -852,7 +884,7 @@ impl Store {
         let footer = "</agent_memory>";
         let mut body_chars = 0usize;
 
-        for hit in hits {
+        for hit in ordered {
             if items.len() >= max_items {
                 break;
             }
@@ -875,5 +907,117 @@ impl Store {
             format!("{header}\n{}\n{footer}", lines.join("\n"))
         };
         Ok(ComposeResult { text, items, truncated, index_degraded: degraded })
+    }
+
+    /// active 指令类记忆（compose 指令名额补齐用），updated_at DESC 固定序。
+    fn active_instruction_hits(
+        &self,
+        scope: &ScopeKey,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, StoreError> {
+        let now = now_rfc3339()?;
+        let ids: Vec<String> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT id FROM memories
+                 WHERE tenant_id=?1 AND user_id=?2 AND kind='instruction' AND status='active'
+                   AND (valid_until IS NULL OR valid_until > ?3)
+                 ORDER BY updated_at DESC, id ASC LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![scope.tenant_id, scope.user_id, now, limit as i64],
+                |r| r.get::<_, String>(0),
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut hits = Vec::new();
+        for id in ids {
+            let row = self
+                .conn()
+                .query_row(
+                    "SELECT kind, claim, status FROM memories
+                     WHERE tenant_id=? AND user_id=? AND id=? AND status='active'
+                       AND (valid_until IS NULL OR valid_until > ?)",
+                    params![scope.tenant_id, scope.user_id, id, now],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                )
+                .optional()?;
+            let Some((kind, claim, status)) = row else { continue };
+            let _ = kind;
+            let refs = self
+                .evidence_refs_of(scope, &id)?
+                .into_iter()
+                .map(|(eid, _, _)| eid)
+                .collect();
+            hits.push(SearchHit {
+                memory_id: id,
+                kind: "instruction".into(),
+                claim,
+                status,
+                score: 0.0,
+                match_reason: "instruction".into(),
+                evidence_refs: refs,
+            });
+        }
+        Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IngestOutcome;
+    use memory_domain::{MemoryKind, Origin};
+
+    fn migrations_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+    }
+
+    fn setup(tag: &str) -> (Store, ScopeKey) {
+        let mut store = Store::open_in_memory(&migrations_dir()).unwrap();
+        let dir = std::env::temp_dir().join(format!("am-mem-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        store.principal_add("t", "u", &dir.join("u.token")).unwrap();
+        let token = std::fs::read_to_string(dir.join("u.token")).unwrap();
+        let scope = store.verify_token(token.trim()).unwrap().unwrap();
+        (store, scope)
+    }
+
+    fn origin() -> Origin {
+        Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s".into() }
+    }
+
+    fn ingest_user(store: &mut Store, scope: &ScopeKey, seq: i64, content: &str) -> String {
+        let t = chrono::Utc::now();
+        match store.record_evidence(scope, &origin(), seq, "user", "user", &t, content).unwrap() {
+            IngestOutcome::Recorded(id) => id,
+            IngestOutcome::AlreadyRecorded(id) => id,
+        }
+    }
+
+    #[test]
+    fn compose_includes_active_instruction_without_lexical_hit() {
+        // doc/13 §6：长期指令先占最多 2 个名额，独立于查询词法命中。
+        // 回归（2026-09-25 真实模型实测）：无关查询下 active 指令缺失 → 注入失效。
+        let (mut store, scope) = setup("compose-instr");
+        let ev = ingest_user(&mut store, &scope, 8, "以后回答请始终用中文。今天先聊到这");
+        store
+            .remember(&scope, &origin(), &ev, "以后回答请始终用中文", MemoryKind::Instruction)
+            .unwrap();
+        // 与指令零词法重叠的查询也要召回该指令。
+        let r = store.compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000).unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert!(r.text.contains("以后回答请始终用中文"));
+        assert!(r.items[0].1.iter().any(|e| e == &ev), "注入项须携带证据引用");
+        // 指令名额上限 2：第三条指令不得进入名额。
+        let ev2 = ingest_user(&mut store, &scope, 16, "以后回答要给代码示例");
+        store.remember(&scope, &origin(), &ev2, "以后回答要给代码示例", MemoryKind::Instruction).unwrap();
+        let ev3 = ingest_user(&mut store, &scope, 24, "以后先说明风险再动手");
+        store.remember(&scope, &origin(), &ev3, "以后先说明风险再动手", MemoryKind::Instruction).unwrap();
+        let r2 = store.compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000).unwrap();
+        // 三条指令但名额只有 2：文本恰好包含两条 claim（最新的 updated_at DESC 两条）。
+        assert!(r2.text.contains("以后回答要给代码示例"));
+        assert!(r2.text.contains("以后先说明风险再动手"));
+        assert!(!r2.text.contains("以后回答请始终用中文"), "最旧的一条被挤出 2 个名额");
     }
 }
