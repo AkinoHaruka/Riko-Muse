@@ -181,7 +181,7 @@ impl Store {
         }
 
         let now = now_rfc3339()?;
-        let mut insert_job = |tx: &rusqlite::Transaction<'_>,
+        let insert_job = |tx: &rusqlite::Transaction<'_>,
                               through: i64,
                               status: &str,
                               error_code: Option<&str>|
@@ -723,7 +723,11 @@ impl Store {
             params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, candidate_id, c.source_event_id, start as i64, end as i64],
         )?;
 
-        let mut outcome = CandidateOutcome::Rejected { reason: reason_code.unwrap_or("REJECTED") };
+        // Held 准入的行已是 held；返回标签同样如实标 Held（此前误标 Rejected，仅诊断输出受影响）。
+        let mut outcome = match admission {
+            Admission::Held(r) => CandidateOutcome::Held { reason: r },
+            _ => CandidateOutcome::Rejected { reason: reason_code.unwrap_or("REJECTED") },
+        };
         if admission == Admission::Active {
             let claim_hash = claim_sha256(kind, &quote);
             // 规则 8a：同 kind+hash 的 active → 仅加证据。

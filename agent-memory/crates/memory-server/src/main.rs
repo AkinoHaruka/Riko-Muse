@@ -22,8 +22,8 @@ use memory_contract::{
 };
 use memory_domain::{MemoryKind, Origin, ScopeKey};
 use memory_store_sqlite::{
-    ComposeResult, FlushOutcome, IngestOutcome, JobRow, RememberOutcome, SearchHit, Store,
-    StoreError,
+    CandidateDetail, ComposeResult, FlushOutcome, IngestOutcome, JobDoctorStats, RememberOutcome,
+    SearchHit, Store, StoreError,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -64,6 +64,11 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// 候选只读诊断（doc4/04 §2；本阶段不提供 promote）
+    Candidates {
+        #[command(subcommand)]
+        action: CandidatesAction,
+    },
     /// 只读诊断：迁移、principals、索引状态（不修复数据）
     Doctor {
         #[arg(long)]
@@ -98,6 +103,37 @@ enum JobAction {
         /// 运维原因 1—256 字符；不得填用户正文或密钥（写入审计）
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CandidatesAction {
+    /// 列出候选（默认 held；只显示 ID/kind/reason/created_at/来源事件/quote 长度）
+    List {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, default_value = "held")]
+        status: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// 翻页边界：当前 scope 中真实存在的候选 ID，列出其 (created_at,id) 之前的更早项
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// 显示单个候选的 quote 与证据定位（本机交互终端使用，不写日志）
+    Show {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -227,6 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/version", get(version))
                 .route("/v1/evidence/events", post(ingest_events))
                 .route("/v1/extraction/flush", post(flush_window))
+                .route("/v1/jobs", get(list_jobs))
                 .route("/v1/jobs/{job_id}", get(get_job))
                 .route("/v1/jobs/{job_id}/retry", post(retry_job))
                 .route("/v1/memories/remember", post(remember_memory))
@@ -256,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if store.get_job(&scope, &job_id).map_err(|e| e.to_string())?.is_none() {
                         return Err(format!("作业 {job_id} 不存在或不属于当前 scope，未变更任何行"));
                     }
-                    match store.skip_dead_job(&scope, &job_id, &reason).map_err(|e| e.to_string()) {
+                    match store.skip_dead_job(&scope, &job_id, &reason) {
                         Ok(true) => {
                             println!("已跳过作业 {job_id}（WINDOW_TOO_LARGE）；L0 原文保留，后窗将从该 through 之后推进");
                             Ok(())
@@ -265,11 +302,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("作业 {job_id} 已存在跳过记录（幂等），未重复写入");
                             Ok(())
                         }
-                        Err(text) if text.contains("STATE_CONFLICT") || text.contains("窗口/状态冲突") => Err(
+                        Err(StoreError::StateConflict) => Err(
                             "仅 dead 且 error_code=WINDOW_TOO_LARGE 的作业可 skip；其他 dead 请先修复原因后用完整 job ID retry".into(),
                         ),
-                        Err(text) => Err(text),
+                        Err(e) => Err(e.to_string()),
                     }
+                };
+                run()?;
+                Ok(())
+            }
+        },
+        Commands::Candidates { action } => match action {
+            CandidatesAction::List { config, tenant, user, status, limit, before } => {
+                let run = || -> Result<(), String> {
+                    let cfg = Config::load(&config)?;
+                    if !(1..=100).contains(&limit) {
+                        return Err("limit 必须 1～100".into());
+                    }
+                    if !matches!(status.as_str(), "held" | "candidate" | "rejected") {
+                        return Err("status 必须是 held/candidate/rejected".into());
+                    }
+                    let store = Store::open(&cfg.db_path, &cfg.migrations_dir).map_err(|e| e.to_string())?;
+                    let scope = ScopeKey { tenant_id: tenant, user_id: user };
+                    let rows = store
+                        .list_candidates(&scope, &status, limit, before.as_deref())
+                        .map_err(|e| match e {
+                            StoreError::JobNotFound => "before 候选不存在或不属于当前 scope".to_string(),
+                            other => other.to_string(),
+                        })?;
+                    println!("{:<40} {:<12} {:<24} {:<30} {:<24} {}", "ID", "kind", "reason", "created_at", "evidence_id", "quote_len");
+                    for c in rows {
+                        println!(
+                            "{:<40} {:<12} {:<24} {:<30} {:<24} {}",
+                            c.id,
+                            c.kind,
+                            c.reason_code.clone().unwrap_or_else(|| "-".into()),
+                            c.created_at,
+                            c.primary_evidence_id,
+                            c.quote_len
+                        );
+                    }
+                    Ok(())
+                };
+                run()?;
+                Ok(())
+            }
+            CandidatesAction::Show { config, tenant, user, id } => {
+                let run = || -> Result<(), String> {
+                    let cfg = Config::load(&config)?;
+                    let store = Store::open(&cfg.db_path, &cfg.migrations_dir).map_err(|e| e.to_string())?;
+                    let scope = ScopeKey { tenant_id: tenant, user_id: user };
+                    let detail: Option<CandidateDetail> = store
+                        .get_candidate(&scope, &id)
+                        .map_err(|e| e.to_string())?;
+                    let Some(c) = detail else {
+                        return Err(format!("候选 {id} 不存在或不属于当前 scope"));
+                    };
+                    println!("id: {}", c.id);
+                    println!("kind: {} status: {} reason: {}", c.kind, c.status, c.reason_code.clone().unwrap_or_else(|| "-".into()));
+                    println!("created_at: {}", c.created_at);
+                    println!("primary_evidence_id: {}", c.primary_evidence_id);
+                    println!(
+                        "evidence_span: {}..{}",
+                        c.evidence_start_byte.map(|v| v.to_string()).unwrap_or("-".into()),
+                        c.evidence_end_byte.map(|v| v.to_string()).unwrap_or("-".into())
+                    );
+                    println!("quote_sha256: {}", c.quote_sha256);
+                    println!("quote:");
+                    println!("{}", c.quote);
+                    Ok(())
                 };
                 run()?;
                 Ok(())
@@ -293,6 +394,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cfg = Config::load(&config)?;
             let store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
             println!("{}", store.doctor_summary()?);
+            // 作业侧聚合计数（doc4/04 §3）：全部 scope 聚合只显示总数，不打印用户列表；
+            // db=ready 不代表作业健康，卡住的作业在此可见。
+            let stats: JobDoctorStats = store.job_doctor_stats()?;
+            println!("{}", stats.summary());
             Ok(())
         }
         Commands::RebuildIndex { config } => {
@@ -781,15 +886,142 @@ async fn flush_window(
     }
 }
 
-fn job_json(req_id: &str, j: &JobRow) -> serde_json::Value {
+fn job_json(req_id: &str, j: &memory_store_sqlite::JobDetail) -> serde_json::Value {
+    let i = &j.item;
     serde_json::json!({
         "request_id": req_id,
-        "job_id": j.id,
-        "status": j.status,
-        "attempts": j.attempts,
-        "created_at": j.created_at,
-        "updated_at": j.updated_at
+        "job_id": i.id,
+        "host_id": i.host_id,
+        "session_id": i.session_id,
+        "through_event_seq": i.through_event_seq,
+        "status": i.status,
+        "attempts": i.attempts,
+        "run_after": i.run_after,
+        "lease_until": i.lease_until,
+        "error_code": i.error_code,
+        "skipped": i.skipped,
+        "window_key": j.window_key,
+        "prompt_version": j.prompt_version,
+        "model_name": j.model_name,
+        "input_tokens": j.input_tokens,
+        "output_tokens": j.output_tokens,
+        "created_at": i.created_at,
+        "updated_at": i.updated_at
     })
+}
+
+/// GET /v1/jobs（doc4/04 §1）：scope 内分页作业列表，默认 dead，不返回正文。
+async fn list_jobs(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<JobsQuery>,
+) -> Response {
+    let status = query.status.as_deref().unwrap_or("dead");
+    if !matches!(
+        status,
+        "queued" | "running" | "retryable_failed" | "succeeded" | "dead" | "all"
+    ) {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "status 必须是 queued/running/retryable_failed/succeeded/dead/all",
+        );
+    }
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "limit 必须 1～100");
+    }
+    let cursor = match query.cursor.as_deref() {
+        None => None,
+        Some(raw) => match decode_job_cursor(raw) {
+            Ok(c) => Some(c),
+            Err(msg) => {
+                return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg)
+            }
+        },
+    };
+    let result = {
+        let guard = state.store.lock().unwrap();
+        guard.list_jobs(&scope, status, limit, cursor.as_ref().map(|(a, b)| (a.as_str(), b.as_str())))
+    };
+    match result {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "job_id": i.id,
+                        "host_id": i.host_id,
+                        "session_id": i.session_id,
+                        "through_event_seq": i.through_event_seq,
+                        "status": i.status,
+                        "attempts": i.attempts,
+                        "run_after": i.run_after,
+                        "lease_until": i.lease_until,
+                        "error_code": i.error_code,
+                        "skipped": i.skipped,
+                        "created_at": i.created_at,
+                        "updated_at": i.updated_at,
+                    })
+                })
+                .collect();
+            // next_cursor：取满一页时以最后一行的排序键继续翻页；不足一页则到底。
+            let next_cursor = if rows.len() == limit {
+                let last = rows.last().unwrap();
+                Some(encode_job_cursor(&last.created_at, &last.id))
+            } else {
+                None
+            };
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "jobs": items,
+                "next_cursor": next_cursor,
+            }))
+            .into_response()
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+/// cursor = base64url(JSON {created_at,id})；解码 ≤512 字节，校验 RFC3339 与非空 ID。
+/// 它只是翻页位置，不是授权凭据：scope 始终来自当前 token。
+fn encode_job_cursor(created_at: &str, id: &str) -> String {
+    use base64::Engine as _;
+    let payload = serde_json::json!({ "created_at": created_at, "id": id }).to_string();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes())
+}
+
+fn decode_job_cursor(raw: &str) -> Result<(String, String), &'static str> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|_| "cursor 不是合法 base64url")?;
+    if bytes.len() > 512 {
+        return Err("cursor 解码超长（>512 字节）");
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "cursor 不是合法 JSON")?;
+    let created_at = v
+        .get("created_at")
+        .and_then(|x| x.as_str())
+        .ok_or("cursor 缺 created_at")?;
+    if chrono::DateTime::parse_from_rfc3339(created_at).is_err() {
+        return Err("cursor.created_at 不是 RFC3339 时间");
+    }
+    let id = v.get("id").and_then(|x| x.as_str()).ok_or("cursor 缺 id")?;
+    if id.is_empty() {
+        return Err("cursor.id 不能为空");
+    }
+    Ok((created_at.to_string(), id.to_string()))
 }
 
 async fn get_job(
@@ -798,7 +1030,7 @@ async fn get_job(
     Extension(req_id): Extension<RequestId>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Response {
-    match state.store.lock().unwrap().get_job(&scope, &job_id) {
+    match state.store.lock().unwrap().get_job_detail(&scope, &job_id) {
         Ok(Some(j)) => Json(job_json(&req_id.0, &j)).into_response(),
         Ok(None) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "作业不存在"),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
@@ -811,7 +1043,25 @@ async fn retry_job(
     Extension(req_id): Extension<RequestId>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Response {
-    match state.store.lock().unwrap().retry_dead_job(&scope, &job_id) {
+    let mut store = state.store.lock().unwrap();
+    // 先按 scope 精确查询：缺失/跨 scope 一律 404，不靠截断 ID 猜匹配。
+    let detail = match store.get_job_detail(&scope, &job_id) {
+        Ok(Some(d)) => d,
+        Ok(None) => return err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "作业不存在"),
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    if detail.item.status != "dead" {
+        return err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "仅 dead 状态作业可重试");
+    }
+    if detail.item.error_code.as_deref() == Some("WINDOW_TOO_LARGE") {
+        return err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "WINDOW_TOO_LARGE 不允许原样 retry；请用 memoryd job skip 显式跳过，或先修复输入",
+        );
+    }
+    match store.retry_dead_job(&scope, &job_id) {
         Ok(true) => Json(serde_json::json!({ "request_id": req_id.0, "job_id": job_id, "status": "queued" })).into_response(),
         Ok(false) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "仅 dead 状态作业可重试"),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
@@ -949,4 +1199,45 @@ async fn version() -> impl IntoResponse {
         schema_version: SCHEMA_VERSION,
         build: BUILD,
     })
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    //! doc4/04 §1：作业列表 cursor 的编解码约束——base64url(JSON {created_at,id})，
+    //! 解码 ≤512 字节，RFC3339 时间与非空 ID；坏 cursor 全部拒绝。
+
+    use super::{decode_job_cursor, encode_job_cursor};
+    use base64::Engine as _;
+
+    #[test]
+    fn cursor_roundtrip() {
+        let enc = encode_job_cursor("2026-09-25T08:00:00.123456Z", "job-1");
+        let (created_at, id) = decode_job_cursor(&enc).unwrap();
+        assert_eq!(created_at, "2026-09-25T08:00:00.123456Z");
+        assert_eq!(id, "job-1");
+    }
+
+    #[test]
+    fn cursor_rejects_bad_input() {
+        assert!(decode_job_cursor("not-base64!!").is_err(), "非法 base64url 拒绝");
+        // 合法 base64url 但内容不是 JSON。
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"plain text");
+        assert!(decode_job_cursor(&b64).is_err());
+        // JSON 但缺字段。
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"created_at":"2026-09-25T08:00:00Z"}"#);
+        assert!(decode_job_cursor(&b64).is_err(), "缺 id 拒绝");
+        // 非法时间。
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"created_at":"yesterday","id":"j"}"#);
+        assert!(decode_job_cursor(&b64).is_err(), "非 RFC3339 拒绝");
+        // 空 ID。
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"created_at":"2026-09-25T08:00:00Z","id":""}"#);
+        assert!(decode_job_cursor(&b64).is_err(), "空 id 拒绝");
+        // 超长解码（>512 字节）。
+        let big = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(vec![b'x'; 600]);
+        assert!(decode_job_cursor(&big).is_err(), "解码超长拒绝");
+    }
 }

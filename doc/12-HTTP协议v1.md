@@ -45,6 +45,8 @@
 
 `GET /v1/jobs/{job_id}` 返回本 scope 的 `{job_id,status,attempts,created_at,updated_at,error_code?,input_tokens?,output_tokens?}`。不同用户的 ID 一律 404。`POST /v1/jobs/{job_id}/retry` 只允许 `dead` 状态、同 scope 的显式管理调用；`WINDOW_TOO_LARGE` 的作业不接受原样 retry，须用本地 CLI `memoryd job skip` 显式跳过（写审计，L0 原文保留）。DSH Agent 工具不注册此端点。
 
+`GET /v1/jobs?status=<值>&limit=<1..100>&cursor=<opaque>`（doc4/04 §1）返回本 scope 的作业列表：`status` 取 `queued/running/retryable_failed/succeeded/dead/all`，默认 `dead`；默认 limit 20。按 `(created_at DESC,id DESC)` 稳定排序；`cursor` 是 base64url 编码的 `(created_at,id)` 翻页位置（解码上限 512 字节，服务端严格校验；scope 始终来自当前令牌，cursor 不能指定 scope），坏 cursor 返回 400 `INVALID_FIELD`。响应 `{jobs:[{job_id,host_id,session_id,through_event_seq,status,attempts,run_after,lease_until,error_code,skipped,created_at,updated_at}],next_cursor}`，`skipped` 表示该 dead 作业已有显式跳过记录；列表不返回事件正文、Prompt 或密钥。`GET /v1/jobs/{job_id}` 同时补充 `window_key/prompt_version/model_name` 等诊断字段。
+
 ## 5. 用户显式记忆
 
 `POST /v1/memories/remember`

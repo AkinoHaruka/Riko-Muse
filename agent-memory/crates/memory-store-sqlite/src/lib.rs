@@ -59,10 +59,14 @@ pub enum StoreError {
     Time(String),
 }
 
+pub mod diagnostics;
 pub mod evidence;
 pub mod jobs;
 pub mod memories;
 
+pub use diagnostics::{
+    CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem,
+};
 pub use evidence::IngestOutcome;
 pub use jobs::{CandidateOutcome, FailOutcome, FlushOutcome, JobRow};
 pub use memories::{
