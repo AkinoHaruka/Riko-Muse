@@ -181,18 +181,33 @@ export class EventPipeline {
     );
   }
 
-  /** 卸载：停止接收，真实等待在途发送链最多 5 秒；未 ack 保留 spool。 */
+  /** 卸载：先给在途队列与发送链最多 5 秒完成（含 turn/end flush），再停止接收。
+   * 此前先置 stopped 再等待，drainChain 立即返回，one-shot 进程退出竞态把
+   * flush 留在 spool，记忆可用性滞后一轮（doc-handoff/06 F4，2026-09-25）。
+   * 内核离线时在途链不会 settle，按 deadline 收尾，未 ack 保留 spool 供重放。 */
   async dispose(): Promise<void> {
+    const deadline = Date.now() + 5000;
+    // 等内存队列清空、在途链排空（内核在线时毫秒级完成）
+    while (Date.now() < deadline && (this.queue.length > 0 || this.chainPending.size > 0)) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const chains = [...this.chains.values()];
+    if (chains.length > 0) {
+      await Promise.race([
+        Promise.all(chains.map((c) => c.catch(() => undefined))),
+        new Promise((r) => setTimeout(r, Math.max(0, deadline - Date.now()))),
+      ]);
+    }
     this.stopped = true;
     const wakeup = this.writerWakeup;
     if (wakeup) {
       this.writerWakeup = undefined;
       wakeup();
     }
-    const chains = [...this.chains.values()];
+    const rest = [...this.chains.values()];
     await Promise.race([
-      Promise.all(chains.map((c) => c.catch(() => undefined))),
-      new Promise((r) => setTimeout(r, 5000)),
+      Promise.all(rest.map((c) => c.catch(() => undefined))),
+      new Promise((r) => setTimeout(r, 2000)),
     ]);
     for (const list of this.waiters.values()) {
       for (const w of list) {
@@ -324,7 +339,8 @@ export class EventPipeline {
           this.resolveWaiters(item.op.opId, evidenceId);
         }
         list.shift();
-        this.chainPending.set(sessionId, list);
+        if (list.length === 0) this.chainPending.delete(sessionId); // 空列表不清会干扰 dispose 的排空判断
+        else this.chainPending.set(sessionId, list);
         continue;
       }
       if (result.failure === "unauthorized") {
