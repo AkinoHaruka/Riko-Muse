@@ -2,14 +2,16 @@
 
 Rust 优先的通用 Agent 长期记忆内核：同一用户的多 Agent 共享同一份长期记忆，不同用户严格隔离。设计契约见 `../doc/`（v1 冻结：`../doc/10-开发冻结规范.md`；实现契约：`../doc/11`～`15`）。
 
-**状态（分层，勿混为一类。更新：2026-09-25，详见 `../doc-handoff/04-V2-6交付记录.md`）：**
+**状态（分层，勿混为一类。更新：2026-09-25，详见 `../doc-handoff/07-doc4可靠性迭代交付记录.md`）：**
 
 | 层 | 状态 |
 |---|---|
-| HTTP 协议验证（curl 实测 + 26 个单测） | ✅ 本机 Windows 实测 |
-| DSH 实际运行（官方 clone 真实宿主闭环） | ✅ headless profile `memory-hl` 真实会话闭环（capture/五工具/注入/纠错/遗忘/跨用户 404/spool 离线恢复） |
-| 模型真实连通 | ✅ 提取链路与 DSH 会话链路实测（SiliconFlow Qwen3.5-4B，2026-09-25，见 `../doc-handoff/05-真实模型验证.md`）；批量质量/长历史/限速未验证 |
-| 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；未做安装分发，其他操作系统未验证 |
+| HTTP 协议验证（curl 实测 + 单测） | ✅ 本机 Windows 实测（含 doc4 队列可靠性/分窗/诊断：`cargo test --workspace` 49 测试全绿 + 真实 curl 冒烟） |
+| DSH 实际运行（官方 clone 真实宿主闭环） | ✅ v2 闭环（2026-09-25）；**doc4 的适配器改动（80 事件/24 KiB 主动 flush）仅本地单测，真实 DSH 未复验** |
+| 模型真实连通 | ✅ v2 提取链路实测（SiliconFlow Qwen3.5-4B，见 `../doc-handoff/05`）；**doc4 阶段未运行真实模型**（本阶段用固定响应验证，无模型质量验证） |
+| 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；迁移 0003 仅在临时库演练，未做安装分发，其他操作系统未验证 |
+
+队列可靠性契约（作业状态机、公平领取、崩溃恢复、服务端分窗、人工 skip）见 `../doc4/02—04`。
 
 ## 快速开始（Windows 本机已验证）
 
@@ -25,7 +27,7 @@ cargo run -p memory-server --bin memoryd -- principal add \
 cargo run -p memory-server --bin memoryd -- serve --config config.toml
 
 # 4. 检查
-curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":2,...}
+curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":3,...}
 curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"ready|degraded"}
 ```
 
@@ -36,7 +38,9 @@ curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"
 | `memoryd serve --config <file>` | 启动内核（只监听 loopback；非 loopback 绑定拒绝启动） |
 | `memoryd principal add --tenant <id> --user <id> --token-out <file> --db <path>` | 创建用户令牌（文件不能已存在） |
 | `memoryd principal rotate-token ...` | 换令牌，原令牌立即失效 |
-| `memoryd doctor --config <file>` | 只读诊断：schema 版本、principals 数、索引 generation/dirty |
+| `memoryd doctor --config <file>` | 只读诊断：schema 版本、principals 数、索引 generation/dirty + 作业聚合计数（各状态、lease 过期 running、未跳过/已跳过 dead、held 数、最老待办时长） |
+| `memoryd job skip --config <f> --tenant <t> --user <u> --job-id <完整ID> --reason <文本>` | 显式跳过 dead/WINDOW_TOO_LARGE 作业的自动提取（写审计；不删 L0；重复幂等） |
+| `memoryd candidates list/show --config <f> --tenant <t> --user <u> ...` | held 候选只读查看（list 不含正文；show 含 quote，仅本机终端） |
 | `memoryd rebuild-index --config <file>` | 从 active 规范表全量重建 FTS/grams（不复活 forgotten） |
 | `memoryd backup --config <file> --out <path>` | SQLite 在线一致性备份（VACUUM INTO） |
 
@@ -50,8 +54,9 @@ curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"
 |---|---|
 | `GET /v1/health` · `GET /v1/version` | 健康与版本（无需认证） |
 | `POST /v1/evidence/events` | L0 事件幂等接收（同键同 hash 200，同键异 hash 409 `EVENT_CONFLICT`） |
-| `POST /v1/extraction/flush` | 关窗排队提取作业（`window_key=v1:<seq>` 幂等） |
-| `GET /v1/jobs/{id}` · `POST /v1/jobs/{id}/retry` | 作业状态 / dead 重排 |
+| `POST /v1/extraction/flush` | 关窗提取（**服务端权威分窗**：按实际序列化字节切窗，单事件超限建 dead/WINDOW_TOO_LARGE，空洞/无用户组建 succeeded checkpoint；同 through 幂等） |
+| `GET /v1/jobs` | scope 内分页作业列表（默认 dead；keyset cursor；诊断字段，无正文） |
+| `GET /v1/jobs/{id}` · `POST /v1/jobs/{id}/retry` | 作业详情（补诊断字段）/ dead 重排（`WINDOW_TOO_LARGE` 拒绝原样 retry，走 skip） |
 | `POST /v1/memories/remember` | 用户显式记忆（quote 须为最新用户消息连续子串） |
 | `GET /v1/memories/{id}` | 单条 active 记忆（跨用户 404） |
 | `POST /v1/memories/search` | FTS5（拉丁）+ 二元字（中文）+ RRF(k=60)；`include_history` 需历史词 |

@@ -879,6 +879,7 @@ name = "memory-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "clap",
  "futures-util",
@@ -908,6 +909,7 @@ dependencies = [
  "memory-recall",
  "rand 0.8.8",
  "rusqlite",
+ "serde_json",
  "sha2",
  "thiserror",
  "uuid",
