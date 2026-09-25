@@ -2,7 +2,14 @@
 
 Rust 优先的通用 Agent 长期记忆内核：同一用户的多 Agent 共享同一份长期记忆，不同用户严格隔离。设计契约见 `../doc/`（v1 冻结：`../doc/10-开发冻结规范.md`；实现契约：`../doc/11`～`15`）。
 
-**状态：卡 0～5 已交付并本机验证（Windows）。** 卡 6 为本文件。未验证项见文末。
+**状态（分层，勿混为一类。更新：2026-09-25，详见 `../doc-handoff/04-V2-6交付记录.md`）：**
+
+| 层 | 状态 |
+|---|---|
+| HTTP 协议验证（curl 实测 + 26 个单测） | ✅ 本机 Windows 实测 |
+| DSH 实际运行（官方 clone 真实宿主闭环） | ✅ headless profile `memory-hl` 真实会话闭环（capture/五工具/注入/纠错/遗忘/跨用户 404/spool 离线恢复） |
+| 模型真实连通 | ❌ **未验证**——全部宿主闭环使用本地假模型（mock，仅测试装置），无可用真实端点 |
+| 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；未做安装分发，其他操作系统未验证 |
 
 ## 快速开始（Windows 本机已验证）
 
@@ -56,14 +63,15 @@ curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"
 
 ## DSH 适配器（`adapters/dsh/`）
 
-TypeScript 薄适配器，已通过 `tsc --noEmit` 类型检查。宿主 Hook 事实已在目标 checkout 核对（`C:\TRAE\Riko-dsh\deepseek-harness` @ `riko-memory/src/index.ts`，只读）：
+TypeScript 薄适配器（Cordis 插件），按官方 `deepseek-harness@477b4f4`（0.1.7-rc.2）源码事实重写并通过对真实 DSH lib 类型的 `tsc` 检查（宿主事实核对路径：`packages/core/agent-loop`、`packages/llm/llm-deepseek/src/serialize.ts`、`packages/session/session-format-v3-to-v4/src/message-sources.ts`）：
 
-- `ctx.on('session/event', (session, event) => ...)`：`event.type`/`event.seq`/`event.time`/`event.data.source.kind` 可用；
-- `ctx.on('agent/pre-step', ({agent,messages,signal}, next)`：`next()` 返回 `decision`，`decision.kind==='enter'` 时追加 `decision.messages`；
-- `defineTool({name,description,parameters,output,execute})`，`execute(args, exec)` 中 `exec.agent.session` 可用；
-- `createUserMessage({content, source:{kind:'plugin', ...}})` 标记注入来源。
+- Cordis 插件形状：导出 `name`/`inject`/`apply(ctx, config)`；`inject: [tools]`，sessionQuery 软探测；
+- `ctx.on('session/event', ...)`：`event.time` 为 Unix 毫秒数；`user/message` 的 `data` 即 `UserMessage`；
+- `ctx.on('agent/pre-step', ...)`：waterfall `await next()` 后按 compose 结果追加注入消息；
+- 注入 source 用 producer 自有 kind `{kind:'agent-memory', form:'recall'}`——**v4 会话格式已退役 `kind:'plugin'`**（`doc2/04` 相应表述已过时，以官方源码为准）；
+- `defineTool` 五个 `memory_*` 工具，输出固定 JSON 对象 `{ok,data?,error?}`。
 
-装载方式：适配器不硬依赖 DSH 内部包，宿主 glue（Hook 注册、`createUserMessage`、工具包装）由目标 DSH 版本的装载层注入。**在独立 profile 试装**，不与旧 `riko-memory` 插件同时注入。运行时行为：事件先落本地 spool（`spoolDir/events.jsonl`，100 MiB 上限）再异步发送；内核离线时 DSH 对话不受影响，重连后按幂等键重放。
+运行时行为：事件先落本地 spool（`spoolDir/events.jsonl`，追加 + fsync，100 MiB 上限）再异步发送；内核离线时 DSH 对话不受影响，恢复后启动重放按幂等键重发（同键返回既有 evidence_id）。详见 `../doc2/03`、`../doc2/04`。
 
 ## 安全边界
 
@@ -87,8 +95,8 @@ TypeScript 薄适配器，已通过 `tsc --noEmit` 类型检查。宿主 Hook �
 
 ## 已验证与未验证
 
-**已验证（本机 Windows，23 个单测 + curl 实测）**：双用户令牌隔离与轮换；L0 幂等/冲突；Agent A→B 跨 Agent 记忆闭环（remember/search/compose）；中文 grams 与英文 FTS 双路检索；纠错/遗忘/版本锁/幂等/抑制复活；flush 幂等与作业状态；重启恢复；rebuild-index/backup/doctor；非 loopback 拒绝。
+**已验证（本机 Windows，26 个单测 + curl 实测 + 官方 DSH headless 真实闭环，2026-09-25）**：双用户令牌隔离与轮换；L0 幂等/冲突；Agent A→B 跨 Agent 记忆闭环（remember/search/compose，含 DSH 宿主内注入可见性）；中文 grams 与英文 FTS 双路检索；纠错/遗忘/版本锁/幂等/抑制复活（DSH 宿主内多步工具回路）；flush 幂等与作业状态；重启恢复；**spool 离线重放（停内核→落盘→恢复→同键幂等重放）**；rebuild-index/backup/doctor；非 loopback 拒绝。
 
-**未验证**：真实模型端点连通与提取质量（准入规则用固定响应验证）；DSH 宿主内端到端（需独立 profile 试装）；其他操作系统。
+**未验证**：真实模型端点连通与提取质量（宿主闭环均用本地假模型；自动提取 worker 用固定响应验证）；插件 HMR 卸载后工具消失；其他操作系统。one-shot headless 模式下 assistant/tool 事件捕获受退出竞态影响（用户事件不受影响），headless 无 sessionQuery、缺口对账不运行。
 
 **不声称**：EverOS/Hindsight 的基准成绩、SOTA 准确率、生产多租户能力。首版只报告上述本机实测行为。
