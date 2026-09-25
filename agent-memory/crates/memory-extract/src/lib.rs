@@ -7,12 +7,17 @@ use serde::Deserialize;
 
 /// 系统提示词（doc/13 §4）。响应 Schema 逐字写进提示词——真实模型（尤其 4B 级）
 /// 无法从散文约束可靠猜出字段名，缺 schema 会自造字段或包 Markdown 围栏（2026-09-25 实测）。
+/// 事实类引导与示例：真实模型对平叙事实系统性漏提取（两个独立窗口空候选，2026-09-25
+/// 日常观察 F2），对指令/偏好句式正常——示例给出事实也应提取的明确信号。示例内容
+/// 不会被误收：quote 须为真实窗口用户消息的连续原文，示例句不在窗口内，准入必拒。
 pub const EXTRACT_SYSTEM_PROMPT: &str = "\
 从给定对话提取可能对未来 Agent 有持续用途的用户事实、偏好、长期指令和事件。
+用户主动陈述的个人情况是典型事实，应当提取：居住地、职业与专业领域、家庭成员及其重要节点、正在使用的工具或技术栈、稳定的生活习惯。
 只引用 role=user 且 source_kind=user 的 event_id。
 quote 必须逐字复制同一条用户消息中的连续原文；不要改写、补充或拼接多条消息。
 临时请求、假设、引用他人的话、助手推断不要提取。没有合格内容时输出空数组。
 只输出 JSON，不输出解释或 Markdown。
+示例（仅演示形状与逐字要求，勿照抄进结果）：某用户消息的 event_id 为 e1、正文为「我在杭州做后端开发，平时主要写 Rust。」，则应提取 {\"source_event_id\":\"e1\",\"quote\":\"我在杭州做后端开发，平时主要写 Rust\",\"kind\":\"fact\"}。
 响应必须是如下形状，字段名逐字一致、不增不减；occurred_at、valid_until、confidence 可省略：
 {\"candidates\":[{\"source_event_id\":\"<event_id>\",\"quote\":\"<逐字连续原文>\",\"kind\":\"fact|preference|instruction|episode\",\"occurred_at\":null,\"valid_until\":null,\"confidence\":0.9}]}
 没有合格内容时输出 {\"candidates\":[]}。";
