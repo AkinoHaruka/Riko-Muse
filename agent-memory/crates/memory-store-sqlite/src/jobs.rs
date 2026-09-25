@@ -219,7 +219,7 @@ impl Store {
             let job_id = insert_job(&tx, through_event_seq, "succeeded", None)?;
             last_job = Some((job_id, "succeeded".into()));
         }
-        // 审计与作业同一事务（audit_events.actor_kind 限于 user/system）。
+        // 审计与作业同一事务；audit_events 无 CHECK 约束，actor_kind 按来源如实记录。
         let (last_id, last_status) = last_job.expect("至少生成 checkpoint");
         let detail = serde_json::json!({
             "host_id": host_id, "session_id": session_id,
@@ -529,6 +529,30 @@ impl Store {
         Ok(FailOutcome::Retryable { run_after })
     }
 
+    /// 确定性失败立即 dead（doc4/02 §2 状态机、doc4/03 §5）：`WINDOW_TOO_LARGE`、
+    /// `UNKNOWN_PROMPT_VERSION` 等同输入重试不会改变的错误不进退避阶梯——不空转
+    /// 重试、不延迟 dead、attempts 记本次执行结束后的实际次数。generation 匹配才
+    /// 生效；影响 0 行返回 `StaleClaim`。
+    pub fn fail_job_deterministic(
+        &mut self,
+        job_id: &str,
+        generation: i64,
+        attempts: i32,
+        error_code: &str,
+    ) -> Result<(), StoreError> {
+        let now = now_rfc3339()?;
+        let n = self.conn_mut().execute(
+            "UPDATE extraction_jobs SET status='dead', attempts=?1, error_code=?2,
+             lease_until=NULL, updated_at=?3
+             WHERE id=?4 AND status='running' AND claim_generation=?5",
+            params![attempts, error_code, now, job_id, generation],
+        )?;
+        if n == 0 {
+            return Err(StoreError::StaleClaim);
+        }
+        Ok(())
+    }
+
     pub fn get_job(&self, scope: &ScopeKey, job_id: &str) -> Result<Option<JobRow>, StoreError> {
         let row = self
             .conn()
@@ -604,7 +628,7 @@ impl Store {
         tx.execute(
             "INSERT INTO audit_events
              (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
-             VALUES (?1,?2,?3,'system','local_admin','job_skip',?4,?5,?6)",
+             VALUES (?1,?2,?3,'admin_cli','local_admin','job_skip',?4,?5,?6)",
             params![
                 Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id,
                 job_id, now,
@@ -1328,6 +1352,71 @@ mod tests {
             "SELECT count(*) FROM extraction_job_skips", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(skips, 1, "跨 scope 请求不得新增 skip 行");
+    }
+
+    #[test]
+    fn deterministic_failure_dead_immediately_without_retry() {
+        // doc5 卡 D5-0（doc-handoff/08 发现 1）：确定性错误码立即 dead——
+        // 不进 5/15s 退避、attempts 只记本次执行一次、不留 retryable。
+        let mut store = setup("detdead");
+        let scope = scope_of(&store, "t", "u");
+        ingest(&mut store, &scope, "s1", 1, "我叫洛溪");
+        let job_id = flush(&mut store, &scope, "s1", 1);
+        let run_after = job_field(&store, &job_id, "run_after");
+        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        store
+            .fail_job_deterministic(&job_id, claimed.claim_generation, 1, "WINDOW_TOO_LARGE")
+            .unwrap();
+        assert_eq!(job_field(&store, &job_id, "status"), "dead");
+        assert_eq!(job_field(&store, &job_id, "error_code"), "WINDOW_TOO_LARGE");
+        let attempts: i32 = store.conn().query_row(
+            "SELECT attempts FROM extraction_jobs WHERE id=?1", params![job_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(attempts, 1, "本次 attempt 只记一次");
+        assert_eq!(job_field(&store, &job_id, "lease_until"), "<NULL>");
+        // dead 后不因 run_after 重新可领取。
+        assert!(store.claim_next_ordered_job(&plus_secs(&run_after, 3600)).unwrap().is_none());
+        // 旧代际的 deterministic 提交不生效。
+        ingest(&mut store, &scope, "s2", 1, "s2-事件");
+        let job2 = flush(&mut store, &scope, "s2", 1);
+        let claimed2 = store
+            .claim_next_ordered_job(&plus_secs(&run_after, 3601))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed2.id, job2);
+        assert!(matches!(
+            store.fail_job_deterministic(&job2, claimed2.claim_generation + 5, 1, "WINDOW_TOO_LARGE"),
+            Err(StoreError::StaleClaim)
+        ));
+        assert_eq!(job_field(&store, &job2, "status"), "running", "旧代际写入不得生效");
+    }
+
+    #[test]
+    fn skip_audit_uses_admin_cli_actor() {
+        // doc5 卡 D5-0（doc-handoff/08 发现 2）：skip 审计 actor_kind='admin_cli'（doc4/03 §4）。
+        let mut store = setup("skipaudit");
+        let scope = scope_of(&store, "t", "u");
+        let big = "是".repeat(13_500);
+        ingest(&mut store, &scope, "s1", 1, &big);
+        store.flush_window(&scope, "dsh", "s1", 1).unwrap();
+        let dead_id: String = store.conn().query_row(
+            "SELECT id FROM extraction_jobs WHERE status='dead' AND error_code='WINDOW_TOO_LARGE'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(store.skip_dead_job(&scope, &dead_id, "运维确认超限").unwrap());
+        let (actor_kind, actor_id, action): (String, String, String) = store.conn().query_row(
+            "SELECT actor_kind, actor_id, action FROM audit_events WHERE action='job_skip'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(actor_kind, "admin_cli");
+        assert_eq!(actor_id, "local_admin");
+        let _ = action;
+        // skip 表内 actor_kind 同口径。
+        let skip_actor: String = store.conn().query_row(
+            "SELECT actor_kind FROM extraction_job_skips WHERE job_id=?1",
+            params![dead_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(skip_actor, "admin_cli");
     }
 
     #[test]

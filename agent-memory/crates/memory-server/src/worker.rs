@@ -597,12 +597,38 @@ mod tests {
         process_job(&state, &mock1, cfg.clone(), &job).await.unwrap();
         assert_eq!(*sys1.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT_V1);
 
-        // 未知版本 → 显式失败，不改用最新规则。
+        // 未知版本 → 确定性失败：立即 dead、不调用模型、不进退避（doc5 卡 D5-0）。
         let mut job = flush_job(&store, "sv0");
         job.prompt_version = "extract_v0".into();
+        let calls0 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mock0 = SysCapture { system: empty.clone(), response: "{\"candidates\":[]}".into() };
+        let mock0 = CountingModel { inner: mock0, calls: calls0.clone() };
         let err = process_job(&state, &mock0, cfg, &job).await.unwrap_err();
         assert!(err.contains("UNKNOWN_PROMPT_VERSION") || err.contains("无对应规则实现"), "实际错误: {err}");
+        assert_eq!(calls0.load(std::sync::atomic::Ordering::SeqCst), 0, "确定性失败不得调用模型");
+        let j = store.lock().unwrap().get_job(&scope, &job.id).unwrap().unwrap();
+        assert_eq!(j.status, "dead", "未知版本必须一次失败即 dead");
+        assert_eq!(j.attempts, 1, "本次 attempt 只记一次");
+        let detail = store
+            .lock()
+            .unwrap()
+            .get_job_detail(&scope, &job.id)
+            .unwrap()
+            .expect("作业详情应存在");
+        assert_eq!(detail.item.error_code.as_deref(), Some("UNKNOWN_PROMPT_VERSION"));
+    }
+
+    /// 包装模型以统计调用次数（确定性失败不得调用模型）。
+    struct CountingModel {
+        inner: SysCapture,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExtractModel for CountingModel {
+        async fn extract(&self, system: &str, user: &str) -> Result<memory_extract::ExtractOutput, ExtractError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.extract(system, user).await
+        }
     }
 }
 
@@ -813,13 +839,13 @@ async fn process_job_inner<M: ExtractModel>(
 
     // 外层结果处理（doc4/02 §5）：一旦已 claim，任何错误离开本函数前都按类别落状态；
     // 不再有"直接返回、作业留在 running"的路径。
-    // 确定性失败：未知 prompt 版本，同输入重试不会改变 → 立即 dead，不调用模型。
+    // 确定性失败：未知 prompt 版本，同输入重试不会改变 → 立即 dead（不走退避阶梯），
+    // 不调用模型（doc5 卡 D5-0 收口 doc-handoff/08 发现 1）。
     let Some(system_prompt) = memory_extract::system_prompt_for(&job.prompt_version) else {
         let mut guard = state.store.lock().unwrap();
         let code = "UNKNOWN_PROMPT_VERSION";
-        match guard.fail_job(&job.id, job.claim_generation, attempts, code) {
-            Ok(FailOutcome::Retryable { .. }) => {}
-            Ok(FailOutcome::Dead) => {
+        match guard.fail_job_deterministic(&job.id, job.claim_generation, attempts, code) {
+            Ok(()) => {
                 eprintln!("[worker] job {} 已 dead（{code}）", job.id);
             }
             Err(e) => {
@@ -839,8 +865,11 @@ async fn process_job_inner<M: ExtractModel>(
         let (lower, events) = match loaded {
             Ok(v) => v,
             Err(StoreError::WindowTooLarge) => {
-                match guard.fail_job(&job.id, job.claim_generation, attempts, "WINDOW_TOO_LARGE") {
-                    Ok(_) => {}
+                // 窗口超限为确定性失败：同输入重试不会改变 → 立即 dead，不空转重试。
+                match guard.fail_job_deterministic(&job.id, job.claim_generation, attempts, "WINDOW_TOO_LARGE") {
+                    Ok(()) => {
+                        eprintln!("[worker] job {} 已 dead（WINDOW_TOO_LARGE）", job.id);
+                    }
                     Err(e) => eprintln!("[worker] job {} 失败写入未生效（{e}），交由 lease 恢复", job.id),
                 }
                 return Err(format!("窗口超限（job {}，不调用模型，已 dead）", job.id));
