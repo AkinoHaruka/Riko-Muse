@@ -272,7 +272,10 @@ export class EventPipeline {
 
   private enqueueExisting(op: SpooledOp): void {
     // 重启重放：op 已落盘，直接进发送链。
-    const sessionId = String(op.request.session_id ?? "");
+    // session_id 位置按 op 形状区分（doc/12 §3/§4）：event 请求在 origin 内，flush 请求在顶层。
+    // 此前只读顶层 request.session_id，event op 全部被静默丢弃，重放从未发送过事件。
+    const origin = op.request.origin as { session_id?: unknown } | undefined;
+    const sessionId = String(origin?.session_id ?? op.request.session_id ?? "");
     if (sessionId.length === 0) return;
     const bodySeq = op.op === "event" ? Number(op.request.event_seq) : undefined;
     this.enqueueToChain({ op, sessionId, bodySeq, bytes: 0 });

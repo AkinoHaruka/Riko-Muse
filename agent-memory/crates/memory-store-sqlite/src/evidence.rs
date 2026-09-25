@@ -18,7 +18,8 @@ pub enum IngestOutcome {
 }
 
 impl Store {
-    /// 该会话已收到的最大事件序号（flush 校验用）。
+    /// 该会话已收到的最大事件序号（flush 校验用）。无任何事件时返回 None——
+    /// 聚合 MAX 对空集返回一行 NULL，闭包必须按 Option 读取，否则 InvalidColumnType。
     pub fn max_event_seq(
         &self,
         scope: &ScopeKey,
@@ -31,9 +32,10 @@ impl Store {
                 "SELECT MAX(event_seq) FROM evidence_events
                  WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4",
                 rusqlite::params![scope.tenant_id, scope.user_id, host_id, session_id],
-                |r| r.get(0),
+                |r| r.get::<_, Option<i64>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         Ok(v)
     }
 
@@ -238,5 +240,23 @@ mod tests {
         assert_eq!(seq, 3);
         assert_eq!(content, "第二句");
         let _ = id;
+    }
+
+    #[test]
+    fn flush_window_on_unknown_session_is_state_conflict_not_db_error() {
+        // 回归：MAX(event_seq) 对无事件会话返回 NULL 行，此前按 i64 直取
+        // 触发 rusqlite InvalidColumnType → HTTP 500；应返回 StateConflict（doc/13 §3）。
+        let (mut store, scope) = setup("flush-empty");
+        let err = match store.flush_window(&scope, "dsh", "session-unknown", 8) {
+            Err(e) => e,
+            Ok(_) => panic!("空会话 flush 应返回 StateConflict，不应触达数据库错误"),
+        };
+        assert!(matches!(err, StoreError::StateConflict));
+        // 已有事件的会话：through 未越界 → 正常建作业（验证 max_event_seq 正路径未受影响）。
+        let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
+        let o = origin();
+        store.record_evidence(&scope, &o, 8, "user", "user", &t, "你好").unwrap();
+        let outcome = store.flush_window(&scope, "dsh", "s1", 8).unwrap();
+        assert!(matches!(outcome, crate::jobs::FlushOutcome::Created { .. }));
     }
 }
