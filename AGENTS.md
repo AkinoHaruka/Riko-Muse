@@ -21,8 +21,8 @@ doc5（记忆质量规则 D5-0…D5-6）：全部交付；内核 schema 4（迁�
   —— 新作业 extract_v3/admit_v2、旧作业冻结 admit_v1、未知版本立即 dead
   —— remember 直写窄门：凭据永不 active、时间性暂拒、健康/第三人需相邻「请记住：<原话>」
   —— 08 §3.2 两个契约偏差已在 D5-0 修复（确定性错误立即 dead、skip 审计 admin_cli）
-待做：doc5 改动的真实 DSH 闭环复验（可用 mock 端点）、dana/realtest 原库 0003+0004 实际升级部署决策（副本演练均通过）、真实模型观察恢复（用户决定，独立产品决策）
-最新交接：doc-handoff/README.md（必读）+ 09-D5交付记录.md（最新事实）
+待做：dana/realtest 原库 0003+0004 实际升级部署决策（副本演练均通过；升级前先只读快照 + 处理 dana index_dirty=1）、STATE_CONFLICT 是否入适配器 USER_FIXABLE（契约决策）、直写复合命题粒度（产品决策）
+最新交接：doc-handoff/README.md（必读）+ 10-D5真实模型验证.md（最新事实：doc5 真实 DSH 闭环复验 ✅、真实模型首轮观察 ✅ 小样本）
 ```
 
 ## 3. 目录与只读边界
