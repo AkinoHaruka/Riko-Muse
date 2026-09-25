@@ -23,6 +23,8 @@ pub enum StoreError {
     MigrationChecksum { name: String, recorded: String, current: String },
     #[error("迁移文件版本跳跃或重复: {0}")]
     MigrationOrder(String),
+    #[error("extraction_jobs 存在 (tenant,user,host,session,through) 重复作业，停止迁移 0003（未删行、未做任何 DDL）：{ids}")]
+    MigrationJobConflict { ids: String },
     #[error("principal ({tenant}, {user}) 已存在，拒绝覆盖")]
     PrincipalExists { tenant: String, user: String },
     #[error("principal ({tenant}, {user}) 不存在")]
@@ -202,6 +204,25 @@ impl Store {
                 continue;
             }
             let tx = conn.transaction()?;
+            // doc4/02 §1：0003 建 jobs_through_unique 前先检查既有数据是否已有同
+            // (tenant,user,host,session,through) 的重复作业；有则列出精确 job ID 并中止，
+            // 与迁移 DDL 同一事务，任何失败都不留部分修改。
+            if m.name == "0003_job_recovery" {
+                let ids: Option<String> = tx.query_row(
+                    "SELECT group_concat(a.id, ',') FROM extraction_jobs a
+                     WHERE EXISTS (
+                       SELECT 1 FROM extraction_jobs b
+                       WHERE b.tenant_id=a.tenant_id AND b.user_id=a.user_id
+                         AND b.host_id=a.host_id AND b.session_id=a.session_id
+                         AND b.through_event_seq=a.through_event_seq AND b.id<>a.id
+                     )",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )?;
+                if let Some(ids) = ids {
+                    return Err(StoreError::MigrationJobConflict { ids });
+                }
+            }
             tx.execute_batch(&m.sql)?;
             tx.execute(
                 "INSERT INTO schema_migrations (version, name, sha256, applied_at) VALUES (?1, ?2, ?3, ?4)",
@@ -437,14 +458,14 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        // Store::open 应用 0002 升级。
+        // Store::open 依序应用 0002、0003 升级（版本随迁移文件递增）。
         let mut store = Store::open(&db, &migrations).unwrap();
         let schema_v: u32 = store.conn().query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
             [],
             |r| r.get(0),
         ).unwrap();
-        assert_eq!(schema_v, 2);
+        assert_eq!(schema_v, 3);
         let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "succeeded");
@@ -453,6 +474,143 @@ mod tests {
         // 仅对不带该列插入的历史行生效，flush 一律显式写当前常量）。
         assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v2");
         let _ = token_file;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 手工构造"仅到 0002"的旧库（模拟 v2 现场）：按迁移加载器同算法记录 checksum。
+    fn build_v2_db(db: &Path) {
+        let migrations = migrations_dir();
+        let conn = Connection::open(db).unwrap();
+        for (name, file) in [("0001_init", "0001_init.sql"), ("0002_prompt_version", "0002_prompt_version.sql")] {
+            let sql = fs::read_to_string(migrations.join(file)).unwrap();
+            let sha = hex::encode(Sha256::digest(sql.as_bytes()));
+            conn.execute_batch(&sql).unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO schema_migrations (version, name, sha256, applied_at)
+                 VALUES ({v}, '{name}', '{sha}', '2026-09-24T00:00:00Z');",
+                v = if name == "0001_init" { 1 } else { 2 },
+            ))
+            .unwrap();
+        }
+        drop(conn);
+    }
+
+    #[test]
+    fn migrate_v2_db_to_v3_job_recovery() {
+        // doc4 卡 D4-1：schema 2→3 升级；旧作业保留 ID/status/attempts/prompt_version，
+        // claim_generation 由 DEFAULT 回填 0；重复启动不重放迁移。
+        let dir = std::env::temp_dir().join(format!("am-store-v3-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v2.db");
+        build_v2_db(&db);
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at)
+                 VALUES ('t1', 'u1', 'x', 'active', '2026-09-24T00:00:00Z');
+                 INSERT INTO extraction_jobs
+                   (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
+                    status, attempts, run_after, created_at, updated_at)
+                 VALUES ('j1', 't1', 'u1', 'dsh', 's1', 'v1:5', 5, 'retryable_failed', 2,
+                         '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db, &migrations_dir()).unwrap();
+        let (schema_v, applied): (u32, i64) = store.conn().query_row(
+            "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(schema_v, 3);
+        assert_eq!(applied, 3, "0001/0002/0003 各一条，无重放");
+        let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
+        let job = store.get_job(&scope, "j1").unwrap().unwrap();
+        assert_eq!(job.status, "retryable_failed");
+        assert_eq!(job.attempts, 2);
+        assert_eq!(job.prompt_version, "extract_v1", "旧作业回填 extract_v1");
+        let gen: i32 = store.conn().query_row(
+            "SELECT claim_generation FROM extraction_jobs WHERE id='j1'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(gen, 0, "既有作业 claim_generation 回填 0");
+        // skips 表存在且为空。
+        let skips: i64 = store.conn().query_row(
+            "SELECT count(*) FROM extraction_job_skips", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(skips, 0);
+        // 重复启动：迁移不重放。
+        let store2 = Store::open(&db, &migrations_dir()).unwrap();
+        let applied2: i64 = store2.conn().query_row(
+            "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(applied2, 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_v3_conflict_reports_job_ids_and_keeps_rows() {
+        // doc4 卡 D4-1 / doc4/04 §4：唯一索引冲突 → 报精确 job ID、未丢行、不做部分 DDL；
+        // 冲突排除后同一库可正常升级。
+        let dir = std::env::temp_dir().join(format!("am-store-v3-conflict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conflict.db");
+        build_v2_db(&db);
+        {
+            // window_key 不同绕开 0001 的既有唯一键，但 (host,session,through) 冲突。
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at)
+                 VALUES ('t1', 'u1', 'x', 'active', '2026-09-24T00:00:00Z');
+                 INSERT INTO extraction_jobs
+                   (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
+                    status, attempts, run_after, created_at, updated_at)
+                 VALUES ('jA', 't1', 'u1', 'dsh', 's1', 'v1:5', 5, 'succeeded', 1,
+                         '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z'),
+                        ('jB', 't1', 'u1', 'dsh', 's1', 'legacy:5', 5, 'queued', 0,
+                         '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let err = match Store::open(&db, &migrations_dir()) {
+            Err(e) => e,
+            Ok(_) => panic!("冲突库必须迁移失败"),
+        };
+        match err {
+            StoreError::MigrationJobConflict { ids } => {
+                assert!(ids.contains("jA") && ids.contains("jB"), "应列出冲突 job ID：{ids}");
+            }
+            other => panic!("应为 MigrationJobConflict，实际 {other:?}"),
+        }
+        // 未丢行、未做部分 DDL（schema 仍为 2，新表/新列不存在）。
+        {
+            let conn = Connection::open(&db).unwrap();
+            let jobs: i64 = conn.query_row("SELECT count(*) FROM extraction_jobs", [], |r| r.get(0)).unwrap();
+            assert_eq!(jobs, 2, "冲突不得删行");
+            let schema_v: u32 = conn.query_row(
+                "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(schema_v, 2);
+            let has_col: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('extraction_jobs') WHERE name='claim_generation'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(has_col, 0, "失败迁移不得留下新列");
+        }
+        // 排除冲突后同一库可升级。
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            conn.execute_batch("DELETE FROM extraction_jobs WHERE id='jB';").unwrap();
+        }
+        let store = Store::open(&db, &migrations_dir()).unwrap();
+        let schema_v: u32 = store.conn().query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(schema_v, 3);
         let _ = fs::remove_dir_all(&dir);
     }
 }

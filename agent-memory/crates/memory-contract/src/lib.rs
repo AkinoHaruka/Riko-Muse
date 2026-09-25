@@ -5,8 +5,8 @@ use serde::Serialize;
 
 /// 协议版本：HTTP v1 语义不变（doc/12）。DSH 适配器握手依据。
 pub const PROTOCOL_VERSION: u32 = 1;
-/// 数据库模式版本：随迁移文件递增（0001→1，0002→2）。worker 按作业行 prompt_version 选规则。
-pub const SCHEMA_VERSION: u32 = 2;
+/// 数据库模式版本：随迁移文件递增（0001→1，0002→2，0003→3）。worker 按作业行 prompt_version 选规则。
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
