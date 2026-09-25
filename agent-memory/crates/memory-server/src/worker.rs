@@ -127,7 +127,7 @@ mod tests {
         // 真实 event_id 需要从窗口事件取——用 mock 前先取事件。
         let ev_id = {
             let g = store.lock().unwrap();
-            let lower = g.window_lower_bound(&scope, "dsh", "s1", &job.window_key).unwrap();
+            let lower = g.window_lower_bound(&scope, "dsh", "s1", job.through_event_seq).unwrap();
             g.load_window_events(&scope, &job, lower).unwrap()[0].id.clone()
         };
         let mut fixed_str = fixed.to_string();
@@ -732,7 +732,7 @@ async fn process_job<M: ExtractModel>(
     let (events, origin) = {
         let guard = state.store.lock().unwrap();
         let lower = guard
-            .window_lower_bound(&scope, &job.host_id, &job.session_id, &job.window_key)
+            .window_lower_bound(&scope, &job.host_id, &job.session_id, job.through_event_seq)
             .map_err(|e| e.to_string())?;
         let events = guard
             .load_window_events(&scope, job, lower)
