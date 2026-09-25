@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use memory_domain::{Origin, ScopeKey};
 use memory_extract::{
-    admit, ExtractError, ExtractModel, Extraction, ExtractOutput,
+    Admission, ExtractError, ExtractModel, Extraction, ExtractOutput,
 };
 use memory_store_sqlite::{FailOutcome, JobRow, StoreError};
 
@@ -541,9 +541,10 @@ mod tests {
         let state = AppState { store: store.clone() };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
         for (session, content) in [
-            ("sv2", "以后回答我用中文"),
+            ("sv3", "以后回答我用中文"),
             ("sv1", "以后回答我用中文"),
             ("sv0", "以后回答我用中文"),
+            ("sv0b", "以后回答我用中文"),
         ] {
             let t = chrono::Utc::now();
             let origin = memory_domain::Origin {
@@ -581,15 +582,19 @@ mod tests {
         };
         let empty = Arc::new(Mutex::new(String::new()));
 
-        // 当前版本（extract_v2）作业 → 当前提示词。
-        let mut job = flush_job(&store, "sv2");
+        // 当前版本（extract_v3/admit_v2）作业 → v3 提示词，admission_version 为 admit_v2。
+        let mut job = flush_job(&store, "sv3");
         assert_eq!(job.prompt_version, memory_contract::EXTRACT_PROMPT_VERSION);
+        assert_eq!(job.admission_version, memory_contract::ADMISSION_VERSION);
+        assert_eq!(job.prompt_version, "extract_v3");
+        assert_eq!(job.admission_version, "admit_v2");
         let sys2 = empty.clone();
         let mock2 = SysCapture { system: sys2.clone(), response: "{\"candidates\":[]}".into() };
         process_job(&state, &mock2, cfg.clone(), &job).await.unwrap();
-        assert_eq!(*sys2.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT);
+        assert_eq!(*sys2.lock().unwrap(), memory_extract::EXTRACT_SYSTEM_PROMPT_V3);
 
-        // 老版本（extract_v1）作业 → 老提示词。
+        // 老版本（extract_v1 冻结文本）作业 → 老提示词（extract_v2 的分派在
+        // admission_version_dispatch_old_and_new_jobs 中与 admit_v1 一并覆盖）。
         let mut job = flush_job(&store, "sv1");
         job.prompt_version = memory_contract::EXTRACT_PROMPT_VERSION_V1.into();
         let sys1 = empty.clone();
@@ -603,7 +608,7 @@ mod tests {
         let calls0 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mock0 = SysCapture { system: empty.clone(), response: "{\"candidates\":[]}".into() };
         let mock0 = CountingModel { inner: mock0, calls: calls0.clone() };
-        let err = process_job(&state, &mock0, cfg, &job).await.unwrap_err();
+        let err = process_job(&state, &mock0, cfg.clone(), &job).await.unwrap_err();
         assert!(err.contains("UNKNOWN_PROMPT_VERSION") || err.contains("无对应规则实现"), "实际错误: {err}");
         assert_eq!(calls0.load(std::sync::atomic::Ordering::SeqCst), 0, "确定性失败不得调用模型");
         let j = store.lock().unwrap().get_job(&scope, &job.id).unwrap().unwrap();
@@ -616,6 +621,118 @@ mod tests {
             .unwrap()
             .expect("作业详情应存在");
         assert_eq!(detail.item.error_code.as_deref(), Some("UNKNOWN_PROMPT_VERSION"));
+
+        // 未知 admission version → 同样确定性 dead，不调用模型（doc5 卡 D5-3）。
+        let mut job = flush_job(&store, "sv0b");
+        job.admission_version = "admit_v0".into();
+        let calls0b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock0b = SysCapture { system: empty.clone(), response: "{\"candidates\":[]}".into() };
+        let mock0b = CountingModel { inner: mock0b, calls: calls0b.clone() };
+        let err = process_job(&state, &mock0b, cfg, &job).await.unwrap_err();
+        assert!(err.contains("UNKNOWN_ADMISSION_VERSION") || err.contains("无对应规则实现"), "实际错误: {err}");
+        assert_eq!(calls0b.load(std::sync::atomic::Ordering::SeqCst), 0, "未知准入版本不得调用模型");
+        let j = store.lock().unwrap().get_job(&scope, &job.id).unwrap().unwrap();
+        assert_eq!(j.status, "dead");
+        assert_eq!(j.attempts, 1);
+        let detail = store
+            .lock()
+            .unwrap()
+            .get_job_detail(&scope, &job.id)
+            .unwrap()
+            .expect("作业详情应存在");
+        assert_eq!(detail.item.error_code.as_deref(), Some("UNKNOWN_ADMISSION_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn admission_version_dispatch_old_and_new_jobs() {
+        // doc5/03 §5 + doc5/07 C：同一候选，旧作业（extract_v2/admit_v1）保持旧判定，
+        // 新作业（extract_v3/admit_v2）用新规则；revision reason 表明实际策略版本。
+        let (store, scope) = setup("admver");
+        let state = AppState { store: store.clone() };
+        for session in ["s_old", "s_new"] {
+            let t = chrono::Utc::now();
+            let origin = memory_domain::Origin {
+                host_id: "dsh".into(),
+                agent_id: "agent-a".into(),
+                session_id: session.into(),
+            };
+            store
+                .lock()
+                .unwrap()
+                .record_evidence(&scope, &origin, 1, "user", "user", &t, "我在杭州做后端开发。我主要写 Rust。")
+                .unwrap();
+        }
+        let cfg = ModelConfig {
+            endpoint: "http://unused".into(),
+            model: "mock".into(),
+            api_key: "unused".into(),
+            timeout: Duration::from_secs(1),
+            max_tokens: 1024,
+            extra_body: None,
+        };
+        // 旧作业：extract_v2/admit_v1 → 候选 held:NOT_EXPLICIT，不建记忆。
+        run_extract_job(&store, &state, &scope, "s_old", Some("extract_v2"), Some("admit_v1"), cfg.clone())
+            .await
+            .unwrap();
+        {
+            let g = store.lock().unwrap();
+            let (hits, _) = g.search_memories(&scope, "后端", 5, false).unwrap();
+            assert!(hits.is_empty(), "admit_v1 下旧判定不建 active");
+            let held = g.count_candidates_by_reason(&scope, "NOT_EXPLICIT").unwrap();
+            assert_eq!(held, 1, "旧作业候选保持旧结果");
+        }
+        // 新作业：extract_v3/admit_v2 → 候选 active，建记忆。
+        run_extract_job(&store, &state, &scope, "s_new", None, None, cfg.clone())
+            .await
+            .unwrap();
+        {
+            let g = store.lock().unwrap();
+            let (hits, _) = g.search_memories(&scope, "后端", 5, false).unwrap();
+            assert_eq!(hits.len(), 1, "admit_v2 下同一候选 active");
+            assert_eq!(hits[0].claim, "我在杭州做后端开发");
+        }
+        // revision reason 的策略版本断言在 store 层测试（jobs.rs::revision_reason_shows_policy_version）。
+    }
+
+    /// 测试助手：flush→claim→（可选覆写版本）→固定响应候选→process_job。
+    async fn run_extract_job(
+        store: &Arc<Mutex<Store>>,
+        state: &AppState,
+        scope: &memory_domain::ScopeKey,
+        session: &str,
+        prompt_version: Option<&str>,
+        admission_version: Option<&str>,
+        cfg: ModelConfig,
+    ) -> Result<(), String> {
+        let mut g = store.lock().unwrap();
+        let job_id = match g.flush_window(scope, "dsh", session, 1).unwrap() {
+            FlushOutcome::Created { job_id, .. } => job_id,
+            _ => panic!(),
+        };
+        let run_after = g.get_job(scope, &job_id).unwrap().unwrap().run_after;
+        let mut job = g
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, job_id);
+        if let Some(pv) = prompt_version {
+            job.prompt_version = pv.into();
+        }
+        if let Some(av) = admission_version {
+            job.admission_version = av.into();
+        }
+        let ev_id = {
+            let lower = g
+                .window_lower_bound(scope, "dsh", session, job.through_event_seq)
+                .unwrap();
+            g.load_window_events(scope, &job, lower).unwrap()[0].id.clone()
+        };
+        let response = format!(
+            "{{\"candidates\":[{{\"source_event_id\":\"{ev_id}\",\"quote\":\"我在杭州做后端开发\",\"kind\":\"fact\"}}]}}"
+        );
+        drop(g);
+        let mock = MockModel { response, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)) };
+        process_job(state, &mock, cfg, &job).await
     }
 
     /// 包装模型以统计调用次数（确定性失败不得调用模型）。
@@ -854,6 +971,26 @@ async fn process_job_inner<M: ExtractModel>(
         }
         return Err(format!("作业 prompt_version={} 无对应规则实现", job.prompt_version));
     };
+    // doc5/03 §1：准入规则按作业行 admission_version 分派，与 Prompt 版本相互独立；
+    // 未知准入版本同样确定性 dead，不退回"最新规则"（doc5 卡 D5-3）。
+    let admission_version = match job.admission_version.as_str() {
+        memory_contract::ADMISSION_VERSION_V1 | memory_contract::ADMISSION_VERSION_V2 => {
+            job.admission_version.clone()
+        }
+        other => {
+            let mut guard = state.store.lock().unwrap();
+            let code = "UNKNOWN_ADMISSION_VERSION";
+            match guard.fail_job_deterministic(&job.id, job.claim_generation, attempts, code) {
+                Ok(()) => {
+                    eprintln!("[worker] job {} 已 dead（{code}）", job.id);
+                }
+                Err(e) => {
+                    eprintln!("[worker] job {} 失败写入未生效（{e}），交由 lease 恢复", job.id);
+                }
+            }
+            return Err(format!("作业 admission_version={other} 无对应规则实现"));
+        }
+    };
 
     // 加载窗口 + 下界：窗口超限为确定性失败（不调用模型，直接 dead）；下界查询/读库
     // 的暂态错误按退避重试（WINDOW_READ_FAILED）。锁在模型调用前释放。
@@ -929,12 +1066,14 @@ async fn process_job_inner<M: ExtractModel>(
                 Ok(ex) => {
                     let mut last_err: Option<String> = None;
                     for c in &ex.candidates {
-                        let admission = admit(c, &events);
+                        // 按作业行版本分派准入（版本已在上方验证，分派必有实现）。
+                        let admission = memory_extract::admit_for(&admission_version, c, &events)
+                            .unwrap_or(Admission::Held("NOT_EXPLICIT"));
                         match guard.save_candidate(&scope, job, &origin, c, admission) {
                             Ok(outcome) => {
                                 eprintln!(
-                                    "[worker] candidate job={} outcome={:?} prompt={}",
-                                    job.id, outcome, job.prompt_version
+                                    "[worker] candidate job={} outcome={:?} prompt={} admission={}",
+                                    job.id, outcome, job.prompt_version, job.admission_version
                                 );
                             }
                             Err(StoreError::StaleClaim) => {

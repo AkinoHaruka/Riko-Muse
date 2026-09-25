@@ -820,8 +820,12 @@ impl Store {
                             "INSERT INTO memory_revisions
                              (tenant_id, user_id, memory_id, version, previous_claim, new_claim, previous_status, new_status,
                               actor_kind, actor_id, reason_code, changed_at)
-                             VALUES (?1,?2,?3,1,NULL,?4,NULL,'active','system',?5,'extract_v1',?6)",
-                            params![scope.tenant_id, scope.user_id, memory_id, quote, job.id, now],
+                             VALUES (?1,?2,?3,1,NULL,?4,NULL,'active','system',?5,?6,?7)",
+                            params![
+                                scope.tenant_id, scope.user_id, memory_id, quote, job.id,
+                                format!("{}:{}", job.prompt_version, job.admission_version),
+                                now
+                            ],
                         )?;
                         tx.execute(
                             "UPDATE memory_candidates SET status='rejected', reason_code='PROMOTED' WHERE id=?1",
@@ -875,7 +879,10 @@ impl Store {
     }
 }
 
-/// 属性键提取（NFKC+大小写折叠后的固定前后缀，doc/13 §5.9）。
+/// 属性键提取（NFKC+大小写折叠后的固定前后缀，doc/13 §5.9；doc5/03 §7 扩展）。
+/// 扩展键 occupation 同时识别「我在X工作」与「我在X做<职业尾词>」（复用
+/// memory_extract::explicit_shape，不跨层复制名单）；primary_practice 识别
+/// 「我主要写X/我平时主要写X」。旧前缀逻辑保留，不削弱历史 active 的冲突检测。
 fn extract_attr_key(quote: &str, kind: MemoryKind) -> Option<&'static str> {
     let q = quote.to_lowercase();
     if (q.starts_with("我叫") || q.starts_with("my name is")) && kind == MemoryKind::Fact {
@@ -889,6 +896,15 @@ fn extract_attr_key(quote: &str, kind: MemoryKind) -> Option<&'static str> {
         && kind == MemoryKind::Fact
     {
         return Some("occupation");
+    }
+    if kind == MemoryKind::Fact {
+        match memory_extract::explicit_shape(quote) {
+            Some(memory_extract::ExplicitShape::FactOccupation) => return Some("occupation"),
+            Some(memory_extract::ExplicitShape::FactPrimaryPractice) => {
+                return Some("primary_practice")
+            }
+            _ => {}
+        }
     }
     if q.starts_with("以后用") && q.contains("回答") && kind == MemoryKind::Instruction {
         return Some("response_language");
@@ -1423,6 +1439,152 @@ mod tests {
             params![dead_id], |r| r.get(0),
         ).unwrap();
         assert_eq!(skip_actor, "admin_cli");
+    }
+
+    #[test]
+    fn revision_reason_shows_policy_version() {
+        // doc5/03 §1：新 active 的 revision reason 表明 extract_v3:admit_v2，
+        // 不把老作业的结果标为新策略。
+        let mut store = setup("revreason");
+        let scope = scope_of(&store, "t", "u");
+        ingest(&mut store, &scope, "s1", 1, "我在杭州做后端开发。我主要写 Rust。");
+        let job_id = flush(&mut store, &scope, "s1", 1);
+        let run_after = job_field(&store, &job_id, "run_after");
+        let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        let c = memory_extract::ModelCandidate {
+            source_event_id: /* 取窗口首事件 */ {
+                let lower = store.window_lower_bound(&scope, "dsh", "s1", job.through_event_seq).unwrap();
+                store.load_window_events(&scope, &job, lower).unwrap()[0].id.clone()
+            },
+            quote: "我在杭州做后端开发".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: None,
+        };
+        let out = store
+            .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
+            .unwrap();
+        let memory_id = match out {
+            CandidateOutcome::Active { memory_id } => memory_id,
+            other => panic!("应 active：{other:?}"),
+        };
+        let reason: String = store
+            .conn()
+            .query_row(
+                "SELECT reason_code FROM memory_revisions
+                 WHERE tenant_id='t' AND user_id='u' AND memory_id=?1 AND version=1",
+                params![memory_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "extract_v3:admit_v2");
+    }
+
+    #[test]
+    fn attribute_conflict_covers_new_occupation_and_practice_keys() {
+        // doc5/03 §7 / 样本 A25/A26：新职业句式与主要实践参与属性冲突；
+        // 同 scope 同键不同值 → held:POSSIBLE_CONFLICT，不自动覆盖。
+        let mut store = setup("attrconf");
+        let scope = scope_of(&store, "t", "u");
+        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        let run_active = |store: &mut Store, session: &str, seq: i64, quote: &str, kind: &str| {
+            ingest(store, &scope, session, seq, quote);
+            let job_id = flush(store, &scope, session, seq);
+            let run_after = job_field(store, &job_id, "run_after");
+            let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+            let ev_id = {
+                let lower = store.window_lower_bound(&scope, "dsh", session, job.through_event_seq).unwrap();
+                store.load_window_events(&scope, &job, lower).unwrap()[0].id.clone()
+            };
+            let c = memory_extract::ModelCandidate {
+                source_event_id: ev_id,
+                quote: quote.to_string(),
+                kind: kind.to_string(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: None,
+            };
+            store.save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active).unwrap()
+        };
+        // 第一条职业 active（新句式）。
+        let out1 = run_active(&mut store, "s1", 1, "我在杭州做后端开发", "fact");
+        assert!(matches!(out1, CandidateOutcome::Active { .. }));
+        // A26：另一职业句式（老形状）→ occupation 键冲突。
+        let out2 = run_active(&mut store, "s2", 1, "我在腾讯工作", "fact");
+        assert_eq!(out2, CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" }, "A26");
+        // A02 主要实践：无冲突 → active；同键不同值 → 冲突。
+        let out3 = run_active(&mut store, "s3", 1, "我主要写 Rust", "fact");
+        assert!(matches!(out3, CandidateOutcome::Active { .. }));
+        let out4 = run_active(&mut store, "s4", 1, "我平时主要写 Go", "fact");
+        assert_eq!(out4, CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" });
+        // A25：residence 冲突沿既有键。
+        let out5 = run_active(&mut store, "s5", 1, "我住在杭州", "fact");
+        assert!(matches!(out5, CandidateOutcome::Active { .. }));
+        let out6 = run_active(&mut store, "s6", 1, "我住在成都", "fact");
+        assert_eq!(out6, CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" }, "A25");
+    }
+
+    #[test]
+    fn suppressed_source_rejected_on_replay() {
+        // 样本 A23 / doc5/07 C：forget 后同一旧证据+同 hash 的候选重放 → SUPPRESSED_SOURCE。
+        let mut store = setup("suppress2");
+        let scope = scope_of(&store, "t", "u");
+        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        ingest(&mut store, &scope, "s1", 1, "我喜欢Rust");
+        let job_id = flush(&mut store, &scope, "s1", 1);
+        let run_after = job_field(&store, &job_id, "run_after");
+        let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        let ev_id = {
+            let lower = store.window_lower_bound(&scope, "dsh", "s1", job.through_event_seq).unwrap();
+            store.load_window_events(&scope, &job, lower).unwrap()[0].id.clone()
+        };
+        let c = memory_extract::ModelCandidate {
+            source_event_id: ev_id.clone(),
+            quote: "我喜欢Rust".into(),
+            kind: "preference".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: None,
+        };
+        let out1 = store.save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active).unwrap();
+        let memory_id = match out1 {
+            CandidateOutcome::Active { memory_id } => memory_id,
+            other => panic!("应 active：{other:?}"),
+        };
+        store.complete_job(&job_id, job.claim_generation, 1, "mock", None, None).unwrap();
+        // 用户遗忘。
+        let t = chrono::Utc::now();
+        let forget_evid = match store
+            .record_evidence(&scope, &origin, 2, "user", "user", &t, "忘记我喜欢Rust")
+            .unwrap()
+        {
+            crate::IngestOutcome::Recorded(id) => id,
+            _ => panic!(),
+        };
+        store
+            .forget_memory(
+                &scope,
+                &memory_id,
+                &crate::ForgetRequest {
+                    expected_version: 1,
+                    origin: origin.clone(),
+                    user_evidence_id: forget_evid,
+                    target_quote: "我喜欢Rust".into(),
+                },
+            )
+            .unwrap();
+        // 同一旧证据的新作业重放同 quote → SUPPRESSED_SOURCE，不复活。
+        let job2 = flush(&mut store, &scope, "s1", 2);
+        let run_after2 = job_field(&store, &job2, "run_after");
+        let claimed2 = store.claim_next_ordered_job(&plus_secs(&run_after2, 1)).unwrap().unwrap();
+        let out2 = store
+            .save_candidate(&scope, &claimed2, &origin, &c, memory_extract::Admission::Active)
+            .unwrap();
+        assert_eq!(out2, CandidateOutcome::Rejected { reason: "SUPPRESSED_SOURCE" }, "A23");
+        let (hits, _) = store.search_memories(&scope, "Rust", 5, false).unwrap();
+        assert!(hits.is_empty(), "遗忘后不得复活");
     }
 
     #[test]

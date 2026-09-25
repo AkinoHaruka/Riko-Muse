@@ -480,9 +480,12 @@ mod tests {
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "succeeded");
         assert_eq!(job.prompt_version, "extract_v1", "旧作业必须回填 extract_v1");
-        // 新 flush 写入当前版本（extract_v2）；0002 的列默认值保持 extract_v1（迁移已冻结，
-        // 仅对不带该列插入的历史行生效，flush 一律显式写当前常量）。
-        assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v2");
+        // 新 flush 写入当前版本（extract_v3/admit_v2）；0002 的列默认值保持 extract_v1、
+        // 0004 默认保持 admit_v1（迁移已冻结，仅对不带该列插入的历史行生效，
+        // flush 一律显式写当前常量）。
+        assert_eq!(job.admission_version, "admit_v1", "历史作业必须回填 admit_v1");
+        assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v3");
+        assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v2");
         let _ = token_file;
         let _ = fs::remove_dir_all(&dir);
     }
@@ -699,7 +702,7 @@ mod tests {
         ).unwrap();
         assert_eq!(applied2, 4);
 
-        // 新作业仍写 extract_v2/admit_v1（版本默认值切换属 D5-3）。
+        // 新作业写当前默认版本：extract_v3/admit_v2（doc5/03 §3，D5-3 已切换）。
         let mut store3 = Store::open_in_memory(&migrations_dir()).unwrap();
         let tdir = dir.join("tok");
         fs::create_dir_all(&tdir).unwrap();
@@ -716,8 +719,10 @@ mod tests {
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
-        assert_eq!(pv, "extract_v2");
-        assert_eq!(av, "admit_v1", "D5-1 期间新作业不得提前切换版本");
+        assert_eq!(pv, "extract_v3");
+        assert_eq!(av, "admit_v2", "D5-3 切换后新作业写 extract_v3/admit_v2");
+        assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v3");
+        assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v2");
         let _ = fs::remove_dir_all(&dir);
     }
 }

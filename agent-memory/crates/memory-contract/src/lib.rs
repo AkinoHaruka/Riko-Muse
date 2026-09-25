@@ -11,19 +11,20 @@ pub const SCHEMA_VERSION: u32 = 4;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
-/// V1 常量仅为按版本分派历史作业而保留（0002 迁移的列默认值同为 extract_v1）。
+/// V1/V2 常量仅为按版本分派历史作业而保留（0002 迁移的列默认值同为 extract_v1）。
+/// doc5/03 §3：v3 Prompt、v2 准入与 worker 分派全部就绪后，新作业默认值在同一
+/// 提交切换为 extract_v3（自该提交起新建作业写 extract_v3）。
 pub const EXTRACT_PROMPT_VERSION_V1: &str = "extract_v1";
-pub const EXTRACT_PROMPT_VERSION: &str = "extract_v2";
-/// extract_v3（doc5/02）：一候选一命题、最短连续原文。与 admit_v2 在同一提交切换为
-/// 新作业默认值；切换前本常量仅供分派已存在的 v3 作业，不写新作业。
+pub const EXTRACT_PROMPT_VERSION_V2: &str = "extract_v2";
+pub const EXTRACT_PROMPT_VERSION: &str = "extract_v3";
 pub const EXTRACT_PROMPT_VERSION_V3: &str = "extract_v3";
 
 /// 准入规则版本（doc5/03 §1）：admission_version 选 Rust 准入及查库提交规则，
-/// 与 prompt_version（只选模型提示词）分工明确。0004 迁移的列默认值为 admit_v1；
-/// 新作业当前写 admit_v1，与 extract_v3/admit_v2 的切换在同一提交进行。
+/// 与 prompt_version（只选模型提示词）分工明确。0004 迁移的列默认值为 admit_v1
+/// （历史作业回填）；v3 Prompt 与 v2 准入就绪后，新作业默认值在同一提交切换为
+/// admit_v2，与 EXTRACT_PROMPT_VERSION 的切换同步。
 pub const ADMISSION_VERSION_V1: &str = "admit_v1";
-pub const ADMISSION_VERSION: &str = "admit_v1";
-/// admit_v2（doc5/03 §2 固定顺序）。切换前仅供分派已存在的 v2 作业。
+pub const ADMISSION_VERSION: &str = "admit_v2";
 pub const ADMISSION_VERSION_V2: &str = "admit_v2";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----

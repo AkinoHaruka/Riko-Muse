@@ -56,11 +56,11 @@ quote 必须逐字复制同一条用户消息中的连续原文；不要改写�
 没有合格内容时输出 {\"candidates\":[]}。";
 
 /// 按作业行 prompt_version 分派系统提示词；未知版本返回 None（worker 显式失败，
-/// 不用"最新规则"处理旧作业，doc2/05 §3）。
+/// 不用"最新规则"处理旧作业，doc2/05 §3）。extract_v2 字符串与行为冻结（doc5/02 §1）。
 pub fn system_prompt_for(version: &str) -> Option<&'static str> {
     match version {
         memory_contract::EXTRACT_PROMPT_VERSION_V1 => Some(EXTRACT_SYSTEM_PROMPT_V1),
-        memory_contract::EXTRACT_PROMPT_VERSION => Some(EXTRACT_SYSTEM_PROMPT),
+        memory_contract::EXTRACT_PROMPT_VERSION_V2 => Some(EXTRACT_SYSTEM_PROMPT),
         memory_contract::EXTRACT_PROMPT_VERSION_V3 => Some(EXTRACT_SYSTEM_PROMPT_V3),
         _ => None,
     }
@@ -176,7 +176,10 @@ pub fn parse_extraction(content: &str) -> Result<Extraction, String> {
 
 /// doc/13 §5 的确定性准入规则第 1～7 步（第 8、9 步需查库，由 store 层完成）。
 /// 依次判断，第一条不满足就停在 held 或 rejected 并写 reason code。
-pub fn admit(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
+///
+/// **版本冻结（doc5/03 §1/§5）**：此函数即 `admit_v1`，历史作业（含手动 retry）
+/// 一律继续用它，行为不得改变；新规则见 [`admit_v2`]。
+pub fn admit_v1(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
     use Admission::*;
     // 1. 来源必须属于本窗口、role=user、source_kind=user。
     let Some(ev) = events.iter().find(|e| e.id == c.source_event_id) else {
@@ -208,6 +211,81 @@ pub fn admit(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
         return Held("SENSITIVE");
     }
     Active
+}
+
+/// admit_v2（doc5/03 §2 固定顺序）：返回仅 Active/Held(reason)/Rejected(reason)，
+/// 第一项失败决定状态。规则 1—11 在本函数；12—15（抑制源/去重/冲突/提交）在
+/// memory-store-sqlite 的 save_candidate。每次先判无权/无效来源，再看正文内容。
+pub fn admit_v2(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
+    use Admission::*;
+    // 1. 来源必须属于本窗口、role=user、source_kind=user（先于内容，避免跨 scope 泄露）。
+    let Some(ev) = events.iter().find(|e| e.id == c.source_event_id) else {
+        return Rejected("BAD_SOURCE");
+    };
+    if ev.role != "user" || ev.source_kind != "user" {
+        return Rejected("BAD_SOURCE");
+    }
+    // 2. quote 是同一来源正文的连续原文。
+    if !ev.content.contains(&c.quote) {
+        return Rejected("QUOTE_MISMATCH");
+    }
+    // 3. 规范化为空或超过 512 Unicode 标量字符。
+    if memory_domain::fold_whitespace(&c.quote).is_empty()
+        || c.quote.chars().count() > memory_contract::QUOTE_MAX_CHARS
+    {
+        return Rejected("INVALID_QUOTE");
+    }
+    // 4. 假设、转述、引用、一次性语境（含旧文档有而 v1 码遗漏的「今天先」）。
+    if context_uncertain(&c.quote) || c.quote.contains("今天先") {
+        return Held("CONTEXT_UNCERTAIN");
+    }
+    // 5. 可剥离口语前缀与两个独立命题（样本 A06 钉前缀优先记 NON_MINIMAL_QUOTE）。
+    if non_minimal_quote(&c.quote) {
+        return Held("NON_MINIMAL_QUOTE");
+    }
+    if multi_claim(&c.quote) {
+        return Held("MULTI_CLAIM");
+    }
+    // 6. fact/preference 缺明确归属主体（第三人主语不在此停，继续到规则 9）。
+    if matches!(c.kind.as_str(), "fact" | "preference") && unclear_subject(&c.quote) {
+        return Held("UNCLEAR_SUBJECT");
+    }
+    // 7. 凭据内容：任何路径不得 active。
+    if secret_like(&c.quote) {
+        return Held("SECRET");
+    }
+    // 8. 健康/过敏/诊断/病历等敏感个人信息。
+    if sensitive_health(&c.quote) {
+        return Held("SENSITIVE");
+    }
+    // 9. 第三人事实、家庭成员信息。
+    if has_third_person_marker(&c.quote) {
+        return Held("THIRD_PARTY");
+    }
+    // 10. 未来节点、相对时间或明显短期状态。
+    if temporal_marker(&c.quote) {
+        return Held("TEMPORAL");
+    }
+    // 11. kind 与形状不符 → KIND_MISMATCH；未命中允许句式 → NOT_EXPLICIT。
+    match explicit_shape(&c.quote) {
+        None => Held("NOT_EXPLICIT"),
+        Some(shape) if shape.kind() == c.kind.as_str() => Active,
+        Some(_) => Held("KIND_MISMATCH"),
+    }
+}
+
+/// 按作业行 admission_version 分派准入规则（doc5/03 §1）；未知版本返回 None，
+/// worker 对其确定性 dead（UNKNOWN_ADMISSION_VERSION），不退回"最新规则"。
+pub fn admit_for(
+    admission_version: &str,
+    c: &ModelCandidate,
+    events: &[WindowEvent],
+) -> Option<Admission> {
+    match admission_version {
+        memory_contract::ADMISSION_VERSION_V1 => Some(admit_v1(c, events)),
+        memory_contract::ADMISSION_VERSION_V2 => Some(admit_v2(c, events)),
+        _ => None,
+    }
 }
 
 /// 一次性/假设/转述词（doc/13 §5.5）。
@@ -406,9 +484,64 @@ fn sensitive_health(quote: &str) -> bool {
         .any(|w| quote.contains(w))
 }
 
+/// 凭据内容（doc5/03 §7）：继承 v1 sensitive() 的密码/token/API key/sk- 值形态，
+/// 命中即 held:SECRET——自动提取与 memory_remember 直写均不得 active（doc5/04 §2）。
+/// 与 v1 的差异只是不再包含健康/证件字面词（后者归 SENSITIVE）；不把值打印到日志。
+fn secret_like(quote: &str) -> bool {
+    let lower = quote.to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    let bytes_len = chars.len();
+
+    // 模式 1：password / passwd / 密码 → 分隔符 → 非空白值 ≥4
+    for key in ["password", "passwd", "密码"] {
+        let kc: Vec<char> = key.chars().collect();
+        for start in 0..bytes_len.saturating_sub(kc.len() - 1) {
+            if chars[start..].starts_with(&kc) {
+                if let Some(value_len) = value_after_sep(&chars, start + kc.len()) {
+                    if value_len >= 4 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // 模式 2：api key 变体 / token → 分隔符 → [A-Za-z0-9_-] ≥12
+    for key in ["api_key", "api-key", "api key", "apikey", "token"] {
+        let kc: Vec<char> = key.chars().collect();
+        for start in 0..bytes_len.saturating_sub(kc.len() - 1) {
+            if chars[start..].starts_with(&kc) {
+                if let Some(value_len) = value_after_sep(&chars, start + kc.len()) {
+                    if value_len >= 12 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // 模式 3：sk- 后跟 ≥12 个 [A-Za-z0-9_-]
+    let sk: Vec<char> = "sk-".chars().collect();
+    for start in 0..bytes_len.saturating_sub(sk.len() - 1) {
+        if chars[start..].starts_with(&sk) {
+            let mut n = 0;
+            for &c in &chars[start + sk.len()..] {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    n += 1;
+                } else {
+                    break;
+                }
+            }
+            if n >= 12 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// admit_v2 明确句式（doc5/03 §6 最小受支持集合）。quote 匹配到哪个 kind 的形状。
+/// 对 store 层公开：属性冲突键提取复用同一形状识别，不跨层复制名单（doc5/03 §7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExplicitShape {
+pub enum ExplicitShape {
     Instruction,
     Preference,
     FactName,
@@ -467,7 +600,7 @@ fn normalize_shape_input(quote: &str) -> String {
 /// admit_v2 的明确句式识别（doc5/03 §6 最小受支持集合）。返回命中的形状；
 /// 未命中返回 None（调用方按 kind 记 NOT_EXPLICIT 或 KIND_MISMATCH）。
 /// 匹配基于规范化工作副本；句式之外默认 held，不用规则填补所有语言。
-pub(crate) fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
+pub fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
     let s = normalize_shape_input(quote);
     // 长期指令：以固定指令词起始，后面必须有非空要求（doc5/03 §6）。
     for p in ["以后", "从现在起", "请总是", "请记住", "记住", "always", "from now on", "remember"] {
@@ -477,8 +610,8 @@ pub(crate) fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
             }
         }
     }
-    // 稳定偏好。
-    for p in ["我喜欢", "我不喜欢", "i like ", "i dislike ", "i like", "i dislike"] {
+    // 稳定偏好（英文要求 "i like "/"i dislike " 带空格；过去式等形状外一律不放行）。
+    for p in ["我喜欢", "我不喜欢", "i like ", "i dislike "] {
         if let Some(rest) = s.strip_prefix(p) {
             if bounded_fragment(rest) {
                 return Some(ExplicitShape::Preference);
@@ -571,10 +704,10 @@ mod tests {
         let events = vec![ev("以后回答我用中文")];
         let mut c = cand("以后回答我用中文");
         c.source_event_id = "nope".into();
-        assert_eq!(admit(&c, &events), Admission::Rejected("BAD_SOURCE"));
+        assert_eq!(admit_v1(&c, &events), Admission::Rejected("BAD_SOURCE"));
 
         let c2 = ModelCandidate { quote: "我喜欢咖啡".into(), ..cand("x") };
-        assert_eq!(admit(&c2, &events), Admission::Rejected("QUOTE_MISMATCH"));
+        assert_eq!(admit_v1(&c2, &events), Admission::Rejected("QUOTE_MISMATCH"));
     }
 
     #[test]
@@ -586,54 +719,54 @@ mod tests {
             occurred_at: "2026-09-24T12:00:00Z".into(),
             content: "用户应该喜欢中文".into(),
         }];
-        assert_eq!(admit(&cand("用户应该喜欢中文"), &events), Admission::Rejected("BAD_SOURCE"));
+        assert_eq!(admit_v1(&cand("用户应该喜欢中文"), &events), Admission::Rejected("BAD_SOURCE"));
     }
 
     #[test]
     fn one_shot_request_held() {
         let events = vec![ev("这次翻译成英文")];
         let c = ModelCandidate { kind: "episode".into(), ..cand("这次翻译成英文") };
-        assert_eq!(admit(&c, &events), Admission::Held("CONTEXT_UNCERTAIN"));
+        assert_eq!(admit_v1(&c, &events), Admission::Held("CONTEXT_UNCERTAIN"));
     }
 
     #[test]
     fn not_explicit_held() {
         let events = vec![ev("昨天挺累的")];
         let c = ModelCandidate { kind: "episode".into(), ..cand("昨天挺累的") };
-        assert_eq!(admit(&c, &events), Admission::Held("NOT_EXPLICIT"));
+        assert_eq!(admit_v1(&c, &events), Admission::Held("NOT_EXPLICIT"));
     }
 
     #[test]
     fn explicit_instruction_and_self_statement_active() {
         let events = vec![ev("以后回答我用中文")];
-        assert_eq!(admit(&cand("以后回答我用中文"), &events), Admission::Active);
+        assert_eq!(admit_v1(&cand("以后回答我用中文"), &events), Admission::Active);
         let events2 = vec![ev("我叫洛溪")];
         let c = ModelCandidate { kind: "fact".into(), ..cand("我叫洛溪") };
-        assert_eq!(admit(&c, &events2), Admission::Active);
+        assert_eq!(admit_v1(&c, &events2), Admission::Active);
         let events3 = vec![ev("I live in Wuhan")];
         let c3 = ModelCandidate { kind: "fact".into(), ..cand("I live in Wuhan") };
-        assert_eq!(admit(&c3, &events3), Admission::Active);
+        assert_eq!(admit_v1(&c3, &events3), Admission::Active);
     }
 
     #[test]
     fn occupation_rule() {
         let events = vec![ev("我在腾讯工作三年了")];
         let c = ModelCandidate { kind: "fact".into(), ..cand("我在腾讯工作三年了") };
-        assert_eq!(admit(&c, &events), Admission::Active);
+        assert_eq!(admit_v1(&c, &events), Admission::Active);
         let events2 = vec![ev("我在家里休息")];
         let c2 = ModelCandidate { kind: "episode".into(), ..cand("我在家里休息") };
-        assert_eq!(admit(&c2, &events2), Admission::Held("NOT_EXPLICIT"));
+        assert_eq!(admit_v1(&c2, &events2), Admission::Held("NOT_EXPLICIT"));
     }
 
     #[test]
     fn sensitive_held() {
         let events = vec![ev("记住我的密码：abc12345")];
         let c = ModelCandidate { kind: "instruction".into(), ..cand("记住我的密码：abc12345") };
-        assert_eq!(admit(&c, &events), Admission::Held("SENSITIVE"));
+        assert_eq!(admit_v1(&c, &events), Admission::Held("SENSITIVE"));
         // 单独谈论「密码」一词不被阻断。
         let events2 = vec![ev("我不喜欢密码学课")];
         let c2 = ModelCandidate { kind: "preference".into(), ..cand("我不喜欢密码学课") };
-        assert_eq!(admit(&c2, &events2), Admission::Active);
+        assert_eq!(admit_v1(&c2, &events2), Admission::Active);
     }
 
     #[test]
@@ -769,5 +902,101 @@ mod tests {
         assert_eq!(explicit_shape("  我不喜欢加班  "), Some(ExplicitShape::Preference));
         // 否定词是形状的一部分：剥掉就反义，绝不匹配正向形状。
         assert_eq!(normalize_shape_input("我不喜欢加班"), "我不喜欢加班");
+    }
+
+    #[test]
+    fn admit_v2_matrix_auto_extract() {
+        // doc5/07 A 组自动提取样本（纯函数级；A20—A26 查库规则在 store 层测试）。
+        let f = |quote: &str, kind: &str| {
+            let events = vec![ev(quote)];
+            let c = ModelCandidate { kind: kind.into(), ..cand(quote) };
+            admit_v2(&c, &events)
+        };
+        use Admission::{Active, Held};
+        assert_eq!(f("我在杭州做后端开发", "fact"), Active, "A01");
+        assert_eq!(f("我主要写 Rust", "fact"), Active, "A02");
+        assert_eq!(
+            f("我在杭州做后端开发，平时主要写 Rust", "fact"),
+            Held("MULTI_CLAIM"),
+            "A03"
+        );
+        assert_eq!(f("我在杭州做后端开发", "fact"), Active, "A04（同 A01）");
+        assert_eq!(f("平时主要写 Rust", "fact"), Held("UNCLEAR_SUBJECT"), "A05");
+        assert_eq!(
+            f("提醒一下，我在杭州做后端开发", "fact"),
+            Held("NON_MINIMAL_QUOTE"),
+            "A06"
+        );
+        assert_eq!(f("我在杭州做后端开发", "fact"), Active, "A07（同 A01）");
+        assert_eq!(f("我喜欢用暗色主题写代码", "preference"), Active, "A08");
+        assert_eq!(f("今天先用暗色主题", "preference"), Held("CONTEXT_UNCERTAIN"), "A09");
+        assert_eq!(f("以后回答请用中文", "instruction"), Active, "A10");
+        assert_eq!(
+            f("我们家小孩今年九月上小学一年级", "fact"),
+            Held("THIRD_PARTY"),
+            "A11：固定顺序先记第三人"
+        );
+        assert_eq!(f("我对花生过敏", "fact"), Held("SENSITIVE"), "A12");
+        assert_eq!(f("我姐在成都教书", "fact"), Held("THIRD_PARTY"), "A13");
+        assert_eq!(f("老笔记本电池坏了", "fact"), Held("UNCLEAR_SUBJECT"), "A14");
+        assert_eq!(f("我在家做饭", "fact"), Held("NOT_EXPLICIT"), "A15");
+        assert_eq!(f("我今年九月开始新工作", "fact"), Held("TEMPORAL"), "A16");
+        assert_eq!(f("我叫洛溪", "fact"), Active, "A17");
+        assert_eq!(f("如果我住在成都就好了", "fact"), Held("CONTEXT_UNCERTAIN"), "A18");
+        assert_eq!(f("我的 API key：sk-0123456789abcdef", "fact"), Held("SECRET"), "A19");
+        assert_eq!(f("我喜欢暗色主题", "fact"), Held("KIND_MISMATCH"), "A27");
+        // 我以后... 不因内部含「以后」被当作指令（doc5/03 §6 instruction 边界）。
+        assert_eq!(f("我以后都回答中文", "instruction"), Held("NOT_EXPLICIT"));
+    }
+
+    #[test]
+    fn admit_v2_source_and_quote_gates() {
+        // A20/A21：来源与逐字闸门在 v2 顺序最前；长度上限沿既有规则。
+        let events = vec![ev("我在杭州做后端开发"), ev2_assistant()];
+        let mut c = cand("我在杭州做后端开发");
+        c.kind = "fact".into();
+        c.source_event_id = "e2".into();
+        assert_eq!(admit_v2(&c, &events), Admission::Rejected("BAD_SOURCE"), "A20");
+        let c2 = ModelCandidate {
+            quote: "我在杭州担任后端工程师".into(),
+            ..cand("x")
+        };
+        assert_eq!(
+            admit_v2(&c2, &events),
+            Admission::Rejected("QUOTE_MISMATCH"),
+            "A21"
+        );
+        // 长度上限：quote 须先满足逐字（规则 2），再判 512 上限（规则 3）。
+        let long_content = "长".repeat(513);
+        let events_long = vec![ev(&long_content)];
+        let c3 = ModelCandidate { quote: long_content.clone(), ..cand("x") };
+        assert_eq!(admit_v2(&c3, &events_long), Admission::Rejected("INVALID_QUOTE"));
+    }
+
+    fn ev2_assistant() -> WindowEvent {
+        WindowEvent {
+            id: "e2".into(),
+            role: "assistant".into(),
+            source_kind: "assistant".into(),
+            occurred_at: "2026-09-24T12:00:00Z".into(),
+            content: "用户应该喜欢中文".into(),
+        }
+    }
+
+    #[test]
+    fn admit_v1_and_v2_diverge_on_same_candidate() {
+        // doc5/03 §5：旧作业保持旧判定、新作业用新规则——同一候选两版结果不同。
+        // v1 无职业尾词/主要实践形状：A01/A02 在 admit_v1 下 held:NOT_EXPLICIT。
+        let events = vec![ev("我在杭州做后端开发。我主要写 Rust。")];
+        let c1 = ModelCandidate { kind: "fact".into(), ..cand("我在杭州做后端开发") };
+        assert_eq!(admit_v1(&c1, &events), Admission::Held("NOT_EXPLICIT"));
+        assert_eq!(admit_v2(&c1, &events), Admission::Active);
+        let c2 = ModelCandidate { kind: "fact".into(), ..cand("我主要写 Rust") };
+        assert_eq!(admit_v1(&c2, &events), Admission::Held("NOT_EXPLICIT"));
+        assert_eq!(admit_v2(&c2, &events), Admission::Active);
+        // 分派：未知版本 None（worker 确定性 dead）。
+        assert_eq!(admit_for("admit_v1", &c1, &events), Some(Admission::Held("NOT_EXPLICIT")));
+        assert_eq!(admit_for("admit_v2", &c1, &events), Some(Admission::Active));
+        assert_eq!(admit_for("admit_v0", &c1, &events), None);
     }
 }
