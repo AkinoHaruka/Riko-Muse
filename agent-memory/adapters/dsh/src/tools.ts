@@ -7,6 +7,8 @@
  *   未 ack 返回"当前消息尚未入库，请重试"，不改用旧事件。
  * - correct 必填 old_quote + expected_version；forget 必填 expected_version + target_quote。
  * - HTTP 失败按 doc2/04 §1 分类：用户可处理 → {ok:false,...}；基础设施 → throw（带 request_id）。
+ *   例外（doc5/09 决策 A）：memory_remember 的 409 STATE_CONFLICT 按端点窄映射为 {ok:false}，
+ *   其余工具的同名错误仍 throw。
  * - 输出固定为 JSON 对象（schema 与 execute 返回值一致），render 为文本块。
  */
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -78,13 +80,19 @@ function toJson(value: unknown): Json {
   return JSON.parse(JSON.stringify(value ?? null)) as Json;
 }
 
-function toToolResult(r: ApiResult): ToolResultBody {
+function toToolResult(r: ApiResult, opts?: { rememberStateConflict?: boolean }): ToolResultBody {
   if (r.failure === "ok" && r.status >= 200 && r.status < 300) {
     return { ok: true, data: toJson(r.body) };
   }
   const body = (r.body ?? {}) as { error?: { code?: string; message?: string } };
   const code = body.error?.code ?? (r.failure === "unauthorized" ? "UNAUTHENTICATED" : "INTERNAL");
   const message = body.error?.message ?? `内核返回 status=${r.status} request_id=${r.requestId ?? "?"}`;
+  // doc5/09 决策 A：仅 memory_remember 端点的 409 STATE_CONFLICT（SECRET/TEMPORAL/
+  // 需保存指令/复合命题四类直写拒绝）是用户可理解的保存规则反馈，窄映射为
+  // {ok:false,error}；其他工具的同名错误不在此列，仍走 throw 路径。
+  if (opts?.rememberStateConflict && r.status === 409 && code === "STATE_CONFLICT") {
+    return { ok: false, error: { code, message } };
+  }
   if (USER_FIXABLE.has(code)) return { ok: false, error: { code, message } };
   // 基础设施/协议错误：抛出并记录 request_id，不把失败包装成成功。
   throw new Error(`agent-memory 内核错误 code=${code} request_id=${r.requestId ?? "?"}: ${message}`);
@@ -161,6 +169,7 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
             quote: args.quote,
             kind: args.kind,
           }),
+          { rememberStateConflict: true },
         );
       },
     }),
