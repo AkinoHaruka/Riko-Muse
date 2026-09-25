@@ -61,6 +61,8 @@ pub enum StoreError {
     TemporalWriteUnsupported,
     #[error("该类内容需要用户在同一消息中直接说「请记住：<原文>」（doc5/04 §2）")]
     SaveInstructionRequired,
+    #[error("一次只能保存一个可独立纠错或遗忘的命题（doc5/09 决策 B）")]
+    CompoundWriteForbidden,
     #[error("时间溢出: {0}")]
     Time(String),
 }

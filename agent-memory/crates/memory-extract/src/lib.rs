@@ -322,6 +322,27 @@ pub fn classify_for_remember(quote: &str) -> RememberClass {
     }
 }
 
+/// 直写复合命题保守判定（doc5/09 决策 B）：`memory_remember` 一次只能保存一个
+/// 可独立纠错/遗忘的命题，适用于所有 kind。任何 `，/,/；/;/。` 之后（跳过空白）
+/// 以下列第二分句起点开始即视为复合命题。本判定只服务直写窄门，**不复用、不改动
+/// admit_v2 的 multi_claim**（其行为已被作业行 admission_version 绑定，静默变更会
+/// 改变未完成旧作业的准入结果）；分句起点之外不推断，无法可靠拆分时由调用方
+/// 拒绝一次性直写。
+pub fn multi_proposition_for_direct_write(quote: &str) -> bool {
+    const SEPARATORS: [char; 5] = ['，', ',', '；', ';', '。'];
+    const CONTINUATIONS: [&str; 6] = ["以后", "从现在起", "我", "平时主要写", "还", "也"];
+    for (i, ch) in quote.char_indices() {
+        if !SEPARATORS.contains(&ch) {
+            continue;
+        }
+        let rest = quote[i + ch.len_utf8()..].trim_start();
+        if CONTINUATIONS.iter().any(|w| rest.starts_with(w)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 一次性/假设/转述词（doc/13 §5.5）。
 fn context_uncertain(quote: &str) -> bool {
     let q = quote.to_lowercase();
@@ -981,6 +1002,38 @@ mod tests {
         assert_eq!(f("我喜欢暗色主题", "fact"), Held("KIND_MISMATCH"), "A27");
         // 我以后... 不因内部含「以后」被当作指令（doc5/03 §6 instruction 边界）。
         assert_eq!(f("我以后都回答中文", "instruction"), Held("NOT_EXPLICIT"));
+    }
+
+    #[test]
+    fn direct_write_multi_proposition_detection() {
+        // doc5/09 决策 B：直写复合命题保守判定（独立函数，不涉 admit_v2）。
+        // 样本复合句（doc-handoff/10 §2.2）：过敏事实 + 长期指令。
+        assert!(multi_proposition_for_direct_write("我对芒果过敏，以后别再推荐含芒果的甜品"));
+        // 分句起点表逐项：以后/从现在起/我/平时主要写/还/也。
+        for quote in [
+            "我喜欢咖啡，也喜欢茶",
+            "我叫林晚；从现在起请叫我晚晚",
+            "我住在城东，我养了一只猫",
+            "我在云舟工作，平时主要写 Go",
+            "我对花生过敏，还有乳制品不耐受",
+            "我喜欢徒步。以后每年要去一次川西",
+            "温度合适，我每天都开窗",
+            "用 ASCII 逗号,我也记一下",
+            "ASCII 分号;还记一条",
+        ] {
+            assert!(multi_proposition_for_direct_write(quote), "应判复合: {quote}");
+        }
+        // 单命题内部含分隔符但第二分句不在起点表内 → 不拦（最小集合边界，如实记录）。
+        for quote in [
+            "我对花生过敏",
+            "我喜欢用钢笔、铅笔写笔记",
+            "我住在城东的滨江小区，家里养了一只猫",
+            "以后回答请保持简短",
+            "版本 3.5 我很喜欢",
+            "价格是 1,000 元",
+        ] {
+            assert!(!multi_proposition_for_direct_write(quote), "不应判复合: {quote}");
+        }
     }
 
     #[test]

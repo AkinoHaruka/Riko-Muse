@@ -280,6 +280,13 @@ impl Store {
             }
             memory_extract::RememberClass::Ordinary => {}
         }
+        // 3.6 直写单命题粒度门（doc5/09 决策 B）：在 span 与高风险类别校验之后、
+        // 去重/创建之前执行，适用于所有 kind 与类别。复合命题拒绝并提示分开保存，
+        // 不自动拆分或改写 quote，也不创建部分记忆。已存在的复合 active 不在此处理。
+        if memory_extract::multi_proposition_for_direct_write(quote) {
+            eprintln!("[memoryd] remember 直写被拒（复合命题，一次只能保存一个命题）");
+            return Err(StoreError::CompoundWriteForbidden);
+        }
         // 4. claim = 折叠空白；长度上限由 handler 校验。
         let claim = fold_whitespace(quote);
         if claim.is_empty() {
@@ -1165,6 +1172,54 @@ mod tests {
         let (hits, _) = store.search_memories(&scope, "花生", 5, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].claim, "我对花生过敏");
+    }
+
+    #[test]
+    fn remember_compound_write_rejected() {
+        // doc5/09 决策 B：直写一次只能保存一个命题；在 span 与高风险校验之后、
+        // 创建/去重之前；适用于所有 kind；不自动拆分、不写部分记忆。
+        let (mut store, scope) = setup("remember-compound");
+        let o = origin();
+        // 样本复合句（doc-handoff/10 §2.2），kind 伪造不影响。
+        let ev1 = ingest_user(&mut store, &scope, 1, "请记住：我对芒果过敏，以后别再推荐含芒果的甜品");
+        for kind in [MemoryKind::Fact, MemoryKind::Preference, MemoryKind::Instruction] {
+            assert!(matches!(
+                store.remember(&scope, &o, &ev1, "我对芒果过敏，以后别再推荐含芒果的甜品", kind),
+                Err(StoreError::CompoundWriteForbidden)
+            ), "kind={kind:?} 复合命题必须 409");
+        }
+        // 高风险类别先于粒度门：敏感内容无保存指令仍按原错误（doc5/09 §3 顺序）。
+        let ev2 = ingest_user(&mut store, &scope, 2, "我对芒果过敏，以后别再推荐含芒果的甜品");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev2, "我对芒果过敏，以后别再推荐含芒果的甜品", MemoryKind::Preference),
+            Err(StoreError::SaveInstructionRequired)
+        ));
+        // 普通复合句同样拒绝（粒度门不区分内容类别）。
+        let ev3 = ingest_user(&mut store, &scope, 3, "请记住：我喜欢咖啡，也喜欢茶");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev3, "我喜欢咖啡，也喜欢茶", MemoryKind::Preference),
+            Err(StoreError::CompoundWriteForbidden)
+        ));
+        // 拒绝路径不新建候选、不写 active。
+        let count = |s: &Store| -> i64 {
+            s.conn()
+                .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&store), 0);
+        // 两条分别明确的保存请求各自得到独立 memory ID（验收 §3）。
+        let ev4 = ingest_user(&mut store, &scope, 4, "请记住：我对芒果过敏");
+        let id1 = match store.remember(&scope, &o, &ev4, "我对芒果过敏", MemoryKind::Fact).unwrap() {
+            RememberOutcome::Created { memory_id, .. } => memory_id,
+            other => panic!("期望 Created，实际 {other:?}"),
+        };
+        let ev5 = ingest_user(&mut store, &scope, 5, "请记住：以后别再推荐含芒果的甜品");
+        let id2 = match store.remember(&scope, &o, &ev5, "以后别再推荐含芒果的甜品", MemoryKind::Instruction).unwrap() {
+            RememberOutcome::Created { memory_id, .. } => memory_id,
+            other => panic!("期望 Created，实际 {other:?}"),
+        };
+        assert_ne!(id1, id2);
+        assert_eq!(count(&store), 2);
     }
 
     #[test]

@@ -681,6 +681,12 @@ async fn remember_memory(
             ErrorCode::StateConflict,
             "该类内容需要用户在最新一条消息中直接说「请记住：<原话>」才会保存；工具调用本身不构成保存授权",
         ),
+        Err(StoreError::CompoundWriteForbidden) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "一次只能保存一个命题：请把复合内容拆开，对每个命题用单独的「请记住：<原话>」分别保存",
+        ),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }
