@@ -288,6 +288,40 @@ pub fn admit_for(
     }
 }
 
+/// `memory_remember` 直写路径的内容类别（doc5/04 §2）。
+/// 判定只看 quote 内容，不信任工具传入的 kind；报告顺序：SECRET 优先于保存指令
+/// 检查，TEMPORAL 是独立否决（即使同一 quote 还属于第三人信息也拒绝），
+/// SENSITIVE/THIRD_PARTY 需要最新用户消息中的直接保存指令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RememberClass {
+    /// 凭据：任何路径不得 active，409 拒绝。
+    Secret,
+    /// 未来/短期状态：本版本无有效期机制，不得永久 active，409 拒绝。
+    Temporal,
+    /// 健康等敏感个人信息：需直接保存指令。
+    Sensitive,
+    /// 第三人/家庭成员信息：需直接保存指令。
+    ThirdParty,
+    /// 其余：沿 remember 既有路径。
+    Ordinary,
+}
+
+/// 对 quote 内容分类（doc5/04 §2）。复用 admit_v2 的同一批检测函数，
+/// 保证自动提取与直写两条路径的判定口径一致。
+pub fn classify_for_remember(quote: &str) -> RememberClass {
+    if secret_like(quote) {
+        RememberClass::Secret
+    } else if temporal_marker(quote) {
+        RememberClass::Temporal
+    } else if sensitive_health(quote) {
+        RememberClass::Sensitive
+    } else if has_third_person_marker(quote) {
+        RememberClass::ThirdParty
+    } else {
+        RememberClass::Ordinary
+    }
+}
+
 /// 一次性/假设/转述词（doc/13 §5.5）。
 fn context_uncertain(quote: &str) -> bool {
     let q = quote.to_lowercase();

@@ -55,6 +55,12 @@ pub enum StoreError {
     VersionConflict,
     #[error("目标含糊：最近用户消息未明确指认该记忆")]
     AmbiguousTarget,
+    #[error("凭据类内容不能保存为 active 记忆（doc5/04 §2）")]
+    SecretWriteForbidden,
+    #[error("时间性内容在本版本不支持永久保存（doc5/04 §2）")]
+    TemporalWriteUnsupported,
+    #[error("该类内容需要用户在同一消息中直接说「请记住：<原文>」（doc5/04 §2）")]
+    SaveInstructionRequired,
     #[error("时间溢出: {0}")]
     Time(String),
 }

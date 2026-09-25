@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{now_rfc3339, Store, StoreError};
 
+#[derive(Debug)]
 pub enum RememberOutcome {
     Created { memory_id: String, version: i64 },
     Dedup { memory_id: String, version: i64 },
@@ -85,6 +86,43 @@ pub fn has_forget_cue(text: &str) -> bool {
     ["忘记", "删除记忆", "不要再记得", "forget", "delete this memory"]
         .iter()
         .any(|w| t.contains(w))
+}
+
+/// 保存指令与目标 quote 的直接相邻判定（doc5/04 §2）：消息去首尾空白后以
+/// 「请记住」「记住」「请帮我记住」或 `Remember` 开始（英文大小写折叠），允许其后
+/// 一个 `:`/`：` 与空白，随后内容必须恰为待保存 quote（可带一个句末标点）。
+/// 保存的 quote 不改写；前一句的保存意图不扩展到后一句。
+fn has_adjacent_save_instruction(message: &str, quote: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["请帮我记住", "请记住", "记住"];
+    const EN_PREFIX: &str = "remember";
+    const TRAILING: [char; 6] = ['。', '.', '！', '!', '？', '?'];
+    let msg = message.trim();
+    let rest: &str = {
+        // 中文按字面前缀；英文对整条消息做小写折叠后定位前缀长度。
+        let mut found: Option<&str> = None;
+        for p in PREFIXES {
+            if let Some(r) = msg.strip_prefix(p) {
+                found = Some(r);
+                break;
+            }
+        }
+        if found.is_none() && msg.to_lowercase().starts_with(EN_PREFIX) {
+            found = msg.get(EN_PREFIX.len()..);
+        }
+        match found {
+            Some(r) => r,
+            None => return false,
+        }
+    };
+    let rest = match rest.strip_prefix([':', '：']) {
+        Some(r) => r.trim_start(),
+        None => rest,
+    };
+    if rest == quote {
+        return true;
+    }
+    // quote 后可带一个句末标点（保存的 quote 不含该标点时）。
+    rest.strip_suffix(TRAILING).map(|r| r.trim_end() == quote).unwrap_or(false)
 }
 
 /// 历史词（doc/12 §7）：include_history 仅当 query 含明确历史词。
@@ -216,6 +254,32 @@ impl Store {
         }
         // 3. quote 是原文连续子串。
         let (start, end) = find_quote_span(&content, quote).ok_or(StoreError::QuoteMismatch)?;
+        // 3.5 直写高风险窄门（doc5/04 §2）：先 scope/latest/quote，后看内容类别与保存
+        // 指令；分类只对 quote 内容独立执行，不信任工具传入的 kind。工具调用本身
+        // 不能证明用户要求保存（Agent 可自主调用 memory_remember）。
+        match memory_extract::classify_for_remember(quote) {
+            memory_extract::RememberClass::Secret => {
+                // 凭据即使用户说「请记住」也不得 active；优先于保存指令检查。
+                return Err(StoreError::SecretWriteForbidden);
+            }
+            memory_extract::RememberClass::Temporal => {
+                // 独立否决：remember 将 valid_until 写 NULL，时间性内容不能无期限 active。
+                return Err(StoreError::TemporalWriteUnsupported);
+            }
+            class @ (memory_extract::RememberClass::Sensitive
+            | memory_extract::RememberClass::ThirdParty) => {
+                // 仅当同一条最新用户消息中的保存指令与目标 quote 直接相邻才允许；
+                // 消息去首尾空白后以固定指令词开始，其后内容恰为待保存 quote（可带
+                // 句末标点）。把过敏内容填成 instruction 也一样要过此门。
+                if !has_adjacent_save_instruction(&content, quote) {
+                    eprintln!(
+                        "[memoryd] remember 直写被拒（需要直接保存指令，类别={class:?}）"
+                    );
+                    return Err(StoreError::SaveInstructionRequired);
+                }
+            }
+            memory_extract::RememberClass::Ordinary => {}
+        }
         // 4. claim = 折叠空白；长度上限由 handler 校验。
         let claim = fold_whitespace(quote);
         if claim.is_empty() {
@@ -1019,5 +1083,113 @@ mod tests {
         assert!(r2.text.contains("以后回答要给代码示例"));
         assert!(r2.text.contains("以后先说明风险再动手"));
         assert!(!r2.text.contains("以后回答请始终用中文"), "最旧的一条被挤出 2 个名额");
+    }
+
+    #[test]
+    fn remember_direct_save_gate_matrix() {
+        // doc5/04 §2 + doc5/07 B 组：直写高风险窄门。
+        let (mut store, scope) = setup("remember-gate");
+        let o = origin();
+        // B01：普通稳定偏好沿既有路径 active。
+        let ev1 = ingest_user(&mut store, &scope, 1, "我喜欢暗色主题");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev1, "我喜欢暗色主题", MemoryKind::Preference).unwrap(),
+            RememberOutcome::Created { .. }
+        ));
+        // B02：健康内容、Agent 自发调工具（无保存指令）→ 409 拒绝，不写 active。
+        let ev2 = ingest_user(&mut store, &scope, 2, "我对花生过敏");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Fact),
+            Err(StoreError::SaveInstructionRequired)
+        ));
+        // B10：工具传 kind=instruction 也绕不过健康分类。
+        assert!(matches!(
+            store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Instruction),
+            Err(StoreError::SaveInstructionRequired)
+        ));
+        // B03：同一条最新消息中有直接相邻保存指令 → 允许。
+        let ev3 = ingest_user(&mut store, &scope, 3, "请记住：我对花生过敏");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev3, "我对花生过敏", MemoryKind::Fact).unwrap(),
+            RememberOutcome::Created { .. }
+        ));
+        // B04：前一句的保存意图不扩展到后一句。
+        let ev4 = ingest_user(&mut store, &scope, 4, "请记住我喜欢蓝色。另外我对花生过敏");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev4, "我对花生过敏", MemoryKind::Fact),
+            Err(StoreError::SaveInstructionRequired)
+        ));
+        // B05：第三人内容有直接保存请求 → 允许。
+        let ev5 = ingest_user(&mut store, &scope, 5, "请记住：我姐在成都教书");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev5, "我姐在成都教书", MemoryKind::Fact).unwrap(),
+            RememberOutcome::Created { .. }
+        ));
+        // B06：时间性内容即使有保存指令也拒绝（本版无有效期机制）。
+        let ev6 = ingest_user(&mut store, &scope, 6, "请记住：我今年九月开始新工作");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev6, "我今年九月开始新工作", MemoryKind::Fact),
+            Err(StoreError::TemporalWriteUnsupported)
+        ));
+        // B07：凭据永不 active——即使「请记住」开头；错误不回显值。
+        let ev7 = ingest_user(&mut store, &scope, 7, "请记住：我的密码：abcd1234");
+        let err7 = store
+            .remember(&scope, &o, &ev7, "我的密码：abcd1234", MemoryKind::Fact)
+            .unwrap_err();
+        assert!(matches!(err7, StoreError::SecretWriteForbidden));
+        assert!(!err7.to_string().contains("abcd1234"), "错误消息不得回显凭据值");
+        // B09：第三人与未来时间同时命中 → 时间否决优先，仍拒绝。
+        let ev9 = ingest_user(&mut store, &scope, 9, "请记住：我们家小孩今年九月入学");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev9, "我们家小孩今年九月入学", MemoryKind::Fact),
+            Err(StoreError::TemporalWriteUnsupported)
+        ));
+        // B08：引用旧用户事件 → 原有 stale 错误，不进入内容类别判定。
+        let ev_stale = ingest_user(&mut store, &scope, 10, "今天聊到这");
+        let err_stale = store
+            .remember(&scope, &o, &ev3, "我对花生过敏", MemoryKind::Fact)
+            .unwrap_err();
+        assert!(matches!(err_stale, StoreError::StaleUserEvidence), "B08 旧事件仍按原错误");
+        let _ = ev_stale;
+        // 跨用户隐藏：另一 scope 的 evidence id → EvidenceNotFound，不泄露存在性。
+        let dir = std::env::temp_dir().join(format!("am-mem-gate-u2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+        let scope2 = ScopeKey { tenant_id: "t".into(), user_id: "u2".into() };
+        assert!(matches!(
+            store.remember(&scope2, &o, &ev3, "我对花生过敏", MemoryKind::Fact),
+            Err(StoreError::EvidenceNotFound)
+        ));
+        // 保存的 quote 不改写：B03 建立的 active claim 逐字等于 quote。
+        let (hits, _) = store.search_memories(&scope, "花生", 5, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].claim, "我对花生过敏");
+    }
+
+    #[test]
+    fn remember_save_instruction_adjacency_rules() {
+        // doc5/04 §2 窄形式：去首尾空白、固定指令词、可选一个冒号与空白、
+        // 内容恰为 quote（可带一个句末标点）；大小写折叠只用于英文。
+        let cases: &[(&str, &str, bool)] = &[
+            ("请记住：我对花生过敏", "我对花生过敏", true),
+            ("请记住我对花生过敏", "我对花生过敏", true),
+            // 最窄读法（doc5/04 §2「允许其后一个 :/： 与空白」）：空白只在冒号后跳过；
+            // 无冒号的空格不构成相邻。从严只影响极少数措辞，方向安全。
+            ("记住 我对花生过敏", "我对花生过敏", false),
+            ("请帮我记住：我对花生过敏。", "我对花生过敏", true),
+            ("Remember: I like Rust", "I like Rust", true),
+            ("remember：我对花生过敏", "我对花生过敏", true),
+            ("  请记住：我对花生过敏  ", "我对花生过敏", true),
+            ("请记住：  我对花生过敏", "我对花生过敏", true),
+            ("请记住我喜欢蓝色。另外我对花生过敏", "我对花生过敏", false),
+            ("请记住一下：我对花生过敏", "我对花生过敏", false),
+            ("我对花生过敏，请记住", "我对花生过敏", false),
+            ("请记住：我姐在成都教书", "我对花生过敏", false),
+            ("请记住", "我对花生过敏", false),
+        ];
+        for (i, (msg, quote, want)) in cases.iter().enumerate() {
+            assert_eq!(has_adjacent_save_instruction(msg, quote), *want, "case #{i}: {msg}");
+        }
     }
 }
