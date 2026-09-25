@@ -5,14 +5,26 @@ use serde::Serialize;
 
 /// 协议版本：HTTP v1 语义不变（doc/12）。DSH 适配器握手依据。
 pub const PROTOCOL_VERSION: u32 = 1;
-/// 数据库模式版本：随迁移文件递增（0001→1，0002→2，0003→3）。worker 按作业行 prompt_version 选规则。
-pub const SCHEMA_VERSION: u32 = 3;
+/// 数据库模式版本：随迁移文件递增（0001→1，0002→2，0003→3，0004→4）。worker 按作业行
+/// prompt_version/admission_version 分别选提示词与准入规则。
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
 /// V1 常量仅为按版本分派历史作业而保留（0002 迁移的列默认值同为 extract_v1）。
 pub const EXTRACT_PROMPT_VERSION_V1: &str = "extract_v1";
 pub const EXTRACT_PROMPT_VERSION: &str = "extract_v2";
+/// extract_v3（doc5/02）：一候选一命题、最短连续原文。与 admit_v2 在同一提交切换为
+/// 新作业默认值；切换前本常量仅供分派已存在的 v3 作业，不写新作业。
+pub const EXTRACT_PROMPT_VERSION_V3: &str = "extract_v3";
+
+/// 准入规则版本（doc5/03 §1）：admission_version 选 Rust 准入及查库提交规则，
+/// 与 prompt_version（只选模型提示词）分工明确。0004 迁移的列默认值为 admit_v1；
+/// 新作业当前写 admit_v1，与 extract_v3/admit_v2 的切换在同一提交进行。
+pub const ADMISSION_VERSION_V1: &str = "admit_v1";
+pub const ADMISSION_VERSION: &str = "admit_v1";
+/// admit_v2（doc5/03 §2 固定顺序）。切换前仅供分派已存在的 v2 作业。
+pub const ADMISSION_VERSION_V2: &str = "admit_v2";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----
 /// 自动上下文默认最多 5 条原子记忆。

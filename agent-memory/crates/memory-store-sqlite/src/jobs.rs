@@ -42,6 +42,9 @@ pub struct JobRow {
     pub updated_at: String,
     /// 生成该作业时的提取规则版本（doc2/05 §3），随作业持久化。
     pub prompt_version: String,
+    /// 生成该作业时的准入规则版本（doc5/03 §1，迁移 0004）；与 prompt_version 分工：
+    /// worker 按两列分别分派提示词与 Rust 准入规则，未知版本显式失败。
+    pub admission_version: String,
     /// 当前执行权代际：每次领取/过期恢复原子 +1；旧代际的提交一律失效（doc4/02 §4—5）。
     pub claim_generation: i64,
 }
@@ -190,12 +193,14 @@ impl Store {
             tx.execute(
                 "INSERT INTO extraction_jobs
                  (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
-                  status, attempts, run_after, created_at, updated_at, prompt_version, error_code)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13)",
+                  status, attempts, run_after, created_at, updated_at, prompt_version,
+                  admission_version, error_code)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13,?14)",
                 params![
                     job_id, scope.tenant_id, scope.user_id, host_id, session_id,
                     format!("v1:{through}"), through, status, now, now, now,
-                    memory_contract::EXTRACT_PROMPT_VERSION, error_code
+                    memory_contract::EXTRACT_PROMPT_VERSION,
+                    memory_contract::ADMISSION_VERSION, error_code
                 ],
             )?;
             Ok(job_id)
@@ -907,7 +912,8 @@ fn job_row_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
             created_at: r.get(10)?,
             updated_at: r.get(11)?,
             prompt_version: r.get(12)?,
-            claim_generation: r.get(13)?,
+            admission_version: r.get(13)?,
+            claim_generation: r.get(14)?,
         })
     }
 }
@@ -915,7 +921,7 @@ fn job_row_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
 /// JobRow 查询列（与 job_row_mapper 的列序一一对应）。
 const JOB_ROW_COLUMNS: &str = "id, tenant_id, user_id, host_id, session_id, window_key, \
      through_event_seq, status, attempts, run_after, created_at, updated_at, prompt_version, \
-     claim_generation";
+     admission_version, claim_generation";
 
 use sha2::Digest;
 

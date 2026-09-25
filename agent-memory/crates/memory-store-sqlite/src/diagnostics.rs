@@ -24,12 +24,14 @@ pub struct JobListItem {
     pub updated_at: String,
 }
 
-/// 作业详情：列表字段 + prompt_version、window_key 与可用的模型用量。
+/// 作业详情：列表字段 + prompt_version、admission_version、window_key 与可用的模型用量。
 #[derive(Debug, Clone)]
 pub struct JobDetail {
     pub item: JobListItem,
     pub window_key: String,
     pub prompt_version: String,
+    /// 生成该作业时的准入规则版本（doc5/03 §1，迁移 0004）。
+    pub admission_version: String,
     pub model_name: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -130,8 +132,8 @@ impl Store {
             .conn()
             .query_row(
                 &format!(
-                    "SELECT {JOB_LIST_COLUMNS}, window_key, prompt_version, model_name,
-                            input_tokens, output_tokens
+                    "SELECT {JOB_LIST_COLUMNS}, window_key, prompt_version, admission_version,
+                            model_name, input_tokens, output_tokens
                      FROM extraction_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3"
                 ),
                 params![scope.tenant_id, scope.user_id, job_id],
@@ -140,9 +142,10 @@ impl Store {
                         item: job_list_mapper()(r)?,
                         window_key: r.get(12)?,
                         prompt_version: r.get(13)?,
-                        model_name: r.get(14)?,
-                        input_tokens: r.get(15)?,
-                        output_tokens: r.get(16)?,
+                        admission_version: r.get(14)?,
+                        model_name: r.get(15)?,
+                        input_tokens: r.get(16)?,
+                        output_tokens: r.get(17)?,
                     })
                 },
             )

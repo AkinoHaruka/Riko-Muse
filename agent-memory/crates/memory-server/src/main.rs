@@ -902,6 +902,7 @@ fn job_json(req_id: &str, j: &memory_store_sqlite::JobDetail) -> serde_json::Val
         "skipped": i.skipped,
         "window_key": j.window_key,
         "prompt_version": j.prompt_version,
+        "admission_version": j.admission_version,
         "model_name": j.model_name,
         "input_tokens": j.input_tokens,
         "output_tokens": j.output_tokens,

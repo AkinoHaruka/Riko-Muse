@@ -468,14 +468,14 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        // Store::open 依序应用 0002、0003 升级（版本随迁移文件递增）。
+        // Store::open 依序应用 0002、0003、0004 升级（版本随迁移文件递增）。
         let mut store = Store::open(&db, &migrations).unwrap();
         let schema_v: u32 = store.conn().query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
             [],
             |r| r.get(0),
         ).unwrap();
-        assert_eq!(schema_v, 3);
+        assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
         let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "succeeded");
@@ -534,8 +534,8 @@ mod tests {
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
-        assert_eq!(schema_v, 3);
-        assert_eq!(applied, 3, "0001/0002/0003 各一条，无重放");
+        assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
+        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64, "0001—0004 各一条，无重放");
         let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "retryable_failed");
@@ -557,7 +557,7 @@ mod tests {
         let applied2: i64 = store2.conn().query_row(
             "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(applied2, 3);
+        assert_eq!(applied2, memory_contract::SCHEMA_VERSION as i64);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -620,7 +620,104 @@ mod tests {
         let schema_v: u32 = store.conn().query_row(
             "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(schema_v, 3);
+        assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 手工构造"仅到 0003"的旧库（模拟 schema 3 现场）：按迁移加载器同算法记录 checksum。
+    fn build_v3_db(db: &Path) {
+        let migrations = migrations_dir();
+        let conn = Connection::open(db).unwrap();
+        for (name, file, v) in [
+            ("0001_init", "0001_init.sql", 1),
+            ("0002_prompt_version", "0002_prompt_version.sql", 2),
+            ("0003_job_recovery", "0003_job_recovery.sql", 3),
+        ] {
+            let sql = fs::read_to_string(migrations.join(file)).unwrap();
+            let sha = hex::encode(Sha256::digest(sql.as_bytes()));
+            conn.execute_batch(&sql).unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO schema_migrations (version, name, sha256, applied_at)
+                 VALUES ({v}, '{name}', '{sha}', '2026-09-24T00:00:00Z');"
+            ))
+            .unwrap();
+        }
+        drop(conn);
+    }
+
+    #[test]
+    fn migrate_v3_db_to_v4_admission_version() {
+        // doc5 卡 D5-1（doc5/03 §1）：schema 3→4；历史作业所有旧列不变、admission_version
+        // 回填 admit_v1；空库直装；重复打开不重跑；新作业仍写 extract_v2/admit_v1。
+        let dir = std::env::temp_dir().join(format!("am-store-v4-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v3.db");
+        build_v3_db(&db);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at)
+                 VALUES ('t1', 'u1', 'x', 'active', '2026-09-24T00:00:00Z');
+                 INSERT INTO extraction_jobs
+                   (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
+                    status, attempts, error_code, run_after, created_at, updated_at)
+                 VALUES ('j1', 't1', 'u1', 'dsh', 's1', 'v1:5', 5, 'retryable_failed', 2,
+                         'MODEL_TIMEOUT', '2026-09-24T00:00:00Z',
+                         '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db, &migrations_dir()).unwrap();
+        let (schema_v, applied): (u32, i64) = store.conn().query_row(
+            "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(schema_v, 4);
+        assert_eq!(applied, 4);
+        // 历史作业：旧列逐字段不变，新列回填 admit_v1。
+        let row: (String, String, i32, Option<String>, String, String, i64) = store.conn().query_row(
+            "SELECT status, prompt_version, attempts, error_code, window_key, admission_version,
+                    claim_generation
+             FROM extraction_jobs WHERE id='j1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        ).unwrap();
+        assert_eq!(row.0, "retryable_failed");
+        assert_eq!(row.1, "extract_v1", "prompt_version 不因 0004 改变");
+        assert_eq!(row.2, 2);
+        assert_eq!(row.3.as_deref(), Some("MODEL_TIMEOUT"));
+        assert_eq!(row.4, "v1:5");
+        assert_eq!(row.5, "admit_v1", "历史作业回填 admit_v1");
+        assert_eq!(row.6, 0);
+        // 重复打开：迁移不重放。
+        let store2 = Store::open(&db, &migrations_dir()).unwrap();
+        let applied2: i64 = store2.conn().query_row(
+            "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(applied2, 4);
+
+        // 新作业仍写 extract_v2/admit_v1（版本默认值切换属 D5-3）。
+        let mut store3 = Store::open_in_memory(&migrations_dir()).unwrap();
+        let tdir = dir.join("tok");
+        fs::create_dir_all(&tdir).unwrap();
+        store3.principal_add("t", "u", &tdir.join("u.token")).unwrap();
+        let scope = ScopeKey { tenant_id: "t".into(), user_id: "u".into() };
+        let t = chrono::Utc::now();
+        store3
+            .record_evidence(&scope, &memory_domain::Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s1".into() }, 1, "user", "user", &t, "以后回答我用中文")
+            .unwrap();
+        let _ = store3.flush_window(&scope, "dsh", "s1", 1).unwrap();
+        let (pv, av): (String, String) = store3.conn().query_row(
+            "SELECT prompt_version, admission_version FROM extraction_jobs
+             WHERE tenant_id='t' AND user_id='u'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(pv, "extract_v2");
+        assert_eq!(av, "admit_v1", "D5-1 期间新作业不得提前切换版本");
         let _ = fs::remove_dir_all(&dir);
     }
 }
