@@ -62,13 +62,14 @@ function renderResult(_args: unknown, value: ToolResultBody): { type: "text"; te
   return [{ type: "text", text: JSON.stringify(value) }];
 }
 
-/** 用户可处理错误码（按 HTTP 状态 + error.code 分类）。 */
+/** 用户可处理错误码（按 HTTP 状态 + error.code 分类）。错误码以 doc/12 与内核
+ * memory-contract/src/lib.rs 为准：404 → NOT_FOUND（没有 MEMORY_NOT_FOUND 这个码值）。 */
 const USER_FIXABLE = new Set([
   "QUOTE_MISMATCH",
   "STALE_USER_EVIDENCE",
   "VERSION_CONFLICT",
   "AMBIGUOUS_TARGET",
-  "MEMORY_NOT_FOUND",
+  "NOT_FOUND",
   "EVENT_CONFLICT",
   "INVALID_FIELD",
 ]);
