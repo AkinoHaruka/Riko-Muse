@@ -583,7 +583,7 @@ mod tests {
         let empty = Arc::new(Mutex::new(String::new()));
 
         // 当前版本（extract_v3/admit_v2）作业 → v3 提示词，admission_version 为 admit_v2。
-        let mut job = flush_job(&store, "sv3");
+        let job = flush_job(&store, "sv3");
         assert_eq!(job.prompt_version, memory_contract::EXTRACT_PROMPT_VERSION);
         assert_eq!(job.admission_version, memory_contract::ADMISSION_VERSION);
         assert_eq!(job.prompt_version, "extract_v3");

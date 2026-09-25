@@ -2,14 +2,22 @@
 
 Rust 优先的通用 Agent 长期记忆内核：同一用户的多 Agent 共享同一份长期记忆，不同用户严格隔离。设计契约见 `../doc/`（v1 冻结：`../doc/10-开发冻结规范.md`；实现契约：`../doc/11`～`15`）。
 
-**状态（分层，勿混为一类。更新：2026-09-25，详见 `../doc-handoff/07-doc4可靠性迭代交付记录.md`）：**
+**状态（分层，勿混为一类。更新：2026-09-25 晚，doc5 记忆质量规则实施后，详见 `../doc-handoff/09-D5交付记录.md`）：**
 
 | 层 | 状态 |
 |---|---|
-| HTTP 协议验证（curl 实测 + 单测） | ✅ 本机 Windows 实测（含 doc4 队列可靠性/分窗/诊断：`cargo test --workspace` 49 测试全绿 + 真实 curl 冒烟） |
-| DSH 实际运行（官方 clone 真实宿主闭环） | ✅ v2 闭环（2026-09-25）；**doc4 的适配器改动（80 事件/24 KiB 主动 flush）仅本地单测，真实 DSH 未复验** |
-| 模型真实连通 | ✅ v2 提取链路实测（SiliconFlow Qwen3.5-4B，见 `../doc-handoff/05`）；**doc4 阶段未运行真实模型**（本阶段用固定响应验证，无模型质量验证） |
-| 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；迁移 0003 仅在临时库演练，未做安装分发，其他操作系统未验证 |
+| HTTP 协议验证（curl 实测 + 单测） | ✅ 本机 Windows 实测（doc5 后 `cargo test --workspace` 68 测试全绿 + 真实 curl 冒烟：版本/健康/remember 高风险窄门 409/201） |
+| DSH 实际运行（官方 clone 真实宿主闭环） | ✅ doc4 改动已在真实 DSH 宿主复验（`../doc-handoff/08` §1）；**doc5 的准入版本改动未在真实 DSH 闭环跑过**（本机确定性测试 + 临时库覆盖） |
+| 模型真实连通 | ✅ v2 提取链路实测（SiliconFlow Qwen3.5-4B，见 `../doc-handoff/05`）；**doc5 阶段未运行真实模型（用户暂停），extract_v3/admit_v2 的真实模型行为未验证** |
+| 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；迁移 0004 已在 schema 3 真实文件副本演练通过（`d5rehearsal`，原库未动）；真实用户库（dana/realtest）未升级，未做安装分发 |
+
+## 记忆质量规则（doc5，2026-09-25 起生效）
+
+新作业固定 `extract_v3` 提取 + `admit_v2` 准入（作业行两列持久化，worker 按列分派；未知版本确定性立即 dead）；历史作业保持原 Prompt + `admit_v1`，行为冻结。要点：
+
+- 一候选一命题、最短连续原文；宽 quote、可剥离口语前缀、缺主语片段、第三人、健康敏感、未来/短期状态、凭据一律不自动 active（详见 `../doc5/03` 固定顺序与 reason 表）。
+- `memory_remember` 直写：凭据永不 active（409）；时间性内容暂不支持永久保存（409）；健康/第三人内容需用户在最新一条消息中直接说「请记住：<原话>」才可 active；普通偏好沿既有路径。`source_class=user_explicit` 表示可逐字定位到用户直接陈述，**不等于用户明确要求持久保存**。
+- 召回契约不变：instruction 独立名额至多 2，fact/preference 仅按词法命中注入（离线探针见 `../doc5/05` 与交付记录 §7）。
 
 队列可靠性契约（作业状态机、公平领取、崩溃恢复、服务端分窗、人工 skip）见 `../doc4/02—04`。
 
@@ -27,7 +35,7 @@ cargo run -p memory-server --bin memoryd -- principal add \
 cargo run -p memory-server --bin memoryd -- serve --config config.toml
 
 # 4. 检查
-curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":3,...}
+curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":4,...}
 curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"ready|degraded"}
 ```
 

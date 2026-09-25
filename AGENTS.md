@@ -13,13 +13,16 @@
 ## 2. 当前状态（2026-09-25 晚）
 
 ```
-根仓库 main，HEAD：D4-7（b766135）之上的收口复验提交（git log 查 docs(D4-收口)）
+根仓库 main，HEAD：D5-6（2026-09-25 晚，git log 查 feat(D5-x)）
 v1（doc/ 卡 0–6）：已交付，Rust 内核 + CLI + DSH 适配器骨架
 v2（doc2/ 卡 V2-0…V2-6）：全部交付（含真实模型链路验证，见 doc-handoff/05）
-doc4（可靠性迭代 D4-0…D4-7）：全部交付；内核 schema 3（迁移 0003）
-收口复验（doc-handoff/08，本轮）：真实 DSH 宿主复验 ✅；dana 库副本演练迁移 0003 ✅（原库未升级）；定向源码复核完成——2 项低风险偏差记录在案（确定性错误未立即 dead、skip 审计 actor_kind 口径），无数据风险
-待做：08 §5——两个一行级偏差修复（下一卡）、原库 0003 实际升级部署决策、记忆质量规则产品决策（用户计划第 5 项，独立进行，不因个别样本放宽准入）
-最新交接：doc-handoff/README.md（必读）+ 08-收口复验记录.md（最新事实）
+doc4（可靠性迭代 D4-0…D4-7）：全部交付；真实 DSH 复验 ✅（doc-handoff/08）
+doc5（记忆质量规则 D5-0…D5-6）：全部交付；内核 schema 4（迁移 0004）
+  —— 新作业 extract_v3/admit_v2、旧作业冻结 admit_v1、未知版本立即 dead
+  —— remember 直写窄门：凭据永不 active、时间性暂拒、健康/第三人需相邻「请记住：<原话>」
+  —— 08 §3.2 两个契约偏差已在 D5-0 修复（确定性错误立即 dead、skip 审计 admin_cli）
+待做：doc5 改动的真实 DSH 闭环复验（可用 mock 端点）、dana/realtest 原库 0003+0004 实际升级部署决策（副本演练均通过）、真实模型观察恢复（用户决定，独立产品决策）
+最新交接：doc-handoff/README.md（必读）+ 09-D5交付记录.md（最新事实）
 ```
 
 ## 3. 目录与只读边界
@@ -29,6 +32,7 @@ doc4（可靠性迭代 D4-0…D4-7）：全部交付；内核 schema 3（迁移 
 | `agent-memory/` | **唯一实现目录**：`crates/`（Rust）、`migrations/`、`adapters/dsh/`（TS 适配器）、`config.example.toml`、`README.md` |
 | `doc/` | v1 规范：目标、数据模型、HTTP v1、算法契约、任务卡 |
 | `doc2/` | v2 施工规范（官方 DSH 源码事实 + 修复任务卡 + 运行手册） |
+| `doc5/` | doc5 记忆质量规则（产品决定与施工规范，已实施；未跟踪） |
 | `doc-handoff/` | 交接文档：环境复现、已完成证据、待办与冲突、可复制交接 Prompt |
 | `deepseek-harness/` | 官方 DSH clone（`477b4f4`，0.1.7-rc.2）——**未跟踪、只读参考**，不提交、不改源码 |
 | `EverOS/`、`hindsight/`、`tencentdb-agent-memory/` | 上游参考仓库，**只读**，算法来源见 `doc/02` |
