@@ -4,6 +4,7 @@
 //! 窗口输入只含当前认证用户的本次窗口事件（doc/13 §4）。
 
 use serde::Deserialize;
+use unicode_normalization::UnicodeNormalization;
 
 /// extract_v1 原始系统提示词（doc/13 §4）。仅供按作业行版本处理历史作业
 /// （doc2/05 §3：保留老版本）；对真实推理模型有缺 Schema 的已知缺陷，勿用于新作业。
@@ -32,12 +33,35 @@ quote 必须逐字复制同一条用户消息中的连续原文；不要改写�
 
 pub const EXTRACT_PROMPT_VERSION: &str = memory_contract::EXTRACT_PROMPT_VERSION;
 
+/// extract_v3（doc5/02）：一候选一命题、最短连续原文，与 admit_v2 配套（doc5/03 §2）。
+/// 响应 Schema 与 v2 完全一致（严格 schema，额外字段按 BAD_JSON 处理）；输入序列化、
+/// 分窗预算与空数组语义均不变。宽 quote 应留作 held，而不是以错粒度激活；
+/// 提示词明示不得改写主语、不得为保全主语跨越另一命题。
+pub const EXTRACT_SYSTEM_PROMPT_V3: &str = "\
+从给定对话提取可能对未来 Agent 有持续用途的用户事实、偏好、长期指令和事件。
+每个候选只能包含一个可独立纠错、遗忘或过期的用户命题。
+同一条用户消息里有两个各自成立的命题时，输出两条候选：它们可以共用同一个 event_id，
+但每条 quote 必须分别是该消息原文中互不重叠的连续片段。
+不要为了补全主语把两个命题拼进一条 quote，也不要改写用户原话：
+原话是「平时主要写 Rust」时 quote 必须保持原样，不得补写主语变成「我主要写 Rust」。
+不确定某个命题能否独立成立时，宁可整句引用，交给内核判定。
+用户主动陈述的个人情况是典型事实：居住地、职业与专业领域、正在使用的工具或技术栈、稳定的生活习惯。
+只引用 role=user 且 source_kind=user 的 event_id。
+quote 必须逐字复制同一条用户消息中的连续原文；不要改写、补充或拼接多条消息。
+临时请求、假设、引用他人的话、助手推断不要提取。
+只输出 JSON，不输出解释或 Markdown。
+示例（仅演示一候选一命题与逐字要求，勿照抄进结果）：某用户消息的 event_id 为 e1、正文为「我在杭州做后端开发。我主要写 Rust。」，则应提取 {\"candidates\":[{\"source_event_id\":\"e1\",\"quote\":\"我在杭州做后端开发\",\"kind\":\"fact\"},{\"source_event_id\":\"e1\",\"quote\":\"我主要写 Rust\",\"kind\":\"fact\"}]}。
+响应必须是如下形状，字段名逐字一致、不增不减；occurred_at、valid_until、confidence 可省略：
+{\"candidates\":[{\"source_event_id\":\"<event_id>\",\"quote\":\"<逐字连续原文>\",\"kind\":\"fact|preference|instruction|episode\",\"occurred_at\":null,\"valid_until\":null,\"confidence\":0.9}]}
+没有合格内容时输出 {\"candidates\":[]}。";
+
 /// 按作业行 prompt_version 分派系统提示词；未知版本返回 None（worker 显式失败，
 /// 不用"最新规则"处理旧作业，doc2/05 §3）。
 pub fn system_prompt_for(version: &str) -> Option<&'static str> {
     match version {
         memory_contract::EXTRACT_PROMPT_VERSION_V1 => Some(EXTRACT_SYSTEM_PROMPT_V1),
         memory_contract::EXTRACT_PROMPT_VERSION => Some(EXTRACT_SYSTEM_PROMPT),
+        memory_contract::EXTRACT_PROMPT_VERSION_V3 => Some(EXTRACT_SYSTEM_PROMPT_V3),
         _ => None,
     }
 }
@@ -305,6 +329,218 @@ fn value_after_sep(chars: &[char], pos: usize) -> Option<usize> {
     Some(n)
 }
 
+// ---- admit_v2 候选粒度与阻断词判定（doc5/02 §2、doc5/03 §6—7）----
+// 以下全部是保守的确定性检查：只负责阻止自动 active，不声称完备的自然语言理解；
+// 无法识别的复杂句保持 held。保存的 quote/claim 原文不变，匹配用工作副本。
+
+/// 宽 quote：两个可独立维护的命题（doc5/03 §7）。两个完整子句由 `，,；;。` 分隔
+/// 且后句以「我/平时主要写/还/也」开始，即视为第二命题起点。分隔符不含 ASCII '.'，
+/// 避免小数与英文专有名词误判；姓名地址中的普通逗号若后句不是命题起点则不判宽。
+fn multi_claim(quote: &str) -> bool {
+    for sep in ['，', ',', '；', ';', '。'] {
+        let mut from = 0;
+        while let Some(pos) = quote[from..].find(sep) {
+            let abs = from + pos + sep.len_utf8();
+            if abs >= quote.len() {
+                break;
+            }
+            let rest = quote[abs..].trim_start();
+            if rest.starts_with('我')
+                || rest.starts_with("平时主要写")
+                || rest.starts_with('还')
+                || rest.starts_with('也')
+            {
+                return true;
+            }
+            from = abs;
+        }
+    }
+    false
+}
+
+/// 可剥离口语前缀（doc5/03 §7）：quote 含该前缀则 held:NON_MINIMAL_QUOTE；
+/// 模型可另行返回不含前缀的逐字 span，Rust 不改写 quote。
+fn non_minimal_quote(quote: &str) -> bool {
+    let lower = quote.trim().to_lowercase();
+    ["提醒一下，", "顺便说一句，", "对了，", "by the way, "]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
+/// 第一人称完整起点（中文按字面，英文大小写折叠）。
+fn has_first_person_subject(q_trim_lower: &str) -> bool {
+    q_trim_lower.starts_with('我')
+        || q_trim_lower.starts_with("i ")
+        || q_trim_lower.starts_with("i'")
+        || q_trim_lower.starts_with("my ")
+}
+
+/// 第三人标记（doc5/03 §7 有限词表，字面包含）。只用于保守拦截；
+/// 「我们家小孩」不能算第一人称用户事实。
+fn has_third_person_marker(quote: &str) -> bool {
+    ["我姐", "我哥", "我妈", "我爸", "我们家小孩", "小孩", "孩子", "家人", "同事"]
+        .iter()
+        .any(|w| quote.contains(w))
+}
+
+/// 缺明确归属主体（doc5/03 §7）：fact/preference 片段既无第一人称主语也无第三人
+/// 主语 → held:UNCLEAR_SUBJECT，不能用同事件别处的「我」补 claim。
+/// 已识别第三人主语的不在此停（继续到 THIRD_PARTY）。
+fn unclear_subject(quote: &str) -> bool {
+    let q = quote.trim().to_lowercase();
+    !has_first_person_subject(&q) && !has_third_person_marker(quote)
+}
+
+/// 未来节点/短期状态/一次性语境词（doc5/03 §7）。命中即 held:TEMPORAL（CONTEXT_UNCERTAIN
+/// 已先在 admit_v2 规则 4 处理「如果/假如/比如/这次/本次/今天先」）。
+fn temporal_marker(quote: &str) -> bool {
+    ["今年", "明年", "下周", "下个月", "即将", "准备", "今天", "最近", "暂时", "坏了"]
+        .iter()
+        .any(|w| quote.contains(w))
+}
+
+/// 健康敏感词（doc5/03 §7 有限词表）。命中即 held:SENSITIVE；不声称覆盖所有健康表达。
+fn sensitive_health(quote: &str) -> bool {
+    ["过敏", "诊断", "病历", "疾病", "吃药", "服药", "身份证", "银行卡"]
+        .iter()
+        .any(|w| quote.contains(w))
+}
+
+/// admit_v2 明确句式（doc5/03 §6 最小受支持集合）。quote 匹配到哪个 kind 的形状。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplicitShape {
+    Instruction,
+    Preference,
+    FactName,
+    FactResidence,
+    FactOccupation,
+    FactPrimaryPractice,
+}
+
+impl ExplicitShape {
+    /// 该形状所属的候选 kind（doc5/03 §6）：fact 形状包含 name/residence/occupation/
+    /// primary-practice；kind 与形状冲突时记 KIND_MISMATCH，不自动改 kind。
+    pub fn kind(self) -> &'static str {
+        match self {
+            ExplicitShape::Instruction => "instruction",
+            ExplicitShape::Preference => "preference",
+            ExplicitShape::FactName
+            | ExplicitShape::FactResidence
+            | ExplicitShape::FactOccupation
+            | ExplicitShape::FactPrimaryPractice => "fact",
+        }
+    }
+}
+
+/// 职业/角色尾词（doc5/03 §6）：`我在X做Y` 的 Y 必须以其一结尾；`我是X` 仅当 X
+/// 以其一结尾才可自动 active。集中一处，不跨层复制。
+const OCCUPATION_TAILS: [&str; 8] = [
+    "开发", "工程师", "设计师", "教师", "老师", "研究员", "产品经理", "数据分析",
+];
+
+/// 句末一个标点（doc5/03 §6：每项在去除句末一个标点后匹配）。
+const TRAILING_PUNCT: [char; 12] = ['。', '，', '；', '！', '？', '.', ',', ';', '!', '?', '~', '～'];
+
+/// X 的受限片段校验：非空、1—64 Unicode 标量、不含会引入第二命题/新句的标点。
+fn bounded_fragment(x: &str) -> bool {
+    let n = x.chars().count();
+    n > 0
+        && n <= 64
+        && !x.chars().any(|c| {
+            matches!(c, '，' | ',' | '；' | ';' | '。' | '.' | '!' | '？' | '?' | '！' | '\n' | '\r')
+        })
+}
+
+/// 对工作副本执行 trim + NFKC + 小写，并去除句末一个标点（doc5/03 §6 前言）。
+/// 只用于匹配；保存的 quote/claim 原文不变。
+fn normalize_shape_input(quote: &str) -> String {
+    let nfkc: String = quote.trim().nfkc().collect();
+    let mut s = nfkc.to_lowercase();
+    if let Some(last) = s.chars().last() {
+        if TRAILING_PUNCT.contains(&last) {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// admit_v2 的明确句式识别（doc5/03 §6 最小受支持集合）。返回命中的形状；
+/// 未命中返回 None（调用方按 kind 记 NOT_EXPLICIT 或 KIND_MISMATCH）。
+/// 匹配基于规范化工作副本；句式之外默认 held，不用规则填补所有语言。
+pub(crate) fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
+    let s = normalize_shape_input(quote);
+    // 长期指令：以固定指令词起始，后面必须有非空要求（doc5/03 §6）。
+    for p in ["以后", "从现在起", "请总是", "请记住", "记住", "always", "from now on", "remember"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if bounded_fragment(rest) {
+                return Some(ExplicitShape::Instruction);
+            }
+        }
+    }
+    // 稳定偏好。
+    for p in ["我喜欢", "我不喜欢", "i like ", "i dislike ", "i like", "i dislike"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if bounded_fragment(rest) {
+                return Some(ExplicitShape::Preference);
+            }
+        }
+    }
+    // fact/name。
+    for p in ["我叫", "my name is "] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if bounded_fragment(rest) {
+                return Some(ExplicitShape::FactName);
+            }
+        }
+    }
+    // fact/residence。「我在杭州做后端开发」不说明住在杭州——residence 只认我住在。
+    for p in ["我住在", "i live in "] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if bounded_fragment(rest) {
+                return Some(ExplicitShape::FactResidence);
+            }
+        }
+    }
+    // fact/primary-practice：引用自身必须含「我」（我主要写X / 我平时主要写X）。
+    for p in ["我主要写", "我平时主要写"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if bounded_fragment(rest) {
+                return Some(ExplicitShape::FactPrimaryPractice);
+            }
+        }
+    }
+    // fact/occupation-new：我在X做Y，Y 以职业尾词结尾（doc5/03 §6）。
+    if let Some(rest) = s.strip_prefix("我在") {
+        if let Some(do_pos) = rest.rfind("做") {
+            let (x, y) = (&rest[..do_pos], &rest[do_pos + "做".len()..]);
+            if !x.is_empty() && OCCUPATION_TAILS.iter().any(|t| y.ends_with(t)) {
+                return Some(ExplicitShape::FactOccupation);
+            }
+        }
+        // fact/occupation-old：我在X工作（沿旧形状；X 非空受限）。
+        if let Some(work_pos) = rest.find("工作") {
+            if work_pos > 0 {
+                return Some(ExplicitShape::FactOccupation);
+            }
+        }
+    }
+    // 我是X：仅在 X 以职业尾词结尾时算 occupation（doc5/03 §6）；其余不放行。
+    if let Some(rest) = s.strip_prefix("我是") {
+        if OCCUPATION_TAILS.iter().any(|t| rest.ends_with(t)) {
+            return Some(ExplicitShape::FactOccupation);
+        }
+    }
+    // 英文 I am a/an X 沿用旧形状。
+    for p in ["i am a ", "i am an "] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if bounded_fragment(rest) {
+                return Some(ExplicitShape::FactOccupation);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +661,113 @@ mod tests {
         assert!(parse_extraction(fenced_bad).is_err());
         // 纯垃圾仍失败。
         assert!(parse_extraction("不是 JSON").is_err());
+    }
+
+    #[test]
+    fn v3_prompt_dispatched_by_version_and_v1_v2_frozen() {
+        // doc5/02 §1：v1/v2 字符串原样保留；v3 按作业行版本分派。
+        assert_eq!(system_prompt_for("extract_v1"), Some(EXTRACT_SYSTEM_PROMPT_V1));
+        assert_eq!(system_prompt_for("extract_v2"), Some(EXTRACT_SYSTEM_PROMPT));
+        assert_eq!(system_prompt_for("extract_v3"), Some(EXTRACT_SYSTEM_PROMPT_V3));
+        assert_eq!(system_prompt_for("extract_v0"), None);
+        // v3 契约要点写进提示词：一候选一命题、逐字连续、不改写主语、空数组合法。
+        assert!(EXTRACT_SYSTEM_PROMPT_V3.contains("一个可独立纠错、遗忘或过期的用户命题"));
+        assert!(EXTRACT_SYSTEM_PROMPT_V3.contains("不得补写主语"));
+        assert!(EXTRACT_SYSTEM_PROMPT_V3.contains("{\"candidates\":[]}"));
+        // 响应 Schema 与 v2 完全一致：v3 仍按同一严格 schema 解析。
+        let parsed = parse_extraction(
+            "{\"candidates\":[{\"source_event_id\":\"e1\",\"quote\":\"q\",\"kind\":\"fact\"}]}",
+        )
+        .unwrap();
+        assert_eq!(parsed.candidates.len(), 1);
+    }
+
+    #[test]
+    fn multi_claim_detects_two_independent_propositions() {
+        // doc5/02 §2 / doc5/03 §7：后句以我/平时主要写/还/也开始 → 宽 quote。
+        assert!(multi_claim("我在杭州做后端开发，平时主要写 Rust"));
+        assert!(multi_claim("我叫洛溪，我住在杭州"));
+        assert!(multi_claim("我喜欢 Rust；还喜欢 Go"));
+        assert!(multi_claim("我在杭州做后端开发。我主要写 Rust"));
+        // 姓名地址中的普通逗号不是命题起点；ASCII '.' 不是分隔符（小数不拆）。
+        assert!(!multi_claim("我在杭州，滨江区上班"));
+        assert!(!multi_claim("我用的还是 3.5 版本"));
+        // 但真有第二命题时（即使句中含小数）仍判宽。
+        assert!(multi_claim("版本 3.5 发布了，我主要用 Rust"));
+        assert!(!multi_claim("我在杭州做后端开发"));
+    }
+
+    #[test]
+    fn non_minimal_prefix_held_not_rewritten() {
+        // doc5/02 §2：口语前缀与命题可分 → held；Rust 不改写 quote。
+        assert!(non_minimal_quote("提醒一下，我在杭州做后端开发"));
+        assert!(non_minimal_quote("对了，我对花生过敏"));
+        assert!(non_minimal_quote("By The Way, I like Rust"));
+        assert!(!non_minimal_quote("我在杭州做后端开发"));
+    }
+
+    #[test]
+    fn unclear_subject_and_third_party_markers() {
+        // doc5/03 §7：无第一人称且无第三人主语 → UNCLEAR_SUBJECT；
+        // 第三人标记命中 → 不算 unclear（继续到 THIRD_PARTY）。
+        assert!(unclear_subject("平时主要写 Rust"));
+        assert!(unclear_subject("老笔记本电池坏了"));
+        assert!(!unclear_subject("我主要写 Rust"));
+        assert!(!unclear_subject("我们家小孩今年九月上小学"));
+        assert!(!unclear_subject("我姐在成都教书"));
+        // 第三人词表（有限集合，保守拦截）。
+        assert!(has_third_person_marker("我们家小孩今年九月上小学一年级"));
+        assert!(has_third_person_marker("我姐在成都教书"));
+        assert!(!has_third_person_marker("我在杭州做后端开发"));
+    }
+
+    #[test]
+    fn temporal_and_health_markers() {
+        // doc5/03 §7：未来/短期词与健康词的有限集合。
+        assert!(temporal_marker("我今年九月开始新工作"));
+        assert!(temporal_marker("老笔记本电池坏了"));
+        assert!(temporal_marker("我下周去上海"));
+        assert!(!temporal_marker("我在杭州做后端开发"));
+        assert!(sensitive_health("我对花生过敏"));
+        assert!(sensitive_health("我有哮喘诊断"));
+        assert!(!sensitive_health("我喜欢用暗色主题写代码"));
+    }
+
+    #[test]
+    fn explicit_shapes_minimal_supported_set() {
+        // doc5/03 §6 最小受支持集合（正例）。
+        assert_eq!(explicit_shape("以后回答请用中文"), Some(ExplicitShape::Instruction));
+        assert_eq!(explicit_shape("请记住每天备份"), Some(ExplicitShape::Instruction));
+        assert_eq!(explicit_shape("我喜欢用暗色主题写代码"), Some(ExplicitShape::Preference));
+        assert_eq!(explicit_shape("I like Rust"), Some(ExplicitShape::Preference));
+        assert_eq!(explicit_shape("我叫洛溪"), Some(ExplicitShape::FactName));
+        assert_eq!(explicit_shape("My name is 洛溪。"), Some(ExplicitShape::FactName));
+        assert_eq!(explicit_shape("我住在杭州"), Some(ExplicitShape::FactResidence));
+        assert_eq!(explicit_shape("I live in Hangzhou."), Some(ExplicitShape::FactResidence));
+        assert_eq!(explicit_shape("我在杭州做后端开发"), Some(ExplicitShape::FactOccupation));
+        assert_eq!(explicit_shape("我是软件工程师"), Some(ExplicitShape::FactOccupation));
+        assert_eq!(explicit_shape("I am a software engineer"), Some(ExplicitShape::FactOccupation));
+        assert_eq!(explicit_shape("我在腾讯工作三年了"), Some(ExplicitShape::FactOccupation));
+        assert_eq!(explicit_shape("我主要写 Rust"), Some(ExplicitShape::FactPrimaryPractice));
+        assert_eq!(explicit_shape("我平时主要写 Rust"), Some(ExplicitShape::FactPrimaryPractice));
+        // 反例（doc5/03 §6 边界）。
+        assert_eq!(explicit_shape("我在家做饭"), None, "做饭不是职业尾词");
+        assert_eq!(explicit_shape("我是刚吃完饭"), None, "我是X 过宽，非职业尾词不放行");
+        assert_eq!(explicit_shape("平时主要写 Rust"), None, "缺主语片段不是 explicit 形状");
+        assert_eq!(explicit_shape("昨天挺累的"), None);
+        // X 受限：空、超长、含第二命题标点。
+        assert_eq!(explicit_shape("我喜欢"), None);
+        assert_eq!(explicit_shape("我喜欢 Rust，也喜欢 Go"), None, "X 含第二命题标点不放行");
+        let long_x = format!("我喜欢{}", "好".repeat(65));
+        assert_eq!(explicit_shape(&long_x), None, "X 超 64 字符不放行");
+    }
+
+    #[test]
+    fn shape_normalization_folds_case_and_trailing_punct_only() {
+        // doc5/03 §6：匹配用 trim/NFKC/大小写折叠 + 去句末一个标点；不删中间词或否定词。
+        assert_eq!(explicit_shape("I Like Rust."), Some(ExplicitShape::Preference));
+        assert_eq!(explicit_shape("  我不喜欢加班  "), Some(ExplicitShape::Preference));
+        // 否定词是形状的一部分：剥掉就反义，绝不匹配正向形状。
+        assert_eq!(normalize_shape_input("我不喜欢加班"), "我不喜欢加班");
     }
 }
