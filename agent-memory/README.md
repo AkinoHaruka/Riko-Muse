@@ -8,7 +8,7 @@ Rust 优先的通用 Agent 长期记忆内核：同一用户的多 Agent 共享�
 |---|---|
 | HTTP 协议验证（curl 实测 + 26 个单测） | ✅ 本机 Windows 实测 |
 | DSH 实际运行（官方 clone 真实宿主闭环） | ✅ headless profile `memory-hl` 真实会话闭环（capture/五工具/注入/纠错/遗忘/跨用户 404/spool 离线恢复） |
-| 模型真实连通 | ❌ **未验证**——全部宿主闭环使用本地假模型（mock，仅测试装置），无可用真实端点 |
+| 模型真实连通 | ✅ 提取链路与 DSH 会话链路实测（SiliconFlow Qwen3.5-4B，2026-09-25，见 `../doc-handoff/05-真实模型验证.md`）；批量质量/长历史/限速未验证 |
 | 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；未做安装分发，其他操作系统未验证 |
 
 ## 快速开始（Windows 本机已验证）
@@ -97,6 +97,8 @@ TypeScript 薄适配器（Cordis 插件），按官方 `deepseek-harness@477b4f4
 
 **已验证（本机 Windows，26 个单测 + curl 实测 + 官方 DSH headless 真实闭环，2026-09-25）**：双用户令牌隔离与轮换；L0 幂等/冲突；Agent A→B 跨 Agent 记忆闭环（remember/search/compose，含 DSH 宿主内注入可见性）；中文 grams 与英文 FTS 双路检索；纠错/遗忘/版本锁/幂等/抑制复活（DSH 宿主内多步工具回路）；flush 幂等与作业状态；重启恢复；**spool 离线重放（停内核→落盘→恢复→同键幂等重放）**；rebuild-index/backup/doctor；非 loopback 拒绝。
 
-**未验证**：真实模型端点连通与提取质量（宿主闭环均用本地假模型；自动提取 worker 用固定响应验证）；插件 HMR 卸载后工具消失；其他操作系统。one-shot headless 模式下 assistant/tool 事件捕获受退出竞态影响（用户事件不受影响），headless 无 sessionQuery、缺口对账不运行。
+**已验证补充（真实模型，2026-09-25）**：提取 worker 真实模型生成有证据的 active 记忆（claim 为用户原话逐字片段，usage 持久化）；DSH 真实模型会话注入召回并被正确使用（经本地协议转换装置，模型=SiliconFlow Qwen3.5-4B）。
+
+**未验证**：真实模型下的批量提取质量、多窗口长历史、限速；插件 HMR 卸载后工具消失；其他操作系统。one-shot headless 模式下 assistant/tool 事件捕获受退出竞态影响（用户事件不受影响），headless 无 sessionQuery、缺口对账不运行。
 
 **不声称**：EverOS/Hindsight 的基准成绩、SOTA 准确率、生产多租户能力。首版只报告上述本机实测行为。
