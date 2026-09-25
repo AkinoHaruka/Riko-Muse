@@ -5,13 +5,17 @@
 
 use serde::Deserialize;
 
-/// 系统提示词（doc/13 §4）。
+/// 系统提示词（doc/13 §4）。响应 Schema 逐字写进提示词——真实模型（尤其 4B 级）
+/// 无法从散文约束可靠猜出字段名，缺 schema 会自造字段或包 Markdown 围栏（2026-09-25 实测）。
 pub const EXTRACT_SYSTEM_PROMPT: &str = "\
 从给定对话提取可能对未来 Agent 有持续用途的用户事实、偏好、长期指令和事件。
 只引用 role=user 且 source_kind=user 的 event_id。
 quote 必须逐字复制同一条用户消息中的连续原文；不要改写、补充或拼接多条消息。
 临时请求、假设、引用他人的话、助手推断不要提取。没有合格内容时输出空数组。
-只输出 JSON，不输出解释或 Markdown。";
+只输出 JSON，不输出解释或 Markdown。
+响应必须是如下形状，字段名逐字一致、不增不减；occurred_at、valid_until、confidence 可省略：
+{\"candidates\":[{\"source_event_id\":\"<event_id>\",\"quote\":\"<逐字连续原文>\",\"kind\":\"fact|preference|instruction|episode\",\"occurred_at\":null,\"valid_until\":null,\"confidence\":0.9}]}
+没有合格内容时输出 {\"candidates\":[]}。";
 
 pub const EXTRACT_PROMPT_VERSION: &str = memory_contract::EXTRACT_PROMPT_VERSION;
 
@@ -78,6 +82,26 @@ pub trait ExtractModel: Send {
         system: &str,
         user: &str,
     ) -> impl std::future::Future<Output = Result<ExtractOutput, ExtractError>> + Send;
+}
+
+/// 解析模型输出为 Extraction。Markdown 代码围栏只做格式归一化（真实 provider
+/// 常见行为，提示词压不住），剥除后仍走严格 schema 校验（deny_unknown_fields），
+/// 准入闸门不受影响。
+pub fn parse_extraction(content: &str) -> Result<Extraction, String> {
+    let t = content.trim();
+    let stripped = if let Some(rest) = t.strip_prefix("```") {
+        // 跳过 ```json 之类的语言标注行；要求结尾有围栏才算包裹。
+        let first_break = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &rest[first_break..];
+        let body = body.trim_end();
+        match body.rfind("```") {
+            Some(i) if body[..i].trim().starts_with('{') => body[..i].trim(),
+            _ => t,
+        }
+    } else {
+        t
+    };
+    serde_json::from_str(stripped).map_err(|e| e.to_string())
 }
 
 /// doc/13 §5 的确定性准入规则第 1～7 步（第 8、9 步需查库，由 store 层完成）。
@@ -339,5 +363,21 @@ mod tests {
         assert!(serde_json::from_str::<Extraction>(empty).is_ok());
         let extra = r#"{"candidates":[{"source_event_id":"e1","quote":"q","kind":"fact","occurred_at":null,"valid_until":null,"confidence":1,"evil":1}]}"#;
         assert!(serde_json::from_str::<Extraction>(extra).is_err());
+    }
+
+    #[test]
+    fn parse_extraction_strips_code_fence_but_keeps_strict_schema() {
+        // 真实 provider（SiliconFlow Qwen3.5-4B 实测）即使被明令禁止仍包 ```json 围栏。
+        let fenced = "```json\n{\"candidates\":[{\"source_event_id\":\"e1\",\"quote\":\"以后用中文\",\"kind\":\"instruction\"}]}\n```";
+        let parsed = parse_extraction(fenced).unwrap();
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.candidates[0].quote, "以后用中文");
+        // 干净 JSON 原样通过。
+        assert!(parse_extraction("{\"candidates\":[]}").is_ok());
+        // 围栏剥除后仍严格校验：自造字段拒绝。
+        let fenced_bad = "```json\n{\"candidates\":[{\"source_event_id\":\"e1\",\"fact\":\"改写\"}]}\n```";
+        assert!(parse_extraction(fenced_bad).is_err());
+        // 纯垃圾仍失败。
+        assert!(parse_extraction("不是 JSON").is_err());
     }
 }

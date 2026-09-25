@@ -11,6 +11,9 @@ migrations_dir = "migrations"
 # model_name = "qwen2.5:7b"
 # model_key_file = "secrets/model.key"   # 文件内容为一行密钥；密钥不进配置、不进日志、不进 Prompt
 # model_allow_empty_key = false
+# model_max_tokens = 1024                # 单次生成上限；推理型 provider 无上限输出会拖垮提取
+# model_timeout_secs = 30                # 单次模型调用超时（默认 30）
+# model_extra_json = { enable_thinking = false }   # provider 专有开关，顶层合并进请求体
 
 # ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500

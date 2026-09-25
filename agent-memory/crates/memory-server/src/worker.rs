@@ -125,6 +125,8 @@ mod tests {
             model: "mock".into(),
             api_key: "unused".into(),
             timeout: Duration::from_secs(1),
+            max_tokens: 1024,
+            extra_body: None,
         };
         process_job(&state, &mock, cfg, &job).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -164,6 +166,8 @@ mod tests {
             model: "mock".into(),
             api_key: "unused".into(),
             timeout: Duration::from_secs(1),
+            max_tokens: 1024,
+            extra_body: None,
         };
         let r = process_job(&state, &mock, cfg, &job).await;
         assert!(r.is_err());
@@ -443,6 +447,33 @@ mod tests {
         // 幂等窗口键仍生效：重试 dead 后 requeue。
         assert!(g.retry_dead_job(&memory_domain::ScopeKey { tenant_id: "t".into(), user_id: "u".into() }, &job_id).unwrap());
     }
+
+    #[test]
+    fn request_body_has_bounded_output_and_merges_extra_fields() {
+        let base = ModelConfig {
+            endpoint: "https://api.example.com/v1/chat/completions".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            timeout: Duration::from_secs(30),
+            max_tokens: 1024,
+            extra_body: None,
+        };
+        let body = build_request_body(&base, "sys", "user");
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "user");
+        // 额外字段顶层合并，且可覆盖默认值（如 provider 专有 thinking 开关）。
+        let with_extra = ModelConfig {
+            extra_body: Some(serde_json::json!({"enable_thinking": false, "temperature": 0.2})),
+            ..base
+        };
+        let body2 = build_request_body(&with_extra, "sys", "user");
+        assert_eq!(body2["enable_thinking"], false);
+        assert_eq!(body2["temperature"], 0.2);
+        assert_eq!(body2["max_tokens"], 1024);
+    }
 }
 
 
@@ -453,6 +484,37 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key: String,
     pub timeout: Duration,
+    /// 单次生成上限（max_tokens）。默认 1024：推理型 provider 无限时输出会把
+    /// 提取调用拖到分钟级（2026-09-25 SiliconFlow Qwen3.5-4B 实测 >180s）。
+    pub max_tokens: u32,
+    /// 额外请求体字段（provider 专有开关，如 enable_thinking=false），顶层合并进请求。
+    /// None 时不合并任何字段；值须是 JSON 对象。
+    pub extra_body: Option<serde_json::Value>,
+}
+
+/// 构造 Chat Completions 请求体：固定形状 + 可选 provider 专有字段顶层合并。
+/// 合并发生在固定字段之后，专有字段可覆盖默认值（调用方自行保证值合法）。
+fn build_request_body(
+    cfg: &ModelConfig,
+    system: &str,
+    user: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.0,
+        "max_tokens": cfg.max_tokens,
+    });
+    if let Some(extra) = cfg.extra_body.as_ref().and_then(|v| v.as_object()) {
+        let map = body.as_object_mut().expect("body 是 object");
+        for (k, v) in extra {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    body
 }
 
 /// 模型响应正文上限（doc2/05 §2：有界响应，防异常大包）。
@@ -488,22 +550,7 @@ impl OpenAiCompatibleClient {
 
 impl ExtractModel for OpenAiCompatibleClient {
     async fn extract(&self, system: &str, user: &str) -> Result<ExtractOutput, ExtractError> {
-        #[derive(serde::Serialize)]
-        struct Msg<'a> {
-            role: &'a str,
-            content: &'a str,
-        }
-        #[derive(serde::Serialize)]
-        struct Req<'a> {
-            model: &'a str,
-            messages: [Msg<'a>; 2],
-            temperature: f32,
-        }
-        let req = Req {
-            model: &self.cfg.model,
-            messages: [Msg { role: "system", content: system }, Msg { role: "user", content: user }],
-            temperature: 0.0,
-        };
+        let req = build_request_body(&self.cfg, system, user);
         let resp = self
             .http
             .post(&self.cfg.endpoint)
@@ -648,7 +695,7 @@ async fn process_job<M: ExtractModel>(
     match result {
         Ok(output) => {
             let extraction: Result<Extraction, String> =
-                serde_json::from_str(&output.content).map_err(|e| e.to_string());
+                memory_extract::parse_extraction(&output.content);
             match extraction {
                 Ok(ex) => {
                     let mut last_err: Option<String> = None;

@@ -118,6 +118,12 @@ struct Config {
     model_key_file: Option<PathBuf>,
     /// 是否允许空密钥（doc2/05 §2：默认 false，不能把空字符串当真实授权）。
     model_allow_empty_key: Option<bool>,
+    /// 单次生成上限（默认 1024）。推理型 provider 无上限输出会拖垮提取调用。
+    model_max_tokens: Option<u32>,
+    /// 单次模型调用超时秒数（默认 MODEL_CALL_TIMEOUT_SECS=30）。
+    model_timeout_secs: Option<u64>,
+    /// 额外请求体字段（provider 专有开关，如 enable_thinking=false），顶层合并。
+    model_extra_json: Option<toml::Value>,
 }
 
 impl Config {
@@ -177,8 +183,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         model: name.clone(),
                         api_key,
                         timeout: std::time::Duration::from_secs(
-                            memory_contract::MODEL_CALL_TIMEOUT_SECS,
+                            cfg.model_timeout_secs
+                                .unwrap_or(memory_contract::MODEL_CALL_TIMEOUT_SECS),
                         ),
+                        max_tokens: cfg.model_max_tokens.unwrap_or(1024),
+                        extra_body: match &cfg.model_extra_json {
+                            Some(v) => Some(serde_json::to_value(v).map_err(|e| {
+                                format!("model_extra_json 无法转换为 JSON 请求字段: {e}")
+                            })?),
+                            None => None,
+                        },
                     })
                 }
                 _ => None,
