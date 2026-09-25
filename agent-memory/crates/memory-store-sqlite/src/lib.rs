@@ -66,6 +66,8 @@ pub enum StoreError {
 }
 
 pub mod diagnostics;
+#[cfg(test)]
+mod probes;
 pub mod evidence;
 pub mod jobs;
 pub mod memories;
