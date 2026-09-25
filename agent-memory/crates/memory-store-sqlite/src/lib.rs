@@ -49,6 +49,8 @@ pub enum StoreError {
     WindowTooLarge,
     #[error("执行权已失效（claim_generation 不匹配或状态非 running），本次写入未生效")]
     StaleClaim,
+    #[error("作业不存在或不属于当前 scope")]
+    JobNotFound,
     #[error("版本冲突（乐观锁）")]
     VersionConflict,
     #[error("目标含糊：最近用户消息未明确指认该记忆")]

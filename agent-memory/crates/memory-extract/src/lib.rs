@@ -69,6 +69,29 @@ pub struct WindowEvent {
     pub content: String,
 }
 
+/// 窗口事件的模型输入 JSON 形状（doc/13 §4）。服务端分窗预算与 worker 实际发送
+/// 必须共用同一 builder，保证 32 KiB 预算按真实模型输入字节计算（doc4/03 §1—2）。
+pub fn window_event_json(e: &WindowEvent) -> serde_json::Value {
+    serde_json::json!({
+        "event_id": e.id, "role": e.role, "source_kind": e.source_kind,
+        "time": e.occurred_at, "text": e.content
+    })
+}
+
+/// 单事件在输入数组中的序列化字节数（含对象本体与分隔逗号；偏保守，宁可早分窗）。
+/// 序列化失败返回 usize::MAX，使其按超限处理而非静默塞入窗口。
+pub fn serialized_event_size(e: &WindowEvent) -> usize {
+    serde_json::to_vec(&window_event_json(e))
+        .map(|b| b.len() + 1)
+        .unwrap_or(usize::MAX)
+}
+
+/// 整窗序列化为模型输入字符串（数组 JSON，与 worker 实际发送逐字节一致）。
+pub fn serialize_window_events(events: &[WindowEvent]) -> Result<String, String> {
+    let items: Vec<serde_json::Value> = events.iter().map(window_event_json).collect();
+    serde_json::to_string(&items).map_err(|e| format!("窗口输入序列化失败: {e}"))
+}
+
 /// 准入结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {

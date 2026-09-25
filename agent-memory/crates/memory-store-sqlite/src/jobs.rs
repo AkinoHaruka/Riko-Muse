@@ -15,8 +15,9 @@ use crate::{now_rfc3339, Store, StoreError};
 
 #[derive(Debug)]
 pub enum FlushOutcome {
-    NothingToExtract,
-    Created { job_id: String },
+    /// 新范围内没有任何可提取内容：只生成/返回零模型调用 checkpoint。
+    NothingToExtract { job_id: String },
+    Created { job_id: String, status: String },
     Existing { job_id: String, status: String },
 }
 
@@ -54,7 +55,17 @@ pub enum CandidateOutcome {
 }
 
 impl Store {
-    /// POST /v1/extraction/flush（doc/12 §4）。window_key = v1:<through_seq>。
+    /// POST /v1/extraction/flush（doc/12 §4、doc4/03 §2）。服务端分窗为权威：
+    ///
+    /// - 同 (scope,host,session,through) 已有作业 → 原样返回（先于乱序检查，幂等）；
+    /// - `through` 越过已收最大 seq 或小于已排最大 through → 409；
+    /// - 读取 `(已排最大 through, 请求 through]` 的事件，按**实际序列化字节**
+    ///   （与 worker 共用 memory_extract builder）贪心分组，超 100 事件或 32 KiB
+    ///   即在上一事件 seq 处封闭窗口；
+    /// - 单事件自身超限 → 单独 `dead/WINDOW_TOO_LARGE` 作业（attempts=0，不调用模型）；
+    /// - 无 user/user 事件的组与空范围（seq 空洞）→ `succeeded` 零模型调用 checkpoint
+    ///   推进下界；
+    /// - 全部作业与审计在同一事务内提交，返回最后作业的 ID/状态。
     pub fn flush_window(
         &mut self,
         scope: &ScopeKey,
@@ -62,68 +73,173 @@ impl Store {
         session_id: &str,
         through_event_seq: i64,
     ) -> Result<FlushOutcome, StoreError> {
-        let max_seq = self.max_event_seq(scope, host_id, session_id)?.unwrap_or(-1);
-        if through_event_seq > max_seq {
+        struct PendingWindow {
+            through: i64,
+            oversized: bool,
+            has_user: bool,
+        }
+        let tx = self.conn_mut().transaction()?;
+        // 幂等（doc4/03 §2：乱序检查前）：同 through 的既有作业按原 ID/状态返回。
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, status FROM extraction_jobs
+                 WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4
+                   AND through_event_seq=?5",
+                params![scope.tenant_id, scope.user_id, host_id, session_id, through_event_seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((job_id, status)) = existing {
+            tx.commit()?;
+            return Ok(FlushOutcome::Existing { job_id, status });
+        }
+        // through 越过已收到最大 seq → 409（旧协议；空 session 同样拒绝）。
+        let max_seq: Option<i64> = tx.query_row(
+            "SELECT MAX(event_seq) FROM evidence_events
+             WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4",
+            params![scope.tenant_id, scope.user_id, host_id, session_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?;
+        if through_event_seq > max_seq.unwrap_or(-1) {
             return Err(StoreError::StateConflict);
         }
-        // 窗口内须有 role=user 且 source_kind=user 的事件，否则无事可做。
-        let has_user: bool = self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM evidence_events
-                 WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4
-                   AND event_seq<=?5 AND role='user' AND source_kind='user' LIMIT 1",
-                params![scope.tenant_id, scope.user_id, host_id, session_id, through_event_seq],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !has_user {
-            return Ok(FlushOutcome::NothingToExtract);
-        }
-        // flush 小于已排最大 through_seq 且非同一 window_key → 409（doc/13 §3）。
-        let max_scheduled: Option<i64> = self
-            .conn()
-            .query_row(
-                "SELECT MAX(through_event_seq) FROM extraction_jobs
-                 WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4",
-                params![scope.tenant_id, scope.user_id, host_id, session_id],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()?
-            .flatten();
-        let window_key = format!("v1:{through_event_seq}");
+        let max_scheduled: Option<i64> = tx.query_row(
+            "SELECT MAX(through_event_seq) FROM extraction_jobs
+             WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4",
+            params![scope.tenant_id, scope.user_id, host_id, session_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?;
         if let Some(m) = max_scheduled {
             if through_event_seq < m {
                 return Err(StoreError::StateConflict);
             }
         }
-        // 幂等：同 window_key 返回原 job。
-        let existing: Option<(String, String)> = self
-            .conn()
-            .query_row(
-                "SELECT id, status FROM extraction_jobs
-                 WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4 AND window_key=?5",
-                params![scope.tenant_id, scope.user_id, host_id, session_id, window_key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((job_id, status)) = existing {
-            return Ok(FlushOutcome::Existing { job_id, status });
+        let last = max_scheduled.unwrap_or(-1);
+        // 事务内重新读取范围事件（doc4/03 §2：避免旧读引发重复窗口）。
+        let mut stmt = tx.prepare(
+            "SELECT id, role, source_kind, occurred_at, content, event_seq FROM evidence_events
+             WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4
+               AND event_seq>?5 AND event_seq<=?6
+             ORDER BY event_seq",
+        )?;
+        let events: Vec<(i64, memory_extract::WindowEvent)> = stmt
+            .query_map(
+                params![scope.tenant_id, scope.user_id, host_id, session_id, last, through_event_seq],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(5)?,
+                        memory_extract::WindowEvent {
+                            id: r.get(0)?,
+                            role: r.get(1)?,
+                            source_kind: r.get(2)?,
+                            occurred_at: r.get(3)?,
+                            content: r.get(4)?,
+                        },
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        // 贪心分组：按 seq 递增；加入下一事件会超 100 事件或 32 KiB 时先封闭当前组。
+        let mut pending: Vec<PendingWindow> = Vec::new();
+        let mut cur_count = 0usize;
+        let mut cur_bytes = 0usize;
+        let mut cur_last_seq: Option<i64> = None;
+        let mut cur_has_user = false;
+        for (seq, ev) in &events {
+            let size = memory_extract::serialized_event_size(ev);
+            let is_user = ev.role == "user" && ev.source_kind == "user";
+            if size > memory_contract::EXTRACTION_INPUT_MAX_BYTES {
+                // 单事件超限：先封闭已有组，再插入该 seq 的 dead/WINDOW_TOO_LARGE 作业。
+                if let Some(s) = cur_last_seq.take() {
+                    pending.push(PendingWindow { through: s, oversized: false, has_user: cur_has_user });
+                }
+                pending.push(PendingWindow { through: *seq, oversized: true, has_user: false });
+                cur_count = 0;
+                cur_bytes = 0;
+                cur_has_user = false;
+            } else if cur_count + 1 > memory_contract::EXTRACTION_WINDOW_MAX_EVENTS
+                || cur_bytes + size > memory_contract::EXTRACTION_INPUT_MAX_BYTES
+            {
+                let s = cur_last_seq.take().expect("组非空才会触发分窗");
+                pending.push(PendingWindow { through: s, oversized: false, has_user: cur_has_user });
+                cur_count = 1;
+                cur_bytes = size;
+                cur_last_seq = Some(*seq);
+                cur_has_user = is_user;
+            } else {
+                cur_count += 1;
+                cur_bytes += size;
+                cur_last_seq = Some(*seq);
+                cur_has_user |= is_user;
+            }
         }
-        let job_id = Uuid::now_v7().to_string();
+        // 末组非空且尚无 requested_through 的作业：封闭末组，through=requested_through。
+        if cur_last_seq.is_some() {
+            pending.push(PendingWindow { through: through_event_seq, oversized: false, has_user: cur_has_user });
+        }
+
         let now = now_rfc3339()?;
-        self.conn_mut().execute(
-            "INSERT INTO extraction_jobs
-             (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
-              status, attempts, run_after, created_at, updated_at, prompt_version)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',0,?8,?9,?10,?11)",
+        let mut insert_job = |tx: &rusqlite::Transaction<'_>,
+                              through: i64,
+                              status: &str,
+                              error_code: Option<&str>|
+         -> Result<String, StoreError> {
+            let job_id = Uuid::now_v7().to_string();
+            tx.execute(
+                "INSERT INTO extraction_jobs
+                 (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
+                  status, attempts, run_after, created_at, updated_at, prompt_version, error_code)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13)",
+                params![
+                    job_id, scope.tenant_id, scope.user_id, host_id, session_id,
+                    format!("v1:{through}"), through, status, now, now, now,
+                    memory_contract::EXTRACT_PROMPT_VERSION, error_code
+                ],
+            )?;
+            Ok(job_id)
+        };
+        let mut last_job: Option<(String, String)> = None;
+        for w in &pending {
+            let (status, error_code) = if w.oversized {
+                ("dead", Some("WINDOW_TOO_LARGE"))
+            } else if !w.has_user {
+                // 无 user/user 的组：直接 succeeded，不调用模型（doc4/03 §2）。
+                ("succeeded", None)
+            } else {
+                ("queued", None)
+            };
+            let job_id = insert_job(&tx, w.through, status, error_code)?;
+            last_job = Some((job_id, status.to_string()));
+        }
+        if pending.is_empty() {
+            // 空范围（如 through 落在 seq 空洞）：succeeded 空 checkpoint 推进下界，
+            // 不捏造事件（doc4/03 §2）。
+            let job_id = insert_job(&tx, through_event_seq, "succeeded", None)?;
+            last_job = Some((job_id, "succeeded".into()));
+        }
+        // 审计与作业同一事务（audit_events.actor_kind 限于 user/system）。
+        let (last_id, last_status) = last_job.expect("至少生成 checkpoint");
+        let detail = serde_json::json!({
+            "host_id": host_id, "session_id": session_id,
+            "through_event_seq": through_event_seq, "jobs": pending.len().max(1),
+        });
+        tx.execute(
+            "INSERT INTO audit_events
+             (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
+             VALUES (?1,?2,?3,'system','flush','extraction_flush',?4,?5,?6)",
             params![
-                job_id, scope.tenant_id, scope.user_id, host_id, session_id, window_key,
-                through_event_seq, now, now, now, memory_contract::EXTRACT_PROMPT_VERSION
+                Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id,
+                last_id, now, detail.to_string()
             ],
         )?;
-        Ok(FlushOutcome::Created { job_id })
+        tx.commit()?;
+        let actionable = pending.iter().any(|w| w.oversized || w.has_user);
+        if !actionable {
+            return Ok(FlushOutcome::NothingToExtract { job_id: last_id });
+        }
+        Ok(FlushOutcome::Created { job_id: last_id, status: last_status })
     }
 
     /// 本窗口下界：同 scope/host/session 中 `through_event_seq` 小于当前窗口、且
@@ -303,12 +419,13 @@ impl Store {
             },
         )?;
         let events = rows.collect::<Result<Vec<_>, _>>()?;
-        // 窗口上限（doc/13 §3、doc4/03）：100 事件 / 32 KiB，超限不悄悄截断。
-        // 返回 WindowTooLarge：同输入重试不会改变，worker 侧确定性 dead，不空转重试。
+        // 窗口上限（doc/13 §3、doc4/03）：100 事件 / 32 KiB（按与 worker 共用的
+        // 实际序列化字节计），超限不悄悄截断。返回 WindowTooLarge：同输入重试不会
+        // 改变，worker 侧确定性 dead，不空转重试。服务端分窗正常时不应触发。
         if events.len() > memory_contract::EXTRACTION_WINDOW_MAX_EVENTS {
             return Err(StoreError::WindowTooLarge);
         }
-        let total: usize = events.iter().map(|e| e.content.len()).sum();
+        let total: usize = events.iter().map(memory_extract::serialized_event_size).sum();
         if total > memory_contract::EXTRACTION_INPUT_MAX_BYTES {
             return Err(StoreError::WindowTooLarge);
         }
@@ -435,6 +552,67 @@ impl Store {
             params![now, now, scope.tenant_id, scope.user_id, job_id],
         )?;
         Ok(n > 0)
+    }
+
+    /// 本地管理员显式跳过（doc4/03 §4）：仅 `dead + WINDOW_TOO_LARGE` 作业可跳。
+    /// 写 `extraction_job_skips` 与 audit_events（actor_kind='admin_cli'、
+    /// actor_id='local_admin'）；重复相同 skip 幂等返回既有记录。跳过只表示
+    /// 跳过该窗口的自动提取，L0 原文保留。其他 dead 原因、其他 scope 或缺失 ID
+    /// 不变更任何行。
+    pub fn skip_dead_job(
+        &mut self,
+        scope: &ScopeKey,
+        job_id: &str,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let tx = self.conn_mut().transaction()?;
+        let job: Option<(String, String)> = tx
+            .query_row(
+                "SELECT status, COALESCE(error_code,'') FROM extraction_jobs
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match job {
+            None => return Err(StoreError::JobNotFound),
+            Some((status, error_code)) => {
+                if status != "dead" || error_code != "WINDOW_TOO_LARGE" {
+                    return Err(StoreError::StateConflict);
+                }
+            }
+        }
+        let already: bool = tx
+            .query_row(
+                "SELECT 1 FROM extraction_job_skips WHERE job_id=?1",
+                params![job_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if already {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let now = now_rfc3339()?;
+        tx.execute(
+            "INSERT INTO extraction_job_skips
+             (job_id, tenant_id, user_id, reason_code, actor_kind, actor_id, created_at)
+             VALUES (?1,?2,?3,?4,'admin_cli','local_admin',?5)",
+            params![job_id, scope.tenant_id, scope.user_id, reason, now],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_events
+             (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
+             VALUES (?1,?2,?3,'system','local_admin','job_skip',?4,?5,?6)",
+            params![
+                Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id,
+                job_id, now,
+                serde_json::json!({"reason": reason, "error_code": "WINDOW_TOO_LARGE"}).to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// 诊断：统计指定 reason 的候选数（不返回正文）。
@@ -757,7 +935,7 @@ mod tests {
 
     fn flush(store: &mut Store, scope: &ScopeKey, session: &str, through: i64) -> String {
         match store.flush_window(scope, "dsh", session, through).unwrap() {
-            FlushOutcome::Created { job_id } => job_id,
+            FlushOutcome::Created { job_id, .. } => job_id,
             other => panic!("应创建作业，实际 {other:?}"),
         }
     }
@@ -971,5 +1149,221 @@ mod tests {
             -1,
             "未跳过的 dead 前窗不推进下界"
         );
+    }
+
+    #[test]
+    fn flush_splits_101_events_and_replay_is_idempotent() {
+        // doc4/03 §6：101 个短事件一次 flush → 至少两个递增窗口，均不超 100 事件；
+        // 重放同一 flush 不产生新窗口。
+        let mut store = setup("split101");
+        let scope = scope_of(&store, "t", "u");
+        for seq in 1..=101 {
+            ingest(&mut store, &scope, "s1", seq, &format!("事件{seq}"));
+        }
+        let outcome = store.flush_window(&scope, "dsh", "s1", 101).unwrap();
+        let last_id = match &outcome {
+            FlushOutcome::Created { job_id, status } => {
+                assert_eq!(status, "queued", "最后作业应 queued");
+                job_id.clone()
+            }
+            other => panic!("应 Created，实际 {other:?}"),
+        };
+        let (jobs, max_events): (i64, i64) = store.conn().query_row(
+            "SELECT count(*), MAX(through_event_seq) FROM extraction_jobs
+             WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(jobs >= 2, "101 事件至少两个窗口，实际 {jobs}");
+        assert_eq!(max_events, 101, "最后窗口 through = 请求 through");
+        // 逐窗按序领取、加载（真实流程：前窗成功后下界推进），事件数 ≤ 100。
+        let rows: Vec<(String, i64)> = {
+            let mut stmt = store.conn().prepare(
+                "SELECT id, through_event_seq FROM extraction_jobs
+                 WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'
+                 ORDER BY through_event_seq",
+            ).unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for (id, through) in &rows {
+            let now = plus_secs(&now_rfc3339().unwrap(), *through + 1);
+            let claimed = store.claim_next_ordered_job(&now).unwrap().unwrap();
+            assert_eq!(claimed.id, *id, "窗口必须按 through 顺序领取");
+            let lower = store.window_lower_bound(&scope, "dsh", "s1", *through).unwrap();
+            let events = store.load_window_events(&scope, &claimed, lower).unwrap();
+            assert!(
+                events.len() <= memory_contract::EXTRACTION_WINDOW_MAX_EVENTS,
+                "窗口 {through} 事件数 {} 超限",
+                events.len()
+            );
+            store
+                .complete_job(id, claimed.claim_generation, 1, "mock", None, None)
+                .unwrap();
+        }
+        assert_eq!(rows.last().unwrap().0, last_id, "最后作业 ID = 请求 through 对应作业");
+        // 重放：同 ID/状态返回，不新增窗口。
+        match store.flush_window(&scope, "dsh", "s1", 101).unwrap() {
+            FlushOutcome::Existing { job_id, .. } => assert_eq!(job_id, last_id),
+            other => panic!("重放应 Existing，实际 {other:?}"),
+        }
+        let jobs2: i64 = store.conn().query_row(
+            "SELECT count(*) FROM extraction_jobs
+             WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(jobs2, jobs, "重放不得产生新窗口");
+    }
+
+    #[test]
+    fn flush_budget_uses_serialized_bytes_not_raw_content() {
+        // doc4/03 §1—2：预算按实际 JSON 输入字节。10 000 个引号字符原始 10 KB，
+        // JSON 转义后约 20 KB；两条原始合计 20 KB < 32 KiB，转义后 > 32 KiB → 必分窗。
+        let mut store = setup("bytes");
+        let scope = scope_of(&store, "t", "u");
+        let quoted = "\"".repeat(10_000);
+        ingest(&mut store, &scope, "s1", 1, &quoted);
+        ingest(&mut store, &scope, "s1", 2, &quoted);
+        store.flush_window(&scope, "dsh", "s1", 2).unwrap();
+        let (jobs, statuses): (i64, String) = store.conn().query_row(
+            "SELECT count(*), group_concat(status) FROM extraction_jobs
+             WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(jobs, 2, "按序列化字节应分两窗（原始 content.len() 合计仅 20 KB）");
+        assert_eq!(statuses, "queued,queued");
+        // 逐窗按序领取、加载：实际序列化输入不超 32 KiB，L0 原文完整。
+        let rows: Vec<(String, i64)> = {
+            let mut stmt = store.conn().prepare(
+                "SELECT id, through_event_seq FROM extraction_jobs
+                 WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'
+                 ORDER BY through_event_seq",
+            ).unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for (id, through) in &rows {
+            let now = plus_secs(&now_rfc3339().unwrap(), *through + 1);
+            let claimed = store.claim_next_ordered_job(&now).unwrap().unwrap();
+            assert_eq!(claimed.id, *id);
+            let lower = store.window_lower_bound(&scope, "dsh", "s1", *through).unwrap();
+            let events = store.load_window_events(&scope, &claimed, lower).unwrap();
+            let input = memory_extract::serialize_window_events(&events).unwrap();
+            assert!(input.len() <= memory_contract::EXTRACTION_INPUT_MAX_BYTES, "窗口 {through} 序列化 {} 超限", input.len());
+            assert!(events.iter().all(|e| e.content == quoted), "L0 原文不得截断");
+            store
+                .complete_job(id, claimed.claim_generation, 1, "mock", None, None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn flush_oversized_event_dead_then_skip_unblocks() {
+        // doc4/03 §3/§4：单条约 40 KiB 事件 → L0 保留；dead/WINDOW_TOO_LARGE、
+        // attempts=0；skip 前后窗被阻断，skip 后可领；重复 skip 幂等。
+        let mut store = setup("oversize");
+        let scope = scope_of(&store, "t", "u");
+        let big = "是".repeat(13_500); // 序列化（含 JSON 结构）> 32 KiB
+        ingest(&mut store, &scope, "s1", 1, &big);
+        ingest(&mut store, &scope, "s1", 2, "正常事件2");
+        ingest(&mut store, &scope, "s1", 3, "正常事件3");
+        store.flush_window(&scope, "dsh", "s1", 3).unwrap();
+        // L0 保留。
+        let ev1: String = store.conn().query_row(
+            "SELECT content FROM evidence_events WHERE tenant_id='t' AND user_id='u'
+             AND host_id='dsh' AND session_id='s1' AND event_seq=1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(ev1.len(), big.len(), "超限事件 L0 原文不删不改");
+        // dead/WINDOW_TOO_LARGE 作业存在，attempts=0；后窗 queued。
+        let (dead_id, attempts): (String, i32) = store.conn().query_row(
+            "SELECT id, attempts FROM extraction_jobs
+             WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'
+               AND status='dead' AND error_code='WINDOW_TOO_LARGE'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(attempts, 0);
+        let queued: String = store.conn().query_row(
+            "SELECT id FROM extraction_jobs
+             WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1' AND status='queued'",
+            [], |r| r.get(0),
+        ).unwrap();
+        // skip 前：后窗被 dead 前窗阻断。
+        assert!(store.claim_next_ordered_job(&plus_secs(&now_rfc3339().unwrap(), 1)).unwrap().is_none());
+        // 非 WINDOW_TOO_LARGE 的 dead 拒绝 skip；未变更任何行。
+        ingest(&mut store, &scope, "s2", 1, "s2-事件1");
+        let other = flush(&mut store, &scope, "s2", 1);
+        force_status(&mut store, &other, "dead", "MODEL_TIMEOUT");
+        assert!(matches!(
+            store.skip_dead_job(&scope, &other, "测试"),
+            Err(StoreError::StateConflict)
+        ));
+        assert_eq!(
+            job_field(&store, &other, "status"),
+            "dead",
+            "被拒 skip 不得改变状态"
+        );
+        // 正式 skip：后窗可领；重复 skip 幂等。
+        assert!(store.skip_dead_job(&scope, &dead_id, "运维确认单事件超限").unwrap());
+        assert!(!store.skip_dead_job(&scope, &dead_id, "重复请求").unwrap(), "重复 skip 幂等");
+        let claimed = store
+            .claim_next_ordered_job(&plus_secs(&now_rfc3339().unwrap(), 2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, queued, "skip 后同 session 后窗可领");
+        // 跨 scope skip：报 JobNotFound，不写行。
+        let scope2 = ScopeKey { tenant_id: "t".into(), user_id: "u2".into() };
+        assert!(matches!(
+            store.skip_dead_job(&scope2, &dead_id, "越权"),
+            Err(StoreError::JobNotFound)
+        ));
+        let skips: i64 = store.conn().query_row(
+            "SELECT count(*) FROM extraction_job_skips", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(skips, 1, "跨 scope 请求不得新增 skip 行");
+    }
+
+    #[test]
+    fn flush_checkpoint_advances_lower_bound_without_model() {
+        // doc4/03 §2：seq 空洞内的 flush 与无 user/user 事件的组 → succeeded
+        // checkpoint（零模型调用），推进下界，HTTP 语义仍 nothing_to_extract+job_id。
+        let mut store = setup("checkpoint");
+        let scope = scope_of(&store, "t", "u");
+        ingest(&mut store, &scope, "s1", 1, "事件1");
+        ingest(&mut store, &scope, "s1", 3, "事件3"); // 空洞：seq 2
+        match store.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+            FlushOutcome::Created { job_id, status } => {
+                assert_eq!(status, "queued");
+                let _ = job_id;
+            }
+            other => panic!("应 Created，实际 {other:?}"),
+        }
+        // flush through 2 落在空洞：无事件 → succeeded checkpoint。
+        match store.flush_window(&scope, "dsh", "s1", 2).unwrap() {
+            FlushOutcome::NothingToExtract { job_id } => {
+                assert_eq!(job_field(&store, &job_id, "status"), "succeeded");
+            }
+            other => panic!("空洞 flush 应 NothingToExtract+checkpoint，实际 {other:?}"),
+        }
+        // 无 user/user 事件的范围：checkpoint，不排队。
+        let t = chrono::Utc::now();
+        let o = Origin { host_id: "dsh".into(), agent_id: "agent-a".into(), session_id: "s2".into() };
+        store
+            .record_evidence(&scope, &o, 1, "assistant", "assistant", &t, "助手消息不算")
+            .unwrap();
+        match store.flush_window(&scope, "dsh", "s2", 1).unwrap() {
+            FlushOutcome::NothingToExtract { job_id } => {
+                assert_eq!(job_field(&store, &job_id, "status"), "succeeded");
+            }
+            other => panic!("assistant-only 范围应 checkpoint，实际 {other:?}"),
+        }
+        // 后续真实范围（through 3）可正常创建且包含事件 3。
+        match store.flush_window(&scope, "dsh", "s1", 3).unwrap() {
+            FlushOutcome::Created { status, .. } => assert_eq!(status, "queued"),
+            other => panic!("应 Created，实际 {other:?}"),
+        }
     }
 }

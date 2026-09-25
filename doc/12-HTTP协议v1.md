@@ -41,9 +41,9 @@
 {"host_id":"dsh","session_id":"session-x","through_event_seq":42}
 ```
 
-服务器只选认证 scope 中该 host/session 且 `event_seq <= through_event_seq` 的事件。若没有用户事件，返回 200 `{status:"nothing_to_extract"}`。否则创建 `window_key="v1:42"`，202 `{job_id:"...",status:"queued"}`；同键重试返回同一 job ID 和当前状态。`through_event_seq` 不得大于该会话已收到的最大事件序号。v1 不接受 `wait=true`，避免适配器阻塞模型回合。
+请求 schema 不变。**服务端分窗为权威**（doc4/03）：服务器读取认证 scope 中该 host/session 自上一已排窗口之后到 `through_event_seq` 的事件，按实际模型输入序列化字节贪心切分为多个有序窗口（每窗 ≤100 事件且 ≤32 KiB），同一事务内全部创建。响应的 `job_id` 指请求 through 对应的**最后一个**作业；`status` 如实返回该作业状态（通常 `queued`）。单事件自身超过 32 KiB 时生成 `dead/WINDOW_TOO_LARGE` 作业且不调用模型，后续窗口照常创建。新范围内没有用户事件时创建内部 `succeeded` 零模型调用 checkpoint 以推进下界，返回 200 `{status:"nothing_to_extract","job_id":"..."}`（`job_id` 供诊断）。同 `through_event_seq` 重试（在乱序检查之前）返回同一 job ID 和当前状态。`through_event_seq` 不得大于该会话已收到的最大事件序号，也不得小于已排最大窗口（否则 409）。v1 不接受 `wait=true`，避免适配器阻塞模型回合。
 
-`GET /v1/jobs/{job_id}` 返回本 scope 的 `{job_id,status,attempts,created_at,updated_at,error_code?,input_tokens?,output_tokens?}`。不同用户的 ID 一律 404。`POST /v1/jobs/{job_id}/retry` 只允许 `dead` 状态、同 scope 的显式管理调用；DSH Agent 工具不注册此端点。
+`GET /v1/jobs/{job_id}` 返回本 scope 的 `{job_id,status,attempts,created_at,updated_at,error_code?,input_tokens?,output_tokens?}`。不同用户的 ID 一律 404。`POST /v1/jobs/{job_id}/retry` 只允许 `dead` 状态、同 scope 的显式管理调用；`WINDOW_TOO_LARGE` 的作业不接受原样 retry，须用本地 CLI `memoryd job skip` 显式跳过（写审计，L0 原文保留）。DSH Agent 工具不注册此端点。
 
 ## 5. 用户显式记忆
 

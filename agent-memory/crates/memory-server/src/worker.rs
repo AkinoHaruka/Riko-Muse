@@ -108,7 +108,7 @@ mod tests {
         let job_id = {
             let mut g = store.lock().unwrap();
             match g.flush_window(&scope, "dsh", "s1", 4).unwrap() {
-                FlushOutcome::Created { job_id } => job_id,
+                FlushOutcome::Created { job_id, .. } => job_id,
                 _ => panic!("应创建作业"),
             }
         };
@@ -183,7 +183,7 @@ mod tests {
         let job_id = {
             let mut g = store.lock().unwrap();
             match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
-                FlushOutcome::Created { job_id } => job_id,
+                FlushOutcome::Created { job_id, .. } => job_id,
                 _ => panic!(),
             }
         };
@@ -222,7 +222,7 @@ mod tests {
         let mut g = store.lock().unwrap();
         let ev1 = ingest_user(&mut g, &scope, 1, "以后用中文回答");
         let job1_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
-            FlushOutcome::Created { job_id } => job_id,
+            FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
         // save_candidate 事务内核对 running+generation，必须先真实领取。
@@ -255,7 +255,7 @@ mod tests {
         // 规则 9：同属性键（response_language=以后用...回答）不同值 → POSSIBLE_CONFLICT held。
         let ev2 = ingest_user(&mut g, &scope, 2, "以后用英文回答");
         let job2_id = match g.flush_window(&scope, "dsh", "s1", 2).unwrap() {
-            FlushOutcome::Created { job_id } => job_id,
+            FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
         let run_after2 = g.get_job(&scope, &job2_id).unwrap().unwrap().run_after;
@@ -293,7 +293,7 @@ mod tests {
         let mut g = store.lock().unwrap();
         let ev1 = ingest_user(&mut g, &scope, 1, "我喜欢Rust");
         let job1_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
-            FlushOutcome::Created { job_id } => job_id,
+            FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
         let run_after = g.get_job(&scope, &job1_id).unwrap().unwrap().run_after;
@@ -480,7 +480,7 @@ mod tests {
         let mut g = store.lock().unwrap();
         ingest_user(&mut g, &scope, 1, "我叫洛溪");
         let job_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
-            FlushOutcome::Created { job_id } => job_id,
+            FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
         // 第 1、2 次失败 → retryable；第 3 次 → dead。fail/complete 只在
@@ -560,7 +560,7 @@ mod tests {
         let flush_job = |store: &Arc<Mutex<Store>>, session: &str| {
             let mut g = store.lock().unwrap();
             let job_id = match g.flush_window(&scope, "dsh", session, 1).unwrap() {
-                FlushOutcome::Created { job_id } => job_id,
+                FlushOutcome::Created { job_id, .. } => job_id,
                 _ => panic!(),
             };
             let run_after = g.get_job(&scope, &job_id).unwrap().unwrap().run_after;
@@ -862,27 +862,17 @@ async fn process_job_inner<M: ExtractModel>(
         (events, origin)
     };
 
-    // 输入：按 seq 排序的事件 JSON（doc/13 §4）。序列化失败按暂态处理。
-    let input = {
-        let payload: Vec<serde_json::Value> = events
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "event_id": e.id, "role": e.role, "source_kind": e.source_kind,
-                    "time": e.occurred_at, "text": e.content
-                })
-            })
-            .collect();
-        match serde_json::to_string(&payload) {
-            Ok(s) => s,
-            Err(e) => {
-                let mut guard = state.store.lock().unwrap();
-                match guard.fail_job(&job.id, job.claim_generation, attempts, "WINDOW_READ_FAILED") {
-                    Ok(_) => {}
-                    Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
-                }
-                return Err(format!("窗口输入序列化失败: {e}"));
+    // 输入：按 seq 排序的事件 JSON（doc/13 §4）。与 flush 分窗预算共用同一 builder
+    // （doc4/03 §1—2），序列化失败按暂态处理。
+    let input = match memory_extract::serialize_window_events(&events) {
+        Ok(s) => s,
+        Err(e) => {
+            let mut guard = state.store.lock().unwrap();
+            match guard.fail_job(&job.id, job.claim_generation, attempts, "WINDOW_READ_FAILED") {
+                Ok(_) => {}
+                Err(e2) => eprintln!("[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复", job.id),
             }
+            return Err(e);
         }
     };
 

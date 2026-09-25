@@ -59,6 +59,11 @@ enum Commands {
         #[command(subcommand)]
         action: PrincipalAction,
     },
+    /// 作业管理（本地管理员；doc4/03 §4）
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
+    },
     /// 只读诊断：迁移、principals、索引状态（不修复数据）
     Doctor {
         #[arg(long)]
@@ -75,6 +80,24 @@ enum Commands {
         config: PathBuf,
         #[arg(long)]
         out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobAction {
+    /// 显式跳过一个 dead/WINDOW_TOO_LARGE 作业的自动提取（不删 L0 原文；doc4/03 §4）
+    Skip {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        job_id: String,
+        /// 运维原因 1—256 字符；不得填用户正文或密钥（写入审计）
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -219,6 +242,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+        Commands::Job { action } => match action {
+            JobAction::Skip { config, tenant, user, job_id, reason } => {
+                let run = || -> Result<(), String> {
+                    let cfg = Config::load(&config)?;
+                    let reason_chars = reason.chars().count();
+                    if reason_chars == 0 || reason_chars > 256 {
+                        return Err("skip reason 必须 1—256 个字符，且不得填用户正文或密钥".into());
+                    }
+                    let mut store = Store::open(&cfg.db_path, &cfg.migrations_dir).map_err(|e| e.to_string())?;
+                    let scope = ScopeKey { tenant_id: tenant, user_id: user };
+                    // 先按 scope 精确查询，缺失/跨 scope 与状态不符给出可区分错误。
+                    if store.get_job(&scope, &job_id).map_err(|e| e.to_string())?.is_none() {
+                        return Err(format!("作业 {job_id} 不存在或不属于当前 scope，未变更任何行"));
+                    }
+                    match store.skip_dead_job(&scope, &job_id, &reason).map_err(|e| e.to_string()) {
+                        Ok(true) => {
+                            println!("已跳过作业 {job_id}（WINDOW_TOO_LARGE）；L0 原文保留，后窗将从该 through 之后推进");
+                            Ok(())
+                        }
+                        Ok(false) => {
+                            println!("作业 {job_id} 已存在跳过记录（幂等），未重复写入");
+                            Ok(())
+                        }
+                        Err(text) if text.contains("STATE_CONFLICT") || text.contains("窗口/状态冲突") => Err(
+                            "仅 dead 且 error_code=WINDOW_TOO_LARGE 的作业可 skip；其他 dead 请先修复原因后用完整 job ID retry".into(),
+                        ),
+                        Err(text) => Err(text),
+                    }
+                };
+                run()?;
+                Ok(())
+            }
+        },
         Commands::Principal { action } => match action {
             PrincipalAction::Add { tenant, user, token_out, db, migrations } => {
                 let mut store = Store::open(&db, &migrations)?;
@@ -705,13 +761,13 @@ async fn flush_window(
         guard.flush_window(&scope, &body.host_id, &body.session_id, body.through_event_seq)
     };
     match outcome {
-        Ok(FlushOutcome::NothingToExtract) => Json(serde_json::json!({
-            "request_id": req_id.0, "status": "nothing_to_extract"
+        Ok(FlushOutcome::NothingToExtract { job_id }) => Json(serde_json::json!({
+            "request_id": req_id.0, "status": "nothing_to_extract", "job_id": job_id
         }))
         .into_response(),
-        Ok(FlushOutcome::Created { job_id }) => (
+        Ok(FlushOutcome::Created { job_id, status }) => (
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "request_id": req_id.0, "job_id": job_id, "status": "queued" })),
+            Json(serde_json::json!({ "request_id": req_id.0, "job_id": job_id, "status": status })),
         )
             .into_response(),
         Ok(FlushOutcome::Existing { job_id, status }) => Json(serde_json::json!({
