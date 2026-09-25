@@ -254,39 +254,11 @@ impl Store {
         }
         // 3. quote 是原文连续子串。
         let (start, end) = find_quote_span(&content, quote).ok_or(StoreError::QuoteMismatch)?;
-        // 3.5 直写高风险窄门（doc5/04 §2）：先 scope/latest/quote，后看内容类别与保存
-        // 指令；分类只对 quote 内容独立执行，不信任工具传入的 kind。工具调用本身
-        // 不能证明用户要求保存（Agent 可自主调用 memory_remember）。
-        match memory_extract::classify_for_remember(quote) {
-            memory_extract::RememberClass::Secret => {
-                // 凭据即使用户说「请记住」也不得 active；优先于保存指令检查。
-                return Err(StoreError::SecretWriteForbidden);
-            }
-            memory_extract::RememberClass::Temporal => {
-                // 独立否决：remember 将 valid_until 写 NULL，时间性内容不能无期限 active。
-                return Err(StoreError::TemporalWriteUnsupported);
-            }
-            class @ (memory_extract::RememberClass::Sensitive
-            | memory_extract::RememberClass::ThirdParty) => {
-                // 仅当同一条最新用户消息中的保存指令与目标 quote 直接相邻才允许；
-                // 消息去首尾空白后以固定指令词开始，其后内容恰为待保存 quote（可带
-                // 句末标点）。把过敏内容填成 instruction 也一样要过此门。
-                if !has_adjacent_save_instruction(&content, quote) {
-                    eprintln!(
-                        "[memoryd] remember 直写被拒（需要直接保存指令，类别={class:?}）"
-                    );
-                    return Err(StoreError::SaveInstructionRequired);
-                }
-            }
-            memory_extract::RememberClass::Ordinary => {}
-        }
-        // 3.6 直写单命题粒度门（doc5/09 决策 B）：在 span 与高风险类别校验之后、
-        // 去重/创建之前执行，适用于所有 kind 与类别。复合命题拒绝并提示分开保存，
-        // 不自动拆分或改写 quote，也不创建部分记忆。已存在的复合 active 不在此处理。
-        if memory_extract::multi_proposition_for_direct_write(quote) {
-            eprintln!("[memoryd] remember 直写被拒（复合命题，一次只能保存一个命题）");
-            return Err(StoreError::CompoundWriteForbidden);
-        }
+        // 3.5 直写内容护栏已全部解除（用户产品决定，2026-09-25 深夜）：memory_remember
+        // 不再做内容类别判定、不再要求相邻保存指令、不再限制单命题——Agent 可主动
+        // 写入任何内容。保留的仅是协议级校验：scope、最新用户证据、quote 逐字 span、
+        // 去重与审计。原 doc5/04 §2 窄门与 doc5/09 决策 B 由用户决定撤销，护栏待
+        // 用户后续统一重写（历史实现见 git 4cb7eb5 / ea23c29 之前的 remembers 门）。
         // 4. claim = 折叠空白；长度上限由 handler 校验。
         let claim = fold_whitespace(quote);
         if claim.is_empty() {
@@ -1093,158 +1065,59 @@ mod tests {
     }
 
     #[test]
-    fn remember_direct_save_gate_matrix() {
-        // doc5/04 §2 + doc5/07 B 组：直写高风险窄门。
-        let (mut store, scope) = setup("remember-gate");
+    fn remember_direct_write_no_content_gates() {
+        // 用户产品决定（2026-09-25 深夜）：直写内容护栏全部解除——任何内容、
+        // 有无保存指令、单命题或复合句，均按协议校验后 active；Agent 可主动写入。
+        // 保留协议级校验：最新证据、quote 逐字 span、跨用户隔离、幂等去重。
+        let (mut store, scope) = setup("remember-open");
         let o = origin();
-        // B01：普通稳定偏好沿既有路径 active。
+        let created = |r: Result<RememberOutcome, StoreError>| -> String {
+            match r.unwrap() {
+                RememberOutcome::Created { memory_id, .. } => memory_id,
+                other => panic!("期望 Created，实际 {other:?}"),
+            }
+        };
+        // Agent 主动写入（无任何保存指令）：普通偏好。
         let ev1 = ingest_user(&mut store, &scope, 1, "我喜欢暗色主题");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev1, "我喜欢暗色主题", MemoryKind::Preference).unwrap(),
-            RememberOutcome::Created { .. }
-        ));
-        // B02：健康内容、Agent 自发调工具（无保存指令）→ 409 拒绝，不写 active。
+        created(store.remember(&scope, &o, &ev1, "我喜欢暗色主题", MemoryKind::Preference));
+        // 健康、凭据、时间性、第三人：无指令均 active（原四类门解除）。
         let ev2 = ingest_user(&mut store, &scope, 2, "我对花生过敏");
+        let id1 = created(store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Fact));
+        let ev3 = ingest_user(&mut store, &scope, 3, "我的密码：abcd1234");
+        created(store.remember(&scope, &o, &ev3, "我的密码：abcd1234", MemoryKind::Fact));
+        let ev4 = ingest_user(&mut store, &scope, 4, "我今年九月开始新工作");
+        created(store.remember(&scope, &o, &ev4, "我今年九月开始新工作", MemoryKind::Fact));
+        let ev5 = ingest_user(&mut store, &scope, 5, "我姐在成都教书");
+        created(store.remember(&scope, &o, &ev5, "我姐在成都教书", MemoryKind::Fact));
+        // 复合命题（原 doc5/09 决策 B 拒绝样本）→ active。
+        let ev6 = ingest_user(&mut store, &scope, 6, "我对芒果过敏，以后别再推荐含芒果的甜品");
+        created(store.remember(&scope, &o, &ev6, "我对芒果过敏，以后别再推荐含芒果的甜品", MemoryKind::Preference));
+        // 幂等不变：同 claim 重复 remember → Dedup（仅加证据，不新建）。
+        let ev7 = ingest_user(&mut store, &scope, 7, "我对花生过敏");
+        match store.remember(&scope, &o, &ev7, "我对花生过敏", MemoryKind::Fact).unwrap() {
+            RememberOutcome::Dedup { memory_id, .. } => assert_eq!(memory_id, id1),
+            other => panic!("期望 Dedup，实际 {other:?}"),
+        }
+        // quote 不逐字仍拒绝（协议校验，非内容护栏）。
+        let ev8 = ingest_user(&mut store, &scope, 8, "今天聊到这");
+        assert!(matches!(
+            store.remember(&scope, &o, &ev8, "这句话不在消息里", MemoryKind::Fact),
+            Err(StoreError::QuoteMismatch)
+        ));
+        // stale 证据仍拒绝。
         assert!(matches!(
             store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Fact),
-            Err(StoreError::SaveInstructionRequired)
+            Err(StoreError::StaleUserEvidence)
         ));
-        // B10：工具传 kind=instruction 也绕不过健康分类。
-        assert!(matches!(
-            store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Instruction),
-            Err(StoreError::SaveInstructionRequired)
-        ));
-        // B03：同一条最新消息中有直接相邻保存指令 → 允许。
-        let ev3 = ingest_user(&mut store, &scope, 3, "请记住：我对花生过敏");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev3, "我对花生过敏", MemoryKind::Fact).unwrap(),
-            RememberOutcome::Created { .. }
-        ));
-        // B04：前一句的保存意图不扩展到后一句。
-        let ev4 = ingest_user(&mut store, &scope, 4, "请记住我喜欢蓝色。另外我对花生过敏");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev4, "我对花生过敏", MemoryKind::Fact),
-            Err(StoreError::SaveInstructionRequired)
-        ));
-        // B05：第三人内容有直接保存请求 → 允许。
-        let ev5 = ingest_user(&mut store, &scope, 5, "请记住：我姐在成都教书");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev5, "我姐在成都教书", MemoryKind::Fact).unwrap(),
-            RememberOutcome::Created { .. }
-        ));
-        // B06：时间性内容即使有保存指令也拒绝（本版无有效期机制）。
-        let ev6 = ingest_user(&mut store, &scope, 6, "请记住：我今年九月开始新工作");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev6, "我今年九月开始新工作", MemoryKind::Fact),
-            Err(StoreError::TemporalWriteUnsupported)
-        ));
-        // B07：凭据永不 active——即使「请记住」开头；错误不回显值。
-        let ev7 = ingest_user(&mut store, &scope, 7, "请记住：我的密码：abcd1234");
-        let err7 = store
-            .remember(&scope, &o, &ev7, "我的密码：abcd1234", MemoryKind::Fact)
-            .unwrap_err();
-        assert!(matches!(err7, StoreError::SecretWriteForbidden));
-        assert!(!err7.to_string().contains("abcd1234"), "错误消息不得回显凭据值");
-        // B09：第三人与未来时间同时命中 → 时间否决优先，仍拒绝。
-        let ev9 = ingest_user(&mut store, &scope, 9, "请记住：我们家小孩今年九月入学");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev9, "我们家小孩今年九月入学", MemoryKind::Fact),
-            Err(StoreError::TemporalWriteUnsupported)
-        ));
-        // B08：引用旧用户事件 → 原有 stale 错误，不进入内容类别判定。
-        let ev_stale = ingest_user(&mut store, &scope, 10, "今天聊到这");
-        let err_stale = store
-            .remember(&scope, &o, &ev3, "我对花生过敏", MemoryKind::Fact)
-            .unwrap_err();
-        assert!(matches!(err_stale, StoreError::StaleUserEvidence), "B08 旧事件仍按原错误");
-        let _ = ev_stale;
-        // 跨用户隐藏：另一 scope 的 evidence id → EvidenceNotFound，不泄露存在性。
-        let dir = std::env::temp_dir().join(format!("am-mem-gate-u2-{}", std::process::id()));
+        // 跨用户隔离不变：另一 scope 的 evidence id → EvidenceNotFound，不泄露存在性。
+        let dir = std::env::temp_dir().join(format!("am-mem-open-u2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
         let scope2 = ScopeKey { tenant_id: "t".into(), user_id: "u2".into() };
         assert!(matches!(
-            store.remember(&scope2, &o, &ev3, "我对花生过敏", MemoryKind::Fact),
+            store.remember(&scope2, &o, &ev2, "我对花生过敏", MemoryKind::Fact),
             Err(StoreError::EvidenceNotFound)
         ));
-        // 保存的 quote 不改写：B03 建立的 active claim 逐字等于 quote。
-        let (hits, _) = store.search_memories(&scope, "花生", 5, false).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].claim, "我对花生过敏");
-    }
-
-    #[test]
-    fn remember_compound_write_rejected() {
-        // doc5/09 决策 B：直写一次只能保存一个命题；在 span 与高风险校验之后、
-        // 创建/去重之前；适用于所有 kind；不自动拆分、不写部分记忆。
-        let (mut store, scope) = setup("remember-compound");
-        let o = origin();
-        // 样本复合句（doc-handoff/10 §2.2），kind 伪造不影响。
-        let ev1 = ingest_user(&mut store, &scope, 1, "请记住：我对芒果过敏，以后别再推荐含芒果的甜品");
-        for kind in [MemoryKind::Fact, MemoryKind::Preference, MemoryKind::Instruction] {
-            assert!(matches!(
-                store.remember(&scope, &o, &ev1, "我对芒果过敏，以后别再推荐含芒果的甜品", kind),
-                Err(StoreError::CompoundWriteForbidden)
-            ), "kind={kind:?} 复合命题必须 409");
-        }
-        // 高风险类别先于粒度门：敏感内容无保存指令仍按原错误（doc5/09 §3 顺序）。
-        let ev2 = ingest_user(&mut store, &scope, 2, "我对芒果过敏，以后别再推荐含芒果的甜品");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev2, "我对芒果过敏，以后别再推荐含芒果的甜品", MemoryKind::Preference),
-            Err(StoreError::SaveInstructionRequired)
-        ));
-        // 普通复合句同样拒绝（粒度门不区分内容类别）。
-        let ev3 = ingest_user(&mut store, &scope, 3, "请记住：我喜欢咖啡，也喜欢茶");
-        assert!(matches!(
-            store.remember(&scope, &o, &ev3, "我喜欢咖啡，也喜欢茶", MemoryKind::Preference),
-            Err(StoreError::CompoundWriteForbidden)
-        ));
-        // 拒绝路径不新建候选、不写 active。
-        let count = |s: &Store| -> i64 {
-            s.conn()
-                .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-                .unwrap()
-        };
-        assert_eq!(count(&store), 0);
-        // 两条分别明确的保存请求各自得到独立 memory ID（验收 §3）。
-        let ev4 = ingest_user(&mut store, &scope, 4, "请记住：我对芒果过敏");
-        let id1 = match store.remember(&scope, &o, &ev4, "我对芒果过敏", MemoryKind::Fact).unwrap() {
-            RememberOutcome::Created { memory_id, .. } => memory_id,
-            other => panic!("期望 Created，实际 {other:?}"),
-        };
-        let ev5 = ingest_user(&mut store, &scope, 5, "请记住：以后别再推荐含芒果的甜品");
-        let id2 = match store.remember(&scope, &o, &ev5, "以后别再推荐含芒果的甜品", MemoryKind::Instruction).unwrap() {
-            RememberOutcome::Created { memory_id, .. } => memory_id,
-            other => panic!("期望 Created，实际 {other:?}"),
-        };
-        assert_ne!(id1, id2);
-        assert_eq!(count(&store), 2);
-    }
-
-    #[test]
-    fn remember_save_instruction_adjacency_rules() {
-        // doc5/04 §2 窄形式：去首尾空白、固定指令词、可选一个冒号与空白、
-        // 内容恰为 quote（可带一个句末标点）；大小写折叠只用于英文。
-        let cases: &[(&str, &str, bool)] = &[
-            ("请记住：我对花生过敏", "我对花生过敏", true),
-            ("请记住我对花生过敏", "我对花生过敏", true),
-            // 最窄读法（doc5/04 §2「允许其后一个 :/： 与空白」）：空白只在冒号后跳过；
-            // 无冒号的空格不构成相邻。从严只影响极少数措辞，方向安全。
-            ("记住 我对花生过敏", "我对花生过敏", false),
-            ("请帮我记住：我对花生过敏。", "我对花生过敏", true),
-            ("Remember: I like Rust", "I like Rust", true),
-            ("remember：我对花生过敏", "我对花生过敏", true),
-            ("  请记住：我对花生过敏  ", "我对花生过敏", true),
-            ("请记住：  我对花生过敏", "我对花生过敏", true),
-            ("请记住我喜欢蓝色。另外我对花生过敏", "我对花生过敏", false),
-            ("请记住一下：我对花生过敏", "我对花生过敏", false),
-            ("我对花生过敏，请记住", "我对花生过敏", false),
-            ("请记住：我姐在成都教书", "我对花生过敏", false),
-            ("请记住", "我对花生过敏", false),
-        ];
-        for (i, (msg, quote, want)) in cases.iter().enumerate() {
-            assert_eq!(has_adjacent_save_instruction(msg, quote), *want, "case #{i}: {msg}");
-        }
     }
 }

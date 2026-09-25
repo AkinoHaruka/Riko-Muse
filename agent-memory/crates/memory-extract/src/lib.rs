@@ -288,61 +288,6 @@ pub fn admit_for(
     }
 }
 
-/// `memory_remember` 直写路径的内容类别（doc5/04 §2）。
-/// 判定只看 quote 内容，不信任工具传入的 kind；报告顺序：SECRET 优先于保存指令
-/// 检查，TEMPORAL 是独立否决（即使同一 quote 还属于第三人信息也拒绝），
-/// SENSITIVE/THIRD_PARTY 需要最新用户消息中的直接保存指令。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RememberClass {
-    /// 凭据：任何路径不得 active，409 拒绝。
-    Secret,
-    /// 未来/短期状态：本版本无有效期机制，不得永久 active，409 拒绝。
-    Temporal,
-    /// 健康等敏感个人信息：需直接保存指令。
-    Sensitive,
-    /// 第三人/家庭成员信息：需直接保存指令。
-    ThirdParty,
-    /// 其余：沿 remember 既有路径。
-    Ordinary,
-}
-
-/// 对 quote 内容分类（doc5/04 §2）。复用 admit_v2 的同一批检测函数，
-/// 保证自动提取与直写两条路径的判定口径一致。
-pub fn classify_for_remember(quote: &str) -> RememberClass {
-    if secret_like(quote) {
-        RememberClass::Secret
-    } else if temporal_marker(quote) {
-        RememberClass::Temporal
-    } else if sensitive_health(quote) {
-        RememberClass::Sensitive
-    } else if has_third_person_marker(quote) {
-        RememberClass::ThirdParty
-    } else {
-        RememberClass::Ordinary
-    }
-}
-
-/// 直写复合命题保守判定（doc5/09 决策 B）：`memory_remember` 一次只能保存一个
-/// 可独立纠错/遗忘的命题，适用于所有 kind。任何 `，/,/；/;/。` 之后（跳过空白）
-/// 以下列第二分句起点开始即视为复合命题。本判定只服务直写窄门，**不复用、不改动
-/// admit_v2 的 multi_claim**（其行为已被作业行 admission_version 绑定，静默变更会
-/// 改变未完成旧作业的准入结果）；分句起点之外不推断，无法可靠拆分时由调用方
-/// 拒绝一次性直写。
-pub fn multi_proposition_for_direct_write(quote: &str) -> bool {
-    const SEPARATORS: [char; 5] = ['，', ',', '；', ';', '。'];
-    const CONTINUATIONS: [&str; 6] = ["以后", "从现在起", "我", "平时主要写", "还", "也"];
-    for (i, ch) in quote.char_indices() {
-        if !SEPARATORS.contains(&ch) {
-            continue;
-        }
-        let rest = quote[i + ch.len_utf8()..].trim_start();
-        if CONTINUATIONS.iter().any(|w| rest.starts_with(w)) {
-            return true;
-        }
-    }
-    false
-}
-
 /// 一次性/假设/转述词（doc/13 §5.5）。
 fn context_uncertain(quote: &str) -> bool {
     let q = quote.to_lowercase();
@@ -1004,37 +949,6 @@ mod tests {
         assert_eq!(f("我以后都回答中文", "instruction"), Held("NOT_EXPLICIT"));
     }
 
-    #[test]
-    fn direct_write_multi_proposition_detection() {
-        // doc5/09 决策 B：直写复合命题保守判定（独立函数，不涉 admit_v2）。
-        // 样本复合句（doc-handoff/10 §2.2）：过敏事实 + 长期指令。
-        assert!(multi_proposition_for_direct_write("我对芒果过敏，以后别再推荐含芒果的甜品"));
-        // 分句起点表逐项：以后/从现在起/我/平时主要写/还/也。
-        for quote in [
-            "我喜欢咖啡，也喜欢茶",
-            "我叫林晚；从现在起请叫我晚晚",
-            "我住在城东，我养了一只猫",
-            "我在云舟工作，平时主要写 Go",
-            "我对花生过敏，还有乳制品不耐受",
-            "我喜欢徒步。以后每年要去一次川西",
-            "温度合适，我每天都开窗",
-            "用 ASCII 逗号,我也记一下",
-            "ASCII 分号;还记一条",
-        ] {
-            assert!(multi_proposition_for_direct_write(quote), "应判复合: {quote}");
-        }
-        // 单命题内部含分隔符但第二分句不在起点表内 → 不拦（最小集合边界，如实记录）。
-        for quote in [
-            "我对花生过敏",
-            "我喜欢用钢笔、铅笔写笔记",
-            "我住在城东的滨江小区，家里养了一只猫",
-            "以后回答请保持简短",
-            "版本 3.5 我很喜欢",
-            "价格是 1,000 元",
-        ] {
-            assert!(!multi_proposition_for_direct_write(quote), "不应判复合: {quote}");
-        }
-    }
 
     #[test]
     fn admit_v2_source_and_quote_gates() {

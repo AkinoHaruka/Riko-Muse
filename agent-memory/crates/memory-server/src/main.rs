@@ -661,32 +661,9 @@ async fn remember_memory(
         Err(StoreError::StaleUserEvidence) | Err(StoreError::EvidenceNotFound) => {
             err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件或角色不符")
         }
-        // doc5/04 §2：直写高风险窄门。三条都映射 409 STATE_CONFLICT；消息只说明
-        // 所需的用户保存意图或时间限制，不回显 quote 正文或其他 scope 信息。
-        Err(StoreError::SecretWriteForbidden) => err(
-            &req_id.0,
-            StatusCode::CONFLICT,
-            ErrorCode::StateConflict,
-            "凭据类内容不能保存为记忆：即使用户说「请记住」，本内核也不接受凭据成为 active",
-        ),
-        Err(StoreError::TemporalWriteUnsupported) => err(
-            &req_id.0,
-            StatusCode::CONFLICT,
-            ErrorCode::StateConflict,
-            "时间性内容暂不支持永久保存：本版本没有有效期机制，不能把未来/短期状态写成无期限 active",
-        ),
-        Err(StoreError::SaveInstructionRequired) => err(
-            &req_id.0,
-            StatusCode::CONFLICT,
-            ErrorCode::StateConflict,
-            "该类内容需要用户在最新一条消息中直接说「请记住：<原话>」才会保存；工具调用本身不构成保存授权",
-        ),
-        Err(StoreError::CompoundWriteForbidden) => err(
-            &req_id.0,
-            StatusCode::CONFLICT,
-            ErrorCode::StateConflict,
-            "一次只能保存一个命题：请把复合内容拆开，对每个命题用单独的「请记住：<原话>」分别保存",
-        ),
+        // 直写内容护栏已按用户产品决定（2026-09-25 深夜）全部解除；直写路径不再有
+        // 内容类别类 409。quote/证据类错误（QUOTE_MISMATCH、STALE_USER_EVIDENCE）
+        // 沿既有映射。
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }
