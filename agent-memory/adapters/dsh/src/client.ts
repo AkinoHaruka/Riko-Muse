@@ -11,6 +11,8 @@ export interface ClientConfig {
   token: string;
   writeTimeoutMs: number;
   composeTimeoutMs: number;
+  soulTimeoutMs: number;
+  bundleTimeoutMs: number;
 }
 
 export interface ApiResult {
@@ -52,13 +54,13 @@ export class MemoryClient {
     }
   }
 
-  private async get(path: string, timeoutMs: number): Promise<ApiResult> {
+  private async get(path: string, timeoutMs: number, signal?: AbortSignal): Promise<ApiResult> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
       const res = await fetch(`${this.cfg.baseUrl}${path}`, {
         headers: { authorization: `Bearer ${this.cfg.token}` },
-        signal: ctrl.signal,
+        signal: signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal,
       });
       const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
       return { status: res.status, body: json, requestId: json.request_id as string | undefined, failure: classify(res.status) };
@@ -69,6 +71,7 @@ export class MemoryClient {
     }
   }
 
+  /** 启动握手（doc6/06 §1）：读取 capabilities 数组。 */
   version(): Promise<ApiResult> {
     return this.get("/v1/version", this.cfg.writeTimeoutMs);
   }
@@ -83,6 +86,16 @@ export class MemoryClient {
 
   compose(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
     return this.post("/v1/context/compose", request, this.cfg.composeTimeoutMs, signal);
+  }
+
+  /** GET /v1/soul（doc6/06 §2）：当前 agent 的用户编辑人格；不存在返回 version 0。 */
+  soul(agentId: string, signal?: AbortSignal): Promise<ApiResult> {
+    return this.get(`/v1/soul?agent_id=${encodeURIComponent(agentId)}`, this.cfg.soulTimeoutMs, signal);
+  }
+
+  /** POST /v1/context/bundle（doc6/06 §2）：resident + retrieved 分段与诊断。 */
+  contextBundle(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post("/v1/context/bundle", request, this.cfg.bundleTimeoutMs, signal);
   }
 
   search(request: Record<string, unknown>): Promise<ApiResult> {
