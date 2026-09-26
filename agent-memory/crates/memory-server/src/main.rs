@@ -11,7 +11,7 @@ use axum::extract::{Json, Path as AxumPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Extension;
 use axum::Router;
 use clap::{Parser, Subcommand};
@@ -68,6 +68,16 @@ enum Commands {
     Candidates {
         #[command(subcommand)]
         action: CandidatesAction,
+    },
+    /// Soul（用户编辑人格）管理（doc6/03 §1、doc6/06 §2；本机可信 CLI）
+    Soul {
+        #[command(subcommand)]
+        action: SoulAction,
+    },
+    /// Resident 固定记忆管理（doc6/03 §5、doc6/06 §2；本机可信 CLI）
+    Resident {
+        #[command(subcommand)]
+        action: ResidentAction,
     },
     /// 只读诊断：迁移、principals、索引状态（不修复数据）
     Doctor {
@@ -134,6 +144,84 @@ enum CandidatesAction {
         user: String,
         #[arg(long)]
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SoulAction {
+    /// 显示当前 Soul（版本/时间/正文）
+    Show {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] agent: String,
+    },
+    /// 导入 soul.md（CAS；expected-version 必填，初次创建用 0；doc6/03 §1）
+    Import {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] agent: String,
+        #[arg(long)] file: PathBuf,
+        #[arg(long)] expected_version: i64,
+    },
+    /// 导出当前正文到文件（临时文件 + 原子替换；版本写 <out>.version sidecar）
+    Export {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] agent: String,
+        #[arg(long)] out: PathBuf,
+    },
+    /// 列出历史版本元数据（正文用 show/HTTP 单独读取）
+    History {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] agent: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResidentAction {
+    /// 固定一条记忆（显式 position 即重排；doc6/02 §2）
+    Pin {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] memory_id: String,
+        #[arg(long)] position: Option<i64>,
+        #[arg(long)] expected_pin_version: Option<i64>,
+    },
+    /// 解除固定（行保留，enabled=0）
+    Unpin {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] memory_id: String,
+        #[arg(long)] expected_pin_version: Option<i64>,
+    },
+    /// 重排到目标下标（越界钳制到末尾）
+    Move {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] memory_id: String,
+        #[arg(long)] position: i64,
+        #[arg(long)] expected_pin_version: Option<i64>,
+    },
+    /// 列出 enabled pin 与当前可见性/原因（doc6/03 §5）
+    List {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+    },
+    /// 导出 pinned 清单 Markdown（D6-2 视图：仅 pinned 区；预算/召回归 D6-3 bundle）
+    Export {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] out: PathBuf,
     },
 }
 
@@ -272,6 +360,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/context/compose", post(compose_context))
+                .route("/v1/soul", get(get_soul).put(put_soul))
+                .route("/v1/soul/revisions", get(list_soul_revisions))
+                .route("/v1/resident/pins", post(post_resident_pin))
+                .route("/v1/resident/pins/{memory_id}", delete(delete_resident_pin))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
@@ -376,6 +468,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
         },
+        Commands::Soul { action } => {
+            run_soul_action(action)?;
+            Ok(())
+        }
+        Commands::Resident { action } => {
+            run_resident_action(action)?;
+            Ok(())
+        }
         Commands::Principal { action } => match action {
             PrincipalAction::Add { tenant, user, token_out, db, migrations } => {
                 let mut store = Store::open(&db, &migrations)?;
@@ -412,6 +512,248 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
             store.backup_to(&out)?;
             println!("备份完成：{}", out.display());
+            Ok(())
+        }
+    }
+}
+
+// ---- D6-2：soul/resident 本机 CLI（doc6/03 §1/§5）----
+
+/// CLI 打开数据库的统一入口：先警告 Store::open 会自动应用未执行迁移（doc6/03 §5）。
+fn open_store_warned(db_path: &Path, migrations_dir: &Path) -> Result<Store, String> {
+    eprintln!(
+        "[memoryd] 注意：打开 {} 会自动应用未执行的迁移（当前二进制 schema {}）；旧版本二进制会被 checksum 拒绝",
+        db_path.display(),
+        SCHEMA_VERSION
+    );
+    Store::open(db_path, migrations_dir).map_err(|e| e.to_string())
+}
+
+/// 导出文件原子替换（doc6/02 §8.6）：同目录临时文件 + write_all + sync_all + rename。
+fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        f.write_all(content.as_bytes()).map_err(|e| format!("写入临时文件失败: {e}"))?;
+        f.sync_all().map_err(|e| format!("刷盘失败: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("原子替换失败: {e}"))
+}
+
+/// Markdown 单行化：折叠换行，避免用户正文破坏导出文件结构（doc6/03 §2）。
+fn md_single_line(text: &str) -> String {
+    text.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+fn run_soul_action(action: SoulAction) -> Result<(), String> {
+    match action {
+        SoulAction::Show { config, tenant, user, agent } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            match store.get_soul(&scope, &agent).map_err(|e| e.to_string())? {
+                None => Err(format!("agent {agent} 在当前 scope 无 Soul（version 0）")),
+                Some(p) => {
+                    println!("agent_id: {}", p.agent_id);
+                    println!("version: {}", p.version);
+                    println!("updated_at: {}", p.updated_at);
+                    println!("body_sha256: {}", p.body_sha256);
+                    println!("---");
+                    println!("{}", p.body_md);
+                    Ok(())
+                }
+            }
+        }
+        SoulAction::Import { config, tenant, user, agent, file, expected_version } => {
+            let cfg = Config::load(&config)?;
+            if expected_version < 0 {
+                return Err("expected-version 不能为负；初次创建用 0".into());
+            }
+            let body = std::fs::read_to_string(&file).map_err(|e| format!("读取 {} 失败: {e}", file.display()))?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let report = store
+                .upsert_soul(&scope, &agent, &body, expected_version, "user_cli", None, None)
+                .map_err(|e| match e {
+                    StoreError::VersionConflict => {
+                        "版本冲突（VERSION_CONFLICT）：expected-version 与当前不符；用 soul show 查看当前版本".into()
+                    }
+                    StoreError::SoulBodyTooLong => "正文超过 2000 个 Unicode 标量字符，拒绝导入".into(),
+                    StoreError::InvalidAgentId => "agent ID 须为 1—256 字符".into(),
+                    other => other.to_string(),
+                })?;
+            let version = match report.outcome {
+                memory_store_sqlite::soul::SoulUpsertOutcome::Created { version } => {
+                    println!("已创建 Soul version={version}");
+                    version
+                }
+                memory_store_sqlite::soul::SoulUpsertOutcome::Updated { version } => {
+                    println!("已更新 Soul version={version}");
+                    version
+                }
+                memory_store_sqlite::soul::SoulUpsertOutcome::Unchanged { version } => {
+                    println!("内容与 version={version} 相同，幂等未变更");
+                    version
+                }
+            };
+            if !report.audit_recorded {
+                eprintln!("[memoryd] 告警：memory_audit 写入失败（业务修改已提交）；请检查数据库");
+            }
+            let profile = store.get_soul(&scope, &agent).map_err(|e| e.to_string())?;
+            println!("body_sha256: {}", profile.map(|p| p.body_sha256).unwrap_or_default());
+            let _ = version;
+            Ok(())
+        }
+        SoulAction::Export { config, tenant, user, agent, out } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let profile = store
+                .get_soul(&scope, &agent)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("agent {agent} 在当前 scope 无 Soul，无可导出正文"))?;
+            atomic_write_file(&out, &profile.body_md)?;
+            let sidecar = out.with_extension("version");
+            atomic_write_file(&sidecar, &format!("{}\n", profile.version))?;
+            println!(
+                "已导出 Soul version={} 到 {}（版本 sidecar：{}）",
+                profile.version,
+                out.display(),
+                sidecar.display()
+            );
+            Ok(())
+        }
+        SoulAction::History { config, tenant, user, agent } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let revisions = store.list_soul_revisions(&scope, &agent).map_err(|e| e.to_string())?;
+            if revisions.is_empty() {
+                println!("（无历史版本）");
+                return Ok(());
+            }
+            println!("{:<10} {:<20} {:<12} {}", "version", "body_sha256", "actor", "changed_at");
+            for r in revisions {
+                println!("{:<10} {:<20} {:<12} {}", r.version, &r.body_sha256[..20.min(r.body_sha256.len())], r.actor_kind, r.changed_at);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_resident_action(action: ResidentAction) -> Result<(), String> {
+    match action {
+        ResidentAction::Pin { config, tenant, user, memory_id, position, expected_pin_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            match store.resident_pin(&scope, &memory_id, position, expected_pin_version, None) {
+                Ok(memory_store_sqlite::resident::PinOutcome::Pinned { version, position }) => {
+                    println!("已固定 {memory_id}：pin_version={version} position={position}");
+                    Ok(())
+                }
+                Ok(memory_store_sqlite::resident::PinOutcome::Unchanged { version, position }) => {
+                    println!("{memory_id} 已固定（幂等）：pin_version={version} position={position}");
+                    Ok(())
+                }
+                Err(StoreError::MemoryNotFound) => {
+                    Err("记忆不存在或不属于当前 scope（404 语义），未变更".into())
+                }
+                Err(StoreError::VersionConflict) => {
+                    Err("pin 版本冲突（409）：expected-pin-version 与当前不符；用 resident list 查看".into())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        ResidentAction::Unpin { config, tenant, user, memory_id, expected_pin_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            match store.resident_unpin(&scope, &memory_id, expected_pin_version, None) {
+                Ok(o) => {
+                    if o.already_disabled {
+                        println!("{memory_id} 已处于解除状态（幂等）：pin_version={}", o.version);
+                    } else {
+                        println!("已解除固定 {memory_id}：pin_version={}", o.version);
+                    }
+                    Ok(())
+                }
+                Err(StoreError::MemoryNotFound) => Err("记忆不存在或不属于当前 scope（404 语义），未变更".into()),
+                Err(StoreError::VersionConflict) => Err("pin 版本冲突（409）：expected-pin-version 与当前不符".into()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        ResidentAction::Move { config, tenant, user, memory_id, position, expected_pin_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            match store.resident_move(&scope, &memory_id, position, expected_pin_version) {
+                Ok(version) => {
+                    println!("已重排 {memory_id} 到 position={position}：pin_version={version}");
+                    Ok(())
+                }
+                Err(StoreError::MemoryNotFound) => Err("pin 行/记忆不存在或不属于当前 scope（404 语义）".into()),
+                Err(StoreError::VersionConflict) => Err("pin 版本冲突（409）".into()),
+                Err(StoreError::StateConflict) => Err("disabled 行不可重排；先重新 pin".into()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        ResidentAction::List { config, tenant, user } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
+            let rows = store.resident_pins_with_status(&scope, &now).map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("（无 enabled pin）");
+                return Ok(());
+            }
+            println!("{:<40} {:<6} {:<8} {:<14} {:<20} {}", "memory_id", "pos", "pin_ver", "status", "visible", "reason");
+            for r in rows {
+                println!(
+                    "{:<40} {:<6} {:<8} {:<14} {:<20} {}",
+                    r.memory_id,
+                    r.position,
+                    r.version,
+                    r.memory_status,
+                    r.visible,
+                    r.reason
+                );
+            }
+            Ok(())
+        }
+        ResidentAction::Export { config, tenant, user, out } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
+            let rows = store.resident_pins_with_status(&scope, &now).map_err(|e| e.to_string())?;
+            let mut md = String::from("# 长期记忆（resident pinned 视图）\n\n");
+            md.push_str(&format!(
+                "生成时间: {now}；本文件为只读快照，编辑入口是 pin/unpin 与 remember/correct/forget（doc6/03 §2）。\n\n"
+            ));
+            if rows.is_empty() {
+                md.push_str("（无固定项）\n");
+            }
+            let rows_len = rows.len();
+            for r in rows {
+                let claim = store
+                    .get_memory_claim(&scope, &r.memory_id)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_else(|| "（正文不可读）".into());
+                let visibility = if r.visible { "可见".into() } else { format!("不可见（{}）", r.reason) };
+                md.push_str(&format!(
+                    "- [memory: {}] {}\n  状态: {}；选择: pinned；位置: {}；{}\n",
+                    r.memory_id,
+                    md_single_line(&claim),
+                    r.memory_status,
+                    r.position,
+                    visibility
+                ));
+            }
+            atomic_write_file(&out, &md)?;
+            println!("已导出 {} 条 pinned 项到 {}", rows_len, out.display());
             Ok(())
         }
     }
@@ -912,6 +1254,468 @@ fn job_json(req_id: &str, j: &memory_store_sqlite::JobDetail) -> serde_json::Val
         "created_at": i.created_at,
         "updated_at": i.updated_at
     })
+}
+
+// ---- D6-2：GET/PUT /v1/soul、GET /v1/soul/revisions、resident pins（doc6/06 §2）----
+
+fn validate_agent_id(agent_id: &str) -> Result<(), &'static str> {
+    if agent_id.is_empty() {
+        return Err("agent_id 不能为空");
+    }
+    if agent_id.chars().count() > memory_store_sqlite::soul::SOUL_AGENT_ID_MAX_CHARS {
+        return Err("agent_id 超过 256 字符");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoulQuery {
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoulImportRequest {
+    agent_id: String,
+    body_md: String,
+    expected_version: i64,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoulRevisionsQuery {
+    agent_id: String,
+    limit: Option<usize>,
+    /// 翻页：返回 version 大于该值的条目（升序）；cursor 即上一页最后的 version。
+    after_version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinRequest {
+    memory_id: String,
+    position: Option<i64>,
+    expected_pin_version: Option<i64>,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnpinBody {
+    expected_pin_version: Option<i64>,
+}
+
+/// 重放响应：以存储的最小结果 JSON 为基底，补回请求关联字段；重放一律 200。
+fn replay_response(
+    req_id: &str,
+    key_field: (&str, &str),
+    stored: &memory_store_sqlite::soul::MutationReceipt,
+) -> Response {
+    let mut body: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&stored.response_json).unwrap_or_default();
+    body.insert("request_id".into(), serde_json::json!(req_id));
+    body.insert(key_field.0.into(), serde_json::json!(key_field.1));
+    Json(serde_json::Value::Object(body)).into_response()
+}
+
+async fn get_soul(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<SoulQuery>,
+) -> Response {
+    if let Err(msg) = validate_agent_id(&query.agent_id) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg);
+    }
+    let guard = state.store.lock().unwrap();
+    match guard.get_soul(&scope, &query.agent_id) {
+        Ok(Some(p)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "agent_id": p.agent_id,
+            "version": p.version,
+            "body_md": p.body_md,
+            "sha256": p.body_sha256,
+        }))
+        .into_response(),
+        // 不存在：version 0 / 空正文（doc6/06 §2），不报错。
+        Ok(None) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "agent_id": query.agent_id,
+            "version": 0,
+            "body_md": "",
+            "sha256": "",
+        }))
+        .into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn put_soul(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<SoulImportRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    if let Err(msg) = validate_agent_id(&req.agent_id) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg);
+    }
+    if req.expected_version < 0 {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "expected_version 不能为负");
+    }
+    // 规范化请求哈希（doc6/06 §2）：固定字段顺序；同键异请求 409 IDEMPOTENCY_CONFLICT。
+    let hash = memory_store_sqlite::soul::receipt_hash(&[
+        &req.agent_id,
+        &req.body_md,
+        &req.expected_version.to_string(),
+    ]);
+    {
+        let guard = state.store.lock().unwrap();
+        match guard.fetch_mutation_receipt(&scope, "soul_import", &req.idempotency_key) {
+            Ok(Some(receipt)) => {
+                if receipt.request_sha256 != hash {
+                    return err(
+                        &req_id.0,
+                        StatusCode::CONFLICT,
+                        ErrorCode::IdempotencyConflict,
+                        "同一幂等键曾以不同请求体使用",
+                    );
+                }
+                return replay_response(&req_id.0, ("agent_id", &req.agent_id), &receipt);
+            }
+            Ok(None) => {}
+            Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+        }
+    }
+    let result = {
+        let mut guard = state.store.lock().unwrap();
+        guard.upsert_soul(
+            &scope,
+            &req.agent_id,
+            &req.body_md,
+            req.expected_version,
+            "user_api",
+            Some(&req_id.0),
+            Some((&req.idempotency_key, &hash)),
+        )
+    };
+    match result {
+        Ok(report) => {
+            if !report.audit_recorded {
+                // doc6/14 §4：审计失败非阻塞且显式告警（业务修改已提交）。
+                eprintln!("[memoryd] 告警：memory_audit 写入失败（soul_import request={}）；业务修改已提交", req_id.0);
+            }
+            let (status_text, code) = match &report.outcome {
+                memory_store_sqlite::soul::SoulUpsertOutcome::Created { .. } => ("created", StatusCode::CREATED),
+                memory_store_sqlite::soul::SoulUpsertOutcome::Updated { .. } => ("updated", StatusCode::OK),
+                memory_store_sqlite::soul::SoulUpsertOutcome::Unchanged { .. } => ("unchanged", StatusCode::OK),
+            };
+            let version = match &report.outcome {
+                memory_store_sqlite::soul::SoulUpsertOutcome::Created { version }
+                | memory_store_sqlite::soul::SoulUpsertOutcome::Updated { version }
+                | memory_store_sqlite::soul::SoulUpsertOutcome::Unchanged { version } => *version,
+            };
+            let sha = {
+                let guard = state.store.lock().unwrap();
+                guard
+                    .get_soul(&scope, &req.agent_id)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.body_sha256)
+                    .unwrap_or_default()
+            };
+            (
+                code,
+                Json(serde_json::json!({
+                    "request_id": req_id.0,
+                    "agent_id": req.agent_id,
+                    "version": version,
+                    "status": status_text,
+                    "sha256": sha,
+                    "audit_recorded": report.audit_recorded,
+                })),
+            )
+                .into_response()
+        }
+        Err(StoreError::VersionConflict) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::VersionConflict,
+            "expected_version 与当前 Soul 版本不符",
+        ),
+        Err(StoreError::SoulBodyTooLong) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "body_md 超过 2000 个 Unicode 标量字符，拒绝导入",
+        ),
+        Err(StoreError::InvalidAgentId) => {
+            err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "agent_id 须为 1—256 字符")
+        }
+        Err(StoreError::InvalidIdempotencyKey) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "idempotency_key 须为 1—128 个 ASCII [A-Za-z0-9._-]",
+        ),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn list_soul_revisions(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<SoulRevisionsQuery>,
+) -> Response {
+    if let Err(msg) = validate_agent_id(&query.agent_id) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg);
+    }
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=200).contains(&limit) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "limit 必须 1～200");
+    }
+    let guard = state.store.lock().unwrap();
+    match guard.list_soul_revisions(&scope, &query.agent_id) {
+        Ok(all) => {
+            let page: Vec<_> = all
+                .into_iter()
+                .filter(|r| query.after_version.map(|after| r.version > after).unwrap_or(true))
+                .take(limit)
+                .collect();
+            let next_cursor =
+                if page.len() == limit { page.last().map(|r| r.version.to_string()) } else { None };
+            let items: Vec<serde_json::Value> = page
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "version": r.version,
+                        "body_sha256": r.body_sha256,
+                        "actor_kind": r.actor_kind,
+                        "changed_at": r.changed_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "agent_id": query.agent_id,
+                "revisions": items,
+                "next_cursor": next_cursor,
+            }))
+            .into_response()
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn post_resident_pin(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<PinRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    if req.memory_id.is_empty() {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "memory_id 不能为空");
+    }
+    // 规范化哈希：None 用空串占位，字段集固定（doc6/06 §2）。
+    let hash = memory_store_sqlite::soul::receipt_hash(&[
+        &req.memory_id,
+        &req.position.map(|p| p.to_string()).unwrap_or_default(),
+        &req.expected_pin_version.map(|v| v.to_string()).unwrap_or_default(),
+    ]);
+    {
+        let guard = state.store.lock().unwrap();
+        match guard.fetch_mutation_receipt(&scope, "resident_pin", &req.idempotency_key) {
+            Ok(Some(receipt)) => {
+                if receipt.request_sha256 != hash {
+                    return err(
+                        &req_id.0,
+                        StatusCode::CONFLICT,
+                        ErrorCode::IdempotencyConflict,
+                        "同一幂等键曾以不同请求体使用",
+                    );
+                }
+                return replay_response(&req_id.0, ("memory_id", &req.memory_id), &receipt);
+            }
+            Ok(None) => {}
+            Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+        }
+    }
+    let result = {
+        let mut guard = state.store.lock().unwrap();
+        guard.resident_pin(
+            &scope,
+            &req.memory_id,
+            req.position,
+            req.expected_pin_version,
+            Some((&req.idempotency_key, &hash)),
+        )
+    };
+    match result {
+        Ok(outcome) => {
+            let (code, status_text, pin_version, position) = match &outcome {
+                memory_store_sqlite::resident::PinOutcome::Pinned { version, position } => {
+                    // 新建（v1）201；重激活/重排 200。
+                    let code = if *version == 1 { StatusCode::CREATED } else { StatusCode::OK };
+                    (code, "pinned", *version, *position)
+                }
+                memory_store_sqlite::resident::PinOutcome::Unchanged { version, position } => {
+                    (StatusCode::OK, "unchanged", *version, *position)
+                }
+            };
+            (
+                code,
+                Json(serde_json::json!({
+                    "request_id": req_id.0,
+                    "memory_id": req.memory_id,
+                    "status": status_text,
+                    "pin_version": pin_version,
+                    "position": position,
+                })),
+            )
+                .into_response()
+        }
+        Err(StoreError::MemoryNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "记忆不存在或不属于当前 scope",
+        ),
+        Err(StoreError::VersionConflict) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::VersionConflict,
+            "expected_pin_version 与当前不符",
+        ),
+        Err(StoreError::StateConflict) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "position 非法",
+        ),
+        Err(StoreError::InvalidIdempotencyKey) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "idempotency_key 须为 1—128 个 ASCII [A-Za-z0-9._-]",
+        ),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn delete_resident_pin(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(memory_id): AxumPath<String>,
+    headers: axum::http::HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Response {
+    // Idempotency-Key 请求头必填（doc6/06 §2）；规范化请求哈希含路径 ID 与可选正文。
+    let idem_key = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let Some(idem_key) = idem_key else {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "缺少 Idempotency-Key 请求头",
+        );
+    };
+    let expected_pin_version: Option<i64> = if bytes.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<UnpinBody>(&bytes) {
+            Ok(b) => b.expected_pin_version,
+            Err(_) => {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "请求正文不是合法的 {expected_pin_version}",
+                )
+            }
+        }
+    };
+    let hash = memory_store_sqlite::soul::receipt_hash(&[
+        &memory_id,
+        &expected_pin_version.map(|v| v.to_string()).unwrap_or_default(),
+    ]);
+    {
+        let guard = state.store.lock().unwrap();
+        match guard.fetch_mutation_receipt(&scope, "resident_unpin", idem_key) {
+            Ok(Some(receipt)) => {
+                if receipt.request_sha256 != hash {
+                    return err(
+                        &req_id.0,
+                        StatusCode::CONFLICT,
+                        ErrorCode::IdempotencyConflict,
+                        "同一幂等键曾以不同请求体使用",
+                    );
+                }
+                return replay_response(&req_id.0, ("memory_id", &memory_id), &receipt);
+            }
+            Ok(None) => {}
+            Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+        }
+    }
+    let result = {
+        let mut guard = state.store.lock().unwrap();
+        guard.resident_unpin(&scope, &memory_id, expected_pin_version, Some((idem_key, &hash)))
+    };
+    match result {
+        Ok(outcome) => {
+            let (status_text, pin_version) = if outcome.already_disabled {
+                ("already_disabled", outcome.version)
+            } else {
+                ("unpinned", outcome.version)
+            };
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "memory_id": memory_id,
+                "status": status_text,
+                "pin_version": pin_version,
+            }))
+            .into_response()
+        }
+        Err(StoreError::MemoryNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "记忆不存在或不属于当前 scope",
+        ),
+        Err(StoreError::VersionConflict) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::VersionConflict,
+            "expected_pin_version 与当前不符",
+        ),
+        Err(StoreError::InvalidIdempotencyKey) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "Idempotency-Key 须为 1—128 个 ASCII [A-Za-z0-9._-]",
+        ),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
 }
 
 /// GET /v1/jobs（doc4/04 §1）：scope 内分页作业列表，默认 dead，不返回正文。

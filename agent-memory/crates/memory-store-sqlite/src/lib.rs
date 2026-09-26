@@ -105,6 +105,11 @@ pub(crate) fn now_rfc3339() -> Result<String, StoreError> {
     Ok(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
+/// 面向 server/CLI 的当前 UTC RFC3339 时间（诊断展示与读路径 `now` 参数）。
+pub fn now_rfc3339_pub() -> Result<String, StoreError> {
+    now_rfc3339()
+}
+
 /// 迁移描述：版本号来自文件名前缀，sha256 为文件内容哈希。
 struct Migration {
     version: u32,

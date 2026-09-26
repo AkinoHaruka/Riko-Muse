@@ -84,6 +84,8 @@ pub enum ErrorCode {
     VersionConflict,
     StateConflict,
     AmbiguousTarget,
+    /// 同一幂等键曾以不同请求体使用（doc6/02 §2；409）
+    IdempotencyConflict,
     ModelUnavailable,
     IndexDegraded,
     RateLimited,
@@ -105,6 +107,7 @@ impl ErrorCode {
             ErrorCode::VersionConflict => "VERSION_CONFLICT",
             ErrorCode::StateConflict => "STATE_CONFLICT",
             ErrorCode::AmbiguousTarget => "AMBIGUOUS_TARGET",
+            ErrorCode::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
             ErrorCode::ModelUnavailable => "MODEL_UNAVAILABLE",
             ErrorCode::IndexDegraded => "INDEX_DEGRADED",
             ErrorCode::RateLimited => "RATE_LIMITED",

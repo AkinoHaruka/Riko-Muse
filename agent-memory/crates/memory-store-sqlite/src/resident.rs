@@ -2,20 +2,21 @@
 //!
 //! pin/unpin 是选择配置，不改 L1 状态；unpin 不删行（enabled=0 且 version+1），
 //! 重新 pin 沿原行增 version（doc6/02 §2）。位置写入统一走「临时偏移 → 归一化
-//! 0..n-1」路径（doc6/02 §2：若唯一检查妨碍交换，先临时偏移，不能半更新）。
-//! D6-1 只提供存储与可见性初核（active + 有效期）；resident 选择算法与预算在
-//! D6-3 扩展。
+//! 0..n-1」路径（doc6/02 §2：若唯一检查妨碍交换，先临时偏移，不能半更新），
+//! 且每个变更操作整体包在一个 SQLite 事务内（doc6/02 §8.5 重排原子性）。
+//! 回执（receipt）与业务修改同事务提交（doc6/02 §2）。D6-1/D6-2 提供存储与
+//! 可见性初核；resident 选择算法、预算与 suggestions 在 D6-3。
 
 use memory_domain::ScopeKey;
 use rusqlite::{params, OptionalExtension};
 
 use crate::{now_rfc3339, Store, StoreError};
 
-/// 临时偏移量：位置写入期间先把 enabled 行搬出正常区间 [0, REORDER_OFFSET)，
+/// 偏移带起点：位置写入期间先把 enabled 行搬出正常区间 [0, REORDER_OFFSET)，
 /// 规避 enabled position 部分唯一索引的中间态冲突。
 const REORDER_OFFSET: i64 = 2_000_000;
-/// 新 INSERT 行的带外临时位置：位于正常带与偏移带之间，独立于两者，
-/// 归一化前短暂存在（同一连接串行执行，不会有两个行同时处于该位置）。
+/// 新增/重激活行的带外临时位置：位于正常带与偏移带之间，独立于两者，
+/// 归一化前短暂存在（同一连接串行执行，不会有两行同时处于该位置）。
 const INSERT_TEMP_POSITION: i64 = 1_000_000;
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,18 @@ pub struct UnpinOutcome {
     pub already_disabled: bool,
 }
 
+/// CLI 列表行（doc6/03 §5：ID、顺序、当前可用/省略原因）。
+#[derive(Debug, Clone)]
+pub struct ResidentPinStatusRow {
+    pub memory_id: String,
+    pub position: i64,
+    pub version: i64,
+    pub memory_status: String,
+    pub visible: bool,
+    /// 不可见原因：STATUS_FORGOTTEN / STATUS_SUPERSEDED / STATUS_EXPIRED；可见为空。
+    pub reason: &'static str,
+}
+
 /// 可见 pin（doc6/03 §4 初核）：active、未过期；retired 覆盖过滤随 0010
 /// （D6-9）加入，预算与选择算法归 D6-3。
 #[derive(Debug, Clone)]
@@ -55,13 +68,15 @@ pub struct VisiblePin {
 impl Store {
     /// 固定一条记忆。跨 scope/不存在的 memory 一律 MemoryNotFound（不泄露存在性）。
     /// expected_pin_version 提供 CAS；position 为目标下标（越界钳制到末尾），
-    /// 其余 enabled 行保持相对顺序。
+    /// 其余 enabled 行保持相对顺序。`receipt` 提供时与变更同事务提交
+    /// （operation="resident_pin"）。
     pub fn resident_pin(
         &mut self,
         scope: &ScopeKey,
         memory_id: &str,
         position: Option<i64>,
         expected_pin_version: Option<i64>,
+        receipt: Option<(&str, &str)>,
     ) -> Result<PinOutcome, StoreError> {
         if matches!(position, Some(p) if p < 0) {
             // position >= 0 由 SQL CHECK 兜底；负数在入口给确定性错误。
@@ -95,14 +110,27 @@ impl Store {
                 if expected_pin_version.is_some() {
                     return Err(StoreError::VersionConflict);
                 }
+                let tx = self.conn_mut().transaction()?;
                 // 先以带外临时位置落行（独立于正常带与偏移带），再归一化。
-                self.conn_mut().execute(
+                tx.execute(
                     "INSERT INTO resident_pins
                        (tenant_id, user_id, memory_id, enabled, position, pinned_at, version)
                      VALUES (?1, ?2, ?3, 1, ?4, ?5, 1)",
                     params![scope.tenant_id, scope.user_id, memory_id, INSERT_TEMP_POSITION, now],
                 )?;
-                self.reposition_pin(scope, memory_id, position)?;
+                reposition_in_tx(&tx, scope, memory_id, position)?;
+                if let Some((key, hash)) = receipt {
+                    crate::soul::insert_receipt_tx(
+                        &tx,
+                        scope,
+                        "resident_pin",
+                        key,
+                        hash,
+                        "pinned",
+                        r#"{"status":"pinned","pin_version":1}"#,
+                    )?;
+                }
+                tx.commit()?;
                 let pos = self.pin_position_of(scope, memory_id)?.unwrap_or_default();
                 Ok(PinOutcome::Pinned { version: 1, position: pos })
             }
@@ -119,23 +147,36 @@ impl Store {
                     });
                 }
                 let new_version = current_version + 1;
+                let tx = self.conn_mut().transaction()?;
                 if enabled {
                     // 已 enabled：仅重排（版本 +1）。
-                    self.reposition_pin(scope, memory_id, position)?;
+                    reposition_in_tx(&tx, scope, memory_id, position)?;
                 } else {
                     // 重新激活沿原行增版本；先带外入列再归一化，避免占用冲突位置。
-                    self.conn_mut().execute(
+                    tx.execute(
                         "UPDATE resident_pins SET enabled=1, position=?4
                          WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
                         params![scope.tenant_id, scope.user_id, memory_id, INSERT_TEMP_POSITION],
                     )?;
-                    self.reposition_pin(scope, memory_id, position)?;
+                    reposition_in_tx(&tx, scope, memory_id, position)?;
                 }
-                self.conn_mut().execute(
+                tx.execute(
                     "UPDATE resident_pins SET version=?4, pinned_at=?5
                      WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
                     params![scope.tenant_id, scope.user_id, memory_id, new_version, now],
                 )?;
+                if let Some((key, hash)) = receipt {
+                    crate::soul::insert_receipt_tx(
+                        &tx,
+                        scope,
+                        "resident_pin",
+                        key,
+                        hash,
+                        "pinned",
+                        &format!(r#"{{"status":"pinned","pin_version":{new_version}}}"#),
+                    )?;
+                }
+                tx.commit()?;
                 let pos = self.pin_position_of(scope, memory_id)?.unwrap_or_default();
                 Ok(PinOutcome::Pinned { version: new_version, position: pos })
             }
@@ -144,11 +185,13 @@ impl Store {
 
     /// 解除固定：置 enabled=0 并增版本；行不存在或已 disabled 返回幂等结果。
     /// 无 pin 行且记忆 ID 不属于当前 scope 时返回 MemoryNotFound（doc6/06 §2 404）。
+    /// `receipt` 提供时与变更同事务提交（operation="resident_unpin"）。
     pub fn resident_unpin(
         &mut self,
         scope: &ScopeKey,
         memory_id: &str,
         expected_pin_version: Option<i64>,
+        receipt: Option<(&str, &str)>,
     ) -> Result<UnpinOutcome, StoreError> {
         let row: Option<(bool, i64)> = self
             .conn()
@@ -174,10 +217,31 @@ impl Store {
                 if !exists {
                     return Err(StoreError::MemoryNotFound);
                 }
+                // 无 pin 行：幂等已解除（同 scope 记忆）；HTTP 层可记回执。
+                if let Some((key, hash)) = receipt {
+                    self.save_mutation_receipt(
+                        scope,
+                        "resident_unpin",
+                        key,
+                        hash,
+                        "already_disabled",
+                        r#"{"status":"already_disabled","pin_version":0}"#,
+                    )?;
+                }
                 return Ok(UnpinOutcome { version: 0, already_disabled: true });
             }
         };
         if !enabled {
+            if let Some((key, hash)) = receipt {
+                self.save_mutation_receipt(
+                    scope,
+                    "resident_unpin",
+                    key,
+                    hash,
+                    "already_disabled",
+                    &format!(r#"{{"status":"already_disabled","pin_version":{version}}}"#),
+                )?;
+            }
             return Ok(UnpinOutcome { version, already_disabled: true });
         }
         if let Some(expected) = expected_pin_version {
@@ -185,16 +249,29 @@ impl Store {
                 return Err(StoreError::VersionConflict);
             }
         }
-        self.conn_mut().execute(
+        let tx = self.conn_mut().transaction()?;
+        tx.execute(
             "UPDATE resident_pins SET enabled=0, version=?4
              WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             params![scope.tenant_id, scope.user_id, memory_id, version + 1],
         )?;
+        if let Some((key, hash)) = receipt {
+            crate::soul::insert_receipt_tx(
+                &tx,
+                scope,
+                "resident_unpin",
+                key,
+                hash,
+                "unpinned",
+                &format!(r#"{{"status":"unpinned","pin_version":{}}}"#, version + 1),
+            )?;
+        }
+        tx.commit()?;
         Ok(UnpinOutcome { version: version + 1, already_disabled: false })
     }
 
     /// 重排：把一条 enabled pin 移到新下标（越界钳制到末尾），其余 enabled 行
-    /// 保持相对顺序；成功后位置归一化为 0..n-1。目标行版本由调用方负责 +1。
+    /// 保持相对顺序；reposition 与版本更新在同一事务内（doc6/02 §8.5）。
     pub fn resident_move(
         &mut self,
         scope: &ScopeKey,
@@ -223,12 +300,14 @@ impl Store {
                 return Err(StoreError::VersionConflict);
             }
         }
-        self.reposition_pin(scope, memory_id, Some(new_position))?;
-        self.conn_mut().execute(
+        let tx = self.conn_mut().transaction()?;
+        reposition_in_tx(&tx, scope, memory_id, Some(new_position))?;
+        tx.execute(
             "UPDATE resident_pins SET version=?4
              WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             params![scope.tenant_id, scope.user_id, memory_id, version + 1],
         )?;
+        tx.commit()?;
         Ok(version + 1)
     }
 
@@ -244,6 +323,45 @@ impl Store {
                 position: r.get(1)?,
                 pinned_at: r.get(2)?,
                 version: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// CLI 列表：enabled pin + 当前可见性与原因（doc6/03 §5）。
+    /// 预算省略（ITEM_LIMIT/CHAR_LIMIT）与 conflict_ids 归 D6-3 选择函数。
+    pub fn resident_pins_with_status(
+        &self,
+        scope: &ScopeKey,
+        now: &str,
+    ) -> Result<Vec<ResidentPinStatusRow>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT p.memory_id, p.position, p.version, m.status,
+                    (m.status='active' AND (m.valid_until IS NULL OR m.valid_until > ?3))
+             FROM resident_pins p JOIN memories m
+               ON m.tenant_id=p.tenant_id AND m.user_id=p.user_id AND m.id=p.memory_id
+             WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.enabled=1
+             ORDER BY p.position, p.memory_id",
+        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
+            let memory_status: String = r.get(3)?;
+            let visible: bool = r.get(4)?;
+            let reason = if visible {
+                ""
+            } else if memory_status == "forgotten" {
+                "STATUS_FORGOTTEN"
+            } else if memory_status == "superseded" {
+                "STATUS_SUPERSEDED"
+            } else {
+                "STATUS_EXPIRED"
+            };
+            Ok(ResidentPinStatusRow {
+                memory_id: r.get(0)?,
+                position: r.get(1)?,
+                version: r.get(2)?,
+                memory_status,
+                visible,
+                reason,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -289,49 +407,49 @@ impl Store {
             .optional()?;
         Ok(pos)
     }
+}
 
-    /// 重排核心：目标移到目标下标（None = 末尾），随后整组归一化 0..n-1。
-    /// 先把全部 enabled 行加临时偏移（彼此仍唯一），再写回最终位置——任何
-    /// 中间态都不触碰部分唯一索引冲突；失败时调用方事务回滚（doc6/02 §2）。
-    fn reposition_pin(
-        &mut self,
-        scope: &ScopeKey,
-        memory_id: &str,
-        desired: Option<i64>,
-    ) -> Result<(), StoreError> {
-        let current: Vec<String> = {
-            let mut stmt = self.conn().prepare(
-                "SELECT memory_id FROM resident_pins
-                 WHERE tenant_id=?1 AND user_id=?2 AND enabled=1 ORDER BY position, memory_id",
-            )?;
-            let rows =
-                stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if !current.iter().any(|id| id == memory_id) {
-            return Err(StoreError::MemoryNotFound);
-        }
-        let mut ordered: Vec<String> =
-            current.iter().filter(|id| id.as_str() != memory_id).cloned().collect();
-        let target_index = match desired {
-            None => ordered.len(),
-            Some(p) => p.clamp(0, ordered.len() as i64) as usize,
-        };
-        ordered.insert(target_index, memory_id.to_string());
-        self.conn_mut().execute(
-            "UPDATE resident_pins SET position = position + ?3
-             WHERE tenant_id=?1 AND user_id=?2 AND enabled=1",
-            params![scope.tenant_id, scope.user_id, REORDER_OFFSET],
+/// 重排核心：目标移到目标下标（None = 末尾），随后整组归一化 0..n-1。
+/// 先把全部 enabled 行加临时偏移（彼此仍唯一），再写回最终位置——任何
+/// 中间态都不触碰部分唯一索引冲突；调用方负责在事务内执行并在失败时回滚。
+fn reposition_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &ScopeKey,
+    memory_id: &str,
+    desired: Option<i64>,
+) -> Result<(), StoreError> {
+    let current: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT memory_id FROM resident_pins
+             WHERE tenant_id=?1 AND user_id=?2 AND enabled=1 ORDER BY position, memory_id",
         )?;
-        for (index, id) in ordered.iter().enumerate() {
-            self.conn_mut().execute(
-                "UPDATE resident_pins SET position=?4
-                 WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
-                params![scope.tenant_id, scope.user_id, id, index as i64],
-            )?;
-        }
-        Ok(())
+        let rows =
+            stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if !current.iter().any(|id| id == memory_id) {
+        return Err(StoreError::MemoryNotFound);
     }
+    let mut ordered: Vec<String> =
+        current.iter().filter(|id| id.as_str() != memory_id).cloned().collect();
+    let target_index = match desired {
+        None => ordered.len(),
+        Some(p) => p.clamp(0, ordered.len() as i64) as usize,
+    };
+    ordered.insert(target_index, memory_id.to_string());
+    tx.execute(
+        "UPDATE resident_pins SET position = position + ?3
+         WHERE tenant_id=?1 AND user_id=?2 AND enabled=1",
+        params![scope.tenant_id, scope.user_id, REORDER_OFFSET],
+    )?;
+    for (index, id) in ordered.iter().enumerate() {
+        tx.execute(
+            "UPDATE resident_pins SET position=?4
+             WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+            params![scope.tenant_id, scope.user_id, id, index as i64],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -373,10 +491,7 @@ mod tests {
             IngestOutcome::Recorded(id) => id,
             IngestOutcome::AlreadyRecorded(id) => id,
         };
-        match store
-            .remember(scope, origin, &ev, claim, MemoryKind::Fact)
-            .unwrap()
-        {
+        match store.remember(scope, origin, &ev, claim, MemoryKind::Fact).unwrap() {
             crate::RememberOutcome::Created { memory_id, .. } => memory_id,
             crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
         }
@@ -387,37 +502,39 @@ mod tests {
         // doc6/02 §2：unpin 不删行、版本递增、重复 unpin 幂等、重 pin 沿原行增版本。
         let (mut store, scope, origin) = setup("flow");
         let m1 = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州");
-        match store.resident_pin(&scope, &m1, None, None).unwrap() {
+        match store.resident_pin(&scope, &m1, None, None, None).unwrap() {
             PinOutcome::Pinned { version: 1, position: 0 } => {}
             other => panic!("首次 pin 应为 v1/pos0：{other:?}"),
         }
         // 重复 pin 同位置：幂等不增版本。
-        match store.resident_pin(&scope, &m1, None, None).unwrap() {
+        match store.resident_pin(&scope, &m1, None, None, None).unwrap() {
             PinOutcome::Unchanged { version: 1, position: 0 } => {}
             other => panic!("重复 pin 应幂等：{other:?}"),
         }
         // CAS 冲突。
         assert!(matches!(
-            store.resident_pin(&scope, &m1, None, Some(99)),
+            store.resident_pin(&scope, &m1, None, Some(99), None),
             Err(StoreError::VersionConflict)
         ));
-        // unpin：版本 2、行保留。
-        let un = store.resident_unpin(&scope, &m1, Some(1)).unwrap();
+        // unpin：版本 2、行保留；回执同事务落行。
+        let un = store.resident_unpin(&scope, &m1, Some(1), Some(("key-unpin", "hash-unpin"))).unwrap();
         assert_eq!(un.version, 2);
         assert!(!un.already_disabled);
+        let receipt = store.fetch_mutation_receipt(&scope, "resident_unpin", "key-unpin").unwrap().unwrap();
+        assert_eq!(receipt.result_status, "unpinned");
         assert_eq!(store.resident_pins(&scope).unwrap().len(), 0, "enabled=0 不出现在 pin 列表");
         // 重复 unpin（带或不带 CAS）：幂等。
-        let un2 = store.resident_unpin(&scope, &m1, Some(2)).unwrap();
+        let un2 = store.resident_unpin(&scope, &m1, Some(2), None).unwrap();
         assert!(un2.already_disabled && un2.version == 2);
         // 重新 pin：沿原行版本 3。
-        match store.resident_pin(&scope, &m1, None, None).unwrap() {
+        match store.resident_pin(&scope, &m1, None, None, None).unwrap() {
             PinOutcome::Pinned { version: 3, position: 0 } => {}
             other => panic!("重 pin 应为 v3：{other:?}"),
         }
         // 首次 pin 不接受 expected_pin_version。
         let m2 = remember_one(&mut store, &scope, &origin, 2, "用户偏好先看结论");
         assert!(matches!(
-            store.resident_pin(&scope, &m2, None, Some(1)),
+            store.resident_pin(&scope, &m2, None, Some(1), None),
             Err(StoreError::VersionConflict)
         ));
     }
@@ -427,29 +544,28 @@ mod tests {
         // doc6/02 §8.7：跨 scope/不存在 ID 一律 MemoryNotFound，不泄露存在性。
         let (mut store, scope, origin) = setup("iso");
         let other_scope = {
-            let dir = std::env::temp_dir().join(format!("am-res-test-{}-iso-u2", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("am-res-test-{}-iso-u2", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
             let token = std::fs::read_to_string(dir.join("u2.token")).unwrap();
             store.verify_token(token.trim()).unwrap().unwrap()
         };
         let m_alice = remember_one(&mut store, &scope, &origin, 1, "Alice 的居住地");
-        // u2 pin Alice 的 memory：404 语义。
         assert!(matches!(
-            store.resident_pin(&other_scope, &m_alice, None, None),
+            store.resident_pin(&other_scope, &m_alice, None, None, None),
             Err(StoreError::MemoryNotFound)
         ));
         assert!(matches!(
-            store.resident_unpin(&other_scope, &m_alice, None),
+            store.resident_unpin(&other_scope, &m_alice, None, None),
             Err(StoreError::MemoryNotFound)
         ));
         assert!(matches!(
             store.resident_move(&other_scope, &m_alice, 0, None),
             Err(StoreError::MemoryNotFound)
         ));
-        // 完全不存在的 ID 同样 404 语义。
         assert!(matches!(
-            store.resident_pin(&scope, "no-such-id", None, None),
+            store.resident_pin(&scope, "no-such-id", None, None, None),
             Err(StoreError::MemoryNotFound)
         ));
     }
@@ -457,13 +573,13 @@ mod tests {
     #[test]
     fn pinned_forgotten_or_expired_memory_not_visible() {
         // doc6/03 §4：forgotten/expired 的 pin 行保留作历史，但不可见。
+        // forget 自身的证据指认语义由 memories.rs 独立测试覆盖，此处直接按
+        // v1 终态置 forgotten（保留 evidence/revision）。
         let (mut store, scope, origin) = setup("visibility");
         let m_keep = remember_one(&mut store, &scope, &origin, 1, "长期有效的事实");
         let m_gone = remember_one(&mut store, &scope, &origin, 2, "将被遗忘的事实");
-        store.resident_pin(&scope, &m_keep, None, None).unwrap();
-        store.resident_pin(&scope, &m_gone, None, None).unwrap();
-        // forget 语义由 memories.rs 独立测试覆盖；此处只验证「pin 行保留、不可见」，
-        // 直接按 v1 契约置 forgotten（保留 evidence/revision）。
+        store.resident_pin(&scope, &m_keep, None, None, None).unwrap();
+        store.resident_pin(&scope, &m_gone, None, None, None).unwrap();
         store
             .conn()
             .execute(
@@ -471,7 +587,6 @@ mod tests {
                 params![scope.tenant_id, scope.user_id, m_gone],
             )
             .unwrap();
-        // 过期 m_keep 的 valid_until 置为过去。
         store
             .conn()
             .execute(
@@ -480,10 +595,13 @@ mod tests {
             )
             .unwrap();
         let now = now_rfc3339().unwrap();
-        let visible = store.resident_visible_pins(&scope, &now).unwrap();
-        assert!(visible.is_empty(), "forgotten 与过期 pin 均不可见：{visible:?}");
-        // pin 行保留作历史。
-        assert_eq!(store.resident_pins(&scope).unwrap().len(), 2);
+        assert!(store.resident_visible_pins(&scope, &now).unwrap().is_empty());
+        // CLI list 给出不可见原因；pin 行保留作历史。
+        let rows = store.resident_pins_with_status(&scope, &now).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| !r.visible));
+        assert!(rows.iter().any(|r| r.reason == "STATUS_FORGOTTEN"));
+        assert!(rows.iter().any(|r| r.reason == "STATUS_EXPIRED"));
         // 恢复有效期后 active pin 重新可见。
         store
             .conn()
@@ -499,23 +617,22 @@ mod tests {
 
     #[test]
     fn reorder_is_atomic_and_unique() {
-        // doc6/02 §2：重排同事务完成，无半更新；enabled position 全程唯一。
+        // doc6/02 §2/§8.5：重排同事务完成，无半更新；enabled position 全程唯一。
         let (mut store, scope, origin) = setup("reorder");
         let m1 = remember_one(&mut store, &scope, &origin, 1, "事实一");
         let m2 = remember_one(&mut store, &scope, &origin, 2, "事实二");
         let m3 = remember_one(&mut store, &scope, &origin, 3, "事实三");
-        store.resident_pin(&scope, &m1, None, None).unwrap();
-        store.resident_pin(&scope, &m2, None, None).unwrap();
-        store.resident_pin(&scope, &m3, None, None).unwrap();
-        let order = |store: &Store| -> Vec<String> {
-            store.resident_pins(&scope).unwrap().into_iter().map(|p| p.memory_id).collect()
-        };
+        store.resident_pin(&scope, &m1, None, None, None).unwrap();
+        store.resident_pin(&scope, &m2, None, None, None).unwrap();
+        store.resident_pin(&scope, &m3, None, None, None).unwrap();
+        let order =
+            |store: &Store| -> Vec<String> { store.resident_pins(&scope).unwrap().into_iter().map(|p| p.memory_id).collect() };
         assert_eq!(order(&store), vec![m1.clone(), m2.clone(), m3.clone()]);
         // m3 移到首位：版本 +1，顺序 [m3,m1,m2]。
         let v = store.resident_move(&scope, &m3, 0, Some(1)).unwrap();
         assert_eq!(v, 2);
         assert_eq!(order(&store), vec![m3.clone(), m1.clone(), m2.clone()]);
-        // 越界钳制到末尾：m3 移到 99 → [m1,m2,m3]。
+        // 越界钳制到末尾。
         store.resident_move(&scope, &m3, 99, Some(2)).unwrap();
         assert_eq!(order(&store), vec![m1.clone(), m2.clone(), m3.clone()]);
         // 位置归一化 0..n-1，无临时偏移残留。
@@ -529,13 +646,17 @@ mod tests {
         ));
         assert_eq!(order(&store), vec![m1.clone(), m2.clone(), m3.clone()]);
         // disabled 行不可 move。
-        store.resident_unpin(&scope, &m3, None).unwrap();
+        store.resident_unpin(&scope, &m3, None, None).unwrap();
         assert!(matches!(
             store.resident_move(&scope, &m3, 0, None),
             Err(StoreError::StateConflict)
         ));
         // 重新 pin 到占用位置（显式 position 0）：通过临时偏移路径，不冲突。
-        store.resident_pin(&scope, &m3, Some(0), None).unwrap();
+        // 版本链：pin v1 → move v2 → move v3 → unpin v4 → 重激活 v5。
+        match store.resident_pin(&scope, &m3, Some(0), None, None).unwrap() {
+            PinOutcome::Pinned { version: 5, position: 0 } => {}
+            other => panic!("重激活应 v5/pos0：{other:?}"),
+        }
         assert_eq!(order(&store), vec![m3.clone(), m1.clone(), m2.clone()]);
         let positions2: Vec<i64> =
             store.resident_pins(&scope).unwrap().into_iter().map(|p| p.position).collect();

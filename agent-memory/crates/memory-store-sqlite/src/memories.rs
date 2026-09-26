@@ -408,6 +408,23 @@ impl Store {
         }))
     }
 
+    /// 只读取当前 claim（resident export 等视图用）；跨 scope/不存在返回 None。
+    pub fn get_memory_claim(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let claim = self
+            .conn()
+            .query_row(
+                "SELECT claim FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, memory_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(claim)
+    }
+
     /// 搜索实现（doc/13 §6）。返回 hits 与 index_degraded。
     pub fn search_memories(
         &self,
