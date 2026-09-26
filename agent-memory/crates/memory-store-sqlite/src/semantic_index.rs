@@ -74,7 +74,9 @@ impl Store {
         object_id: &str,
         model_id: &str,
     ) -> Result<Option<SemanticJobRow>, StoreError> {
-        let Some((version, content_sha)) = self.semantic_object_fingerprint(scope, object_kind, object_id)? else {
+        let Some((version, content_sha)) =
+            self.semantic_object_fingerprint(scope, object_kind, object_id)?
+        else {
             return Ok(None);
         };
         let now = now_rfc3339()?;
@@ -85,8 +87,17 @@ impl Store {
                 model_id, status, attempts, run_after, claim_generation, created_at, updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',0,?9,0,?9,?9)
              ON CONFLICT DO NOTHING",
-            params![id, scope.tenant_id, scope.user_id, object_kind, object_id,
-                    version, content_sha, model_id, now],
+            params![
+                id,
+                scope.tenant_id,
+                scope.user_id,
+                object_kind,
+                object_id,
+                version,
+                content_sha,
+                model_id,
+                now
+            ],
         )?;
         if n == 0 {
             self.conn_mut().execute(
@@ -120,13 +131,17 @@ impl Store {
         object_kind: &str,
         object_id: &str,
     ) -> Result<Option<(i64, String)>, StoreError> {
+        let now = now_rfc3339()?;
         match object_kind {
             "memory" => self
                 .conn()
                 .query_row(
                     "SELECT version, claim_sha256 FROM memories
-                     WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'",
-                    params![scope.tenant_id, scope.user_id, object_id],
+                     WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'
+                       AND (valid_until IS NULL OR valid_until>?4)
+                       AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                         WHERE r.tenant_id=memories.tenant_id AND r.user_id=memories.user_id AND r.memory_id=memories.id)",
+                    params![scope.tenant_id, scope.user_id, object_id, now],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()
@@ -136,8 +151,17 @@ impl Store {
                     .conn()
                     .query_row(
                         "SELECT version, body_md FROM memory_pages
-                         WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'",
-                        params![scope.tenant_id, scope.user_id, object_id],
+                         WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'
+                           AND EXISTS (SELECT 1 FROM page_sources ps
+                             WHERE ps.tenant_id=memory_pages.tenant_id AND ps.user_id=memory_pages.user_id AND ps.page_id=memory_pages.id)
+                           AND NOT EXISTS (SELECT 1 FROM page_sources ps
+                             JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
+                             WHERE ps.tenant_id=memory_pages.tenant_id AND ps.user_id=memory_pages.user_id AND ps.page_id=memory_pages.id
+                               AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
+                                 OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                                 OR EXISTS (SELECT 1 FROM memory_retirements r
+                                   WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
+                        params![scope.tenant_id, scope.user_id, object_id, now],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
@@ -162,7 +186,9 @@ impl Store {
         if vector.is_empty() || !vector.iter().all(|v| v.is_finite()) {
             return Err(StoreError::InvalidPageField);
         }
-        let Some((cur_version, cur_sha)) = self.semantic_object_fingerprint(scope, object_kind, object_id)? else {
+        let Some((cur_version, cur_sha)) =
+            self.semantic_object_fingerprint(scope, object_kind, object_id)?
+        else {
             return Err(StoreError::StaleInput);
         };
         if cur_version != source_version || cur_sha != content_sha256 {
@@ -182,8 +208,18 @@ impl Store {
              ON CONFLICT (tenant_id, user_id, object_kind, object_id, model_id)
              DO UPDATE SET source_version=?6, content_sha256=?7, dimensions=?8,
                            vector_blob=?9, status='ready', updated_at=?10",
-            params![scope.tenant_id, scope.user_id, object_kind, object_id, model_id,
-                    source_version, content_sha256, dims, blob, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                object_kind,
+                object_id,
+                model_id,
+                source_version,
+                content_sha256,
+                dims,
+                blob,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -264,34 +300,59 @@ impl Store {
     /// doc6/02 §4）。幂等：已有待处理作业只刷新冻结版本。
     pub fn semantic_reindex_all(&mut self, model_id: &str) -> Result<usize, StoreError> {
         let scopes: Vec<(String, String)> = {
-            let mut stmt = self.conn().prepare("SELECT tenant_id, user_id FROM principals WHERE status='active'")?;
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT tenant_id, user_id FROM principals WHERE status='active'")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut n = 0usize;
+        let now = now_rfc3339()?;
         for (tenant, user) in scopes {
-            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let scope = ScopeKey {
+                tenant_id: tenant,
+                user_id: user,
+            };
             let mem_ids: Vec<String> = {
                 let mut stmt = self.conn().prepare(
-                    "SELECT id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND status='active'",
+                    "SELECT id FROM memories m WHERE tenant_id=?1 AND user_id=?2 AND status='active'
+                       AND (valid_until IS NULL OR valid_until>?3)
+                       AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                         WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)",
                 )?;
-                let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get(0))?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| r.get(0))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
             let page_ids: Vec<String> = {
                 let mut stmt = self.conn().prepare(
-                    "SELECT id FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND status='published'",
+                    "SELECT p.id FROM memory_pages p WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.status='published'
+                       AND EXISTS (SELECT 1 FROM page_sources ps WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
+                       AND NOT EXISTS (SELECT 1 FROM page_sources ps
+                         JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
+                         WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id
+                           AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
+                             OR (m.valid_until IS NOT NULL AND m.valid_until<=?3)
+                             OR EXISTS (SELECT 1 FROM memory_retirements r
+                               WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
                 )?;
-                let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get(0))?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| r.get(0))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
             for mid in mem_ids {
-                if self.semantic_enqueue(&scope, "memory", &mid, model_id)?.is_some() {
+                if self
+                    .semantic_enqueue(&scope, "memory", &mid, model_id)?
+                    .is_some()
+                {
                     n += 1;
                 }
             }
             for pid in page_ids {
-                if self.semantic_enqueue(&scope, "page", &pid, model_id)?.is_some() {
+                if self
+                    .semantic_enqueue(&scope, "page", &pid, model_id)?
+                    .is_some()
+                {
                     n += 1;
                 }
             }
@@ -301,7 +362,11 @@ impl Store {
 
     /// 领取索引作业（跨 scope；内置 worker 单循环，doc4 claim/lease/generation）。
     /// 返回 (scope, 行)。
-    pub fn semantic_job_claim(&mut self, now: &str, lease_secs: u64) -> Result<Option<(ScopeKey, SemanticJobRow)>, StoreError> {
+    pub fn semantic_job_claim(
+        &mut self,
+        now: &str,
+        lease_secs: u64,
+    ) -> Result<Option<(ScopeKey, SemanticJobRow)>, StoreError> {
         let next: Option<(String, i64, String, String)> = self
             .conn()
             .query_row(
@@ -312,7 +377,9 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((id, generation, tenant, user)) = next else { return Ok(None) };
+        let Some((id, generation, tenant, user)) = next else {
+            return Ok(None);
+        };
         let lease = lease_from(now, lease_secs)?;
         self.conn_mut().execute(
             "UPDATE semantic_jobs SET status='running', lease_until=?4, claim_generation=?5,
@@ -320,12 +387,19 @@ impl Store {
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='queued'",
             params![tenant, user, id, lease, generation + 1, now_rfc3339()?],
         )?;
-        let scope = ScopeKey { tenant_id: tenant, user_id: user };
+        let scope = ScopeKey {
+            tenant_id: tenant,
+            user_id: user,
+        };
         let job = self.semantic_get_job(&scope, &id)?;
         Ok(job.filter(|j| j.status == "running").map(|j| (scope, j)))
     }
 
-    pub fn semantic_get_job(&self, scope: &ScopeKey, job_id: &str) -> Result<Option<SemanticJobRow>, StoreError> {
+    pub fn semantic_get_job(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+    ) -> Result<Option<SemanticJobRow>, StoreError> {
         self.conn()
             .query_row(
                 &format!(
@@ -364,8 +438,16 @@ impl Store {
                     lease_until=NULL, updated_at=?8
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status='running' AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation,
-                    status, error_code, run_after, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                status,
+                error_code,
+                run_after,
+                now
+            ],
         )?;
         Ok(n > 0)
     }
@@ -386,7 +468,12 @@ fn decode_cosine(blob: &[u8], query: &[f32], qnorm: f32) -> Result<f32, ()> {
     let mut dot = 0f32;
     let mut vnorm = 0f32;
     for (i, q) in query.iter().enumerate() {
-        let bytes = [blob[i * 4], blob[i * 4 + 1], blob[i * 4 + 2], blob[i * 4 + 3]];
+        let bytes = [
+            blob[i * 4],
+            blob[i * 4 + 1],
+            blob[i * 4 + 2],
+            blob[i * 4 + 3],
+        ];
         let v = f32::from_le_bytes(bytes);
         if !v.is_finite() {
             return Err(());

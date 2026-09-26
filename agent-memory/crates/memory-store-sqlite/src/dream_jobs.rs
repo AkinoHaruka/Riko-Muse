@@ -97,6 +97,20 @@ impl Store {
                 "SELECT e.id, e.host_id, e.session_id, e.event_seq, e.content_sha256, e.content
                  FROM evidence_events e
                  WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+                   AND NOT EXISTS (SELECT 1 FROM suppressed_sources ss
+                     WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+                   AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt
+                     WHERE pt.tenant_id=e.tenant_id AND pt.user_id=e.user_id
+                       AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)
+                   AND NOT EXISTS (SELECT 1 FROM memory_evidence me
+                     JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                     WHERE me.tenant_id=e.tenant_id AND me.user_id=e.user_id AND me.evidence_id=e.id
+                       AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                         OR EXISTS (SELECT 1 FROM memory_retirements r
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                         OR EXISTS (SELECT 1 FROM purge_jobs pj
+                           WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id
+                             AND pj.target_id=m.id AND pj.status IN ('pending','running'))))
                    AND NOT EXISTS (
                      SELECT 1 FROM dream_evidence_state s
                      WHERE s.tenant_id=e.tenant_id AND s.user_id=e.user_id
@@ -106,7 +120,7 @@ impl Store {
                  ORDER BY e.host_id, e.session_id, e.event_seq",
             )?;
             let rows = stmt.query_map(
-                params![scope.tenant_id, scope.user_id, DREAM_PIPELINE_V1],
+                params![scope.tenant_id, scope.user_id, DREAM_PIPELINE_V1, now],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -133,8 +147,10 @@ impl Store {
             return Ok(None); // 无待处理 L0：不建空作业。
         }
         let id = Uuid::now_v7().to_string();
-        let fingerprint_src: Vec<String> =
-            candidates.iter().map(|(id, _h, _s, seq, sha)| format!("{id}:{seq}:{sha}")).collect();
+        let fingerprint_src: Vec<String> = candidates
+            .iter()
+            .map(|(id, _h, _s, seq, sha)| format!("{id}:{seq}:{sha}"))
+            .collect();
         let fingerprint = sha256_hex(&fingerprint_src.join("\u{0}"));
         tx.execute(
             "INSERT INTO dream_jobs
@@ -164,7 +180,17 @@ impl Store {
                    (tenant_id, user_id, job_id, input_order, evidence_id, role, host_id,
                     session_id, event_seq, content_sha256)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6, ?7, ?8, ?9)",
-                params![scope.tenant_id, scope.user_id, id, order as i64, eid, host, session, seq, sha],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    id,
+                    order as i64,
+                    eid,
+                    host,
+                    session,
+                    seq,
+                    sha
+                ],
             )?;
             // 账本 assigned（同事务；doc6/10 §5 失败不推进水位）。
             tx.execute(
@@ -208,7 +234,14 @@ impl Store {
             "UPDATE dream_jobs SET status='running', lease_until=?4, claim_generation=?5,
                     attempts=attempts+1, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='queued'",
-            params![scope.tenant_id, scope.user_id, id, lease, generation + 1, now_rfc3339()?],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                id,
+                lease,
+                generation + 1,
+                now_rfc3339()?
+            ],
         )?;
         Ok(self.dream_get(scope, &id)?)
     }
@@ -216,7 +249,11 @@ impl Store {
     /// 跨 scope 领取（内置 worker 单循环，doc6/10 §8）。先恢复过期 running 回
     /// queued；领取 due 的 queued / provider_wait（provider_wait 到期即端点恢复
     /// 续作同一冻结输入，doc6/10 §5）。返回 (scope, 行)。
-    pub fn dream_claim_next(&mut self, now: &str, lease_secs: u64) -> Result<Option<(ScopeKey, DreamJobRow)>, StoreError> {
+    pub fn dream_claim_next(
+        &mut self,
+        now: &str,
+        lease_secs: u64,
+    ) -> Result<Option<(ScopeKey, DreamJobRow)>, StoreError> {
         let tx = self.conn_mut().transaction()?;
         tx.execute(
             "UPDATE dream_jobs SET status='queued', lease_until=NULL, attempts=attempts+1, updated_at=?2
@@ -251,7 +288,10 @@ impl Store {
         if n == 0 {
             return Ok(None);
         }
-        let scope = ScopeKey { tenant_id: tenant, user_id: user };
+        let scope = ScopeKey {
+            tenant_id: tenant,
+            user_id: user,
+        };
         let job = self.dream_get(&scope, &id)?;
         Ok(job.filter(|j| j.status == "running").map(|j| (scope, j)))
     }
@@ -305,8 +345,29 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let span_ok = match (&in_job, &content) {
-                (Some(_), Some(c)) => {
+            let source_current: bool = tx.query_row(
+                "SELECT EXISTS (
+                   SELECT 1 FROM evidence_events e
+                   WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.id=?3
+                     AND NOT EXISTS (SELECT 1 FROM suppressed_sources ss
+                       WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+                     AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt
+                       WHERE pt.tenant_id=e.tenant_id AND pt.user_id=e.user_id
+                         AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)
+                     AND NOT EXISTS (SELECT 1 FROM memory_evidence me
+                       JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                       WHERE me.tenant_id=e.tenant_id AND me.user_id=e.user_id AND me.evidence_id=e.id
+                         AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                           OR EXISTS (SELECT 1 FROM memory_retirements r
+                             WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                           OR EXISTS (SELECT 1 FROM purge_jobs pj
+                             WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id
+                               AND pj.target_id=m.id AND pj.status IN ('pending','running')))))",
+                params![scope.tenant_id, scope.user_id, p.evidence_id, now],
+                |r| r.get(0),
+            )?;
+            let span_ok = match (&in_job, &content, source_current) {
+                (Some(_), Some(c), true) => {
                     p.start_byte < p.end_byte
                         && p.end_byte <= c.len() as i64
                         && c.is_char_boundary(p.start_byte as usize)
@@ -347,7 +408,14 @@ impl Store {
                     "INSERT INTO dream_candidate_evidence
                        (tenant_id, user_id, candidate_id, evidence_id, start_byte, end_byte)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![scope.tenant_id, scope.user_id, cid, p.evidence_id, p.start_byte, p.end_byte],
+                    params![
+                        scope.tenant_id,
+                        scope.user_id,
+                        cid,
+                        p.evidence_id,
+                        p.start_byte,
+                        p.end_byte
+                    ],
                 )?;
             }
             accepted += 1;
@@ -374,8 +442,16 @@ impl Store {
                     output_tokens=?7, updated_at=?8
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status IN ('running','provider_wait') AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation,
-                    model_name, input_tokens, output_tokens, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                model_name,
+                input_tokens,
+                output_tokens,
+                now
+            ],
         )?;
         if n == 0 {
             return Ok(false);
@@ -390,7 +466,13 @@ impl Store {
                  SELECT evidence_id FROM dream_job_inputs
                  WHERE tenant_id=?1 AND user_id=?2 AND job_id=?5
                )",
-            params![scope.tenant_id, scope.user_id, DREAM_PIPELINE_V1, now, job_id],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                DREAM_PIPELINE_V1,
+                now,
+                job_id
+            ],
         )?;
         Ok(true)
     }
@@ -419,7 +501,15 @@ impl Store {
                     run_after=COALESCE(?6, run_after), updated_at=?7
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status IN ('running','provider_wait') AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, run_after, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                error_code,
+                run_after,
+                now
+            ],
         )?;
         Ok(n > 0)
     }
@@ -436,7 +526,14 @@ impl Store {
             "UPDATE dream_jobs SET status='dead', error_code=?5, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status IN ('running','provider_wait') AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, now_rfc3339()?],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                error_code,
+                now_rfc3339()?
+            ],
         )?;
         Ok(n > 0)
     }
@@ -454,7 +551,14 @@ impl Store {
             "UPDATE dream_jobs SET status='stale_input', error_code=?5, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status IN ('running','provider_wait') AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, now_rfc3339()?],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                error_code,
+                now_rfc3339()?
+            ],
         )?;
         Ok(n > 0)
     }
@@ -508,10 +612,28 @@ impl Store {
                JOIN dream_candidate_evidence e
                  ON e.tenant_id=c.tenant_id AND e.user_id=c.user_id AND e.candidate_id=c.id
                WHERE c.tenant_id=?1 AND c.user_id=?2 AND c.dream_job_id=?3 AND c.status='candidate'
+                 AND NOT EXISTS (SELECT 1 FROM dream_candidate_evidence ce
+                   JOIN evidence_events e ON e.tenant_id=ce.tenant_id AND e.user_id=ce.user_id AND e.id=ce.evidence_id
+                   WHERE ce.tenant_id=c.tenant_id AND ce.user_id=c.user_id AND ce.candidate_id=c.id
+                     AND (EXISTS (SELECT 1 FROM suppressed_sources ss
+                           WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+                       OR EXISTS (SELECT 1 FROM purge_tombstones pt
+                           WHERE pt.tenant_id=e.tenant_id AND pt.user_id=e.user_id
+                             AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)
+                       OR EXISTS (SELECT 1 FROM memory_evidence me
+                           JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                           WHERE me.tenant_id=e.tenant_id AND me.user_id=e.user_id AND me.evidence_id=e.id
+                             AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                               OR EXISTS (SELECT 1 FROM memory_retirements r
+                                 WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                               OR EXISTS (SELECT 1 FROM purge_jobs pj
+                                 WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id
+                                   AND pj.target_id=m.id AND pj.status IN ('pending','running'))))))
              )
              ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id], |r| {
+        let now = now_rfc3339()?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id, now], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -560,7 +682,11 @@ impl Store {
 
     /// 心跳：所有 running dream job 续租（单 worker 内串行处理；跨迭代保持
     /// 所有权，防止 extract 与其裁决之间的租约过期重领）。不动 generation。
-    pub fn dream_renew_running_leases(&mut self, now: &str, lease_secs: u64) -> Result<usize, StoreError> {
+    pub fn dream_renew_running_leases(
+        &mut self,
+        now: &str,
+        lease_secs: u64,
+    ) -> Result<usize, StoreError> {
         let lease = lease_from(now, lease_secs)?;
         let n = self.conn_mut().execute(
             "UPDATE dream_jobs SET lease_until=?2, updated_at=?3 WHERE status='running'",
@@ -570,7 +696,11 @@ impl Store {
     }
 
     /// 读取单 job（scope 内）。
-    pub fn dream_get(&self, scope: &ScopeKey, job_id: &str) -> Result<Option<DreamJobRow>, StoreError> {
+    pub fn dream_get(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+    ) -> Result<Option<DreamJobRow>, StoreError> {
         let row = self
             .conn()
             .query_row(
@@ -594,7 +724,9 @@ impl Store {
             "SELECT evidence_id FROM dream_job_inputs
              WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3 ORDER BY input_order",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id], |r| r.get(0))?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id], |r| {
+            r.get(0)
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -612,7 +744,10 @@ impl Store {
              WHERE tenant_id=?1 AND user_id=?2 AND (?3 IS NULL OR status=?3)
              ORDER BY created_at DESC, id DESC LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, status, limit as i64], map_dream_row)?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, status, limit as i64],
+            map_dream_row,
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -638,7 +773,11 @@ impl Store {
              )",
         )?;
         let rows = stmt.query_map(params![interval_hours], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
         })?;
         let idle_cutoff = chrono::DateTime::parse_from_rfc3339(now)
             .map_err(|e| StoreError::Time(e.to_string()))?
@@ -738,7 +877,10 @@ pub fn parse_dream_extract_v1(raw: &str) -> Result<Vec<DreamExtractCandidate>, S
         return Err(StoreError::InvalidPageField);
     }
     for c in &out.candidates {
-        if !matches!(c.kind.as_str(), "fact" | "preference" | "instruction" | "episode") {
+        if !matches!(
+            c.kind.as_str(),
+            "fact" | "preference" | "instruction" | "episode"
+        ) {
             return Err(StoreError::InvalidPageField);
         }
         if c.quote.is_empty() || c.claim.is_empty() || c.evidence_id.is_empty() {
@@ -750,7 +892,8 @@ pub fn parse_dream_extract_v1(raw: &str) -> Result<Vec<DreamExtractCandidate>, S
 
 /// dream_extract_v1 的 system prompt 模板（doc6/10 §6：只看冻结输入；逐字引用；
 /// 输出严格 JSON）。修改必须新建版本常量；旧 job 按保存版本分派。
-pub const DREAM_EXTRACT_V1_PROMPT: &str = "你是记忆整理器。给你一批已冻结的用户原话事件（每条含 evidence_id 与正文）。\
+pub const DREAM_EXTRACT_V1_PROMPT: &str =
+    "你是记忆整理器。给你一批已冻结的用户原话事件（每条含 evidence_id 与正文）。\
 请从中提取值得长期保留的原子记忆候选。规则：\
 1) 每个候选只表达一个独立方面；2) quote 必须是某条事件正文中的逐字连续子串；\
 3) claim 是对 quote 的规范化改写，不得引入新事实；4) 只输出 JSON，字段固定为 \

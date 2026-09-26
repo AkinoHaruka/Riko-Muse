@@ -11,6 +11,7 @@ use memory_recall::{cjk_bigrams, is_single_char_query, latin_tokens, rrf_score};
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
 
+use crate::soul::{AuditAction, AuditLayer, MemoryAuditEntry};
 use crate::{now_rfc3339, Store, StoreError};
 
 #[derive(Debug)]
@@ -85,9 +86,15 @@ pub struct ForgetOutcome {
 /// 遗忘动词（doc/12 §6）：首版中文/英文固定集。
 pub fn has_forget_cue(text: &str) -> bool {
     let t = text.to_lowercase();
-    ["忘记", "删除记忆", "不要再记得", "forget", "delete this memory"]
-        .iter()
-        .any(|w| t.contains(w))
+    [
+        "忘记",
+        "删除记忆",
+        "不要再记得",
+        "forget",
+        "delete this memory",
+    ]
+    .iter()
+    .any(|w| t.contains(w))
 }
 
 /// 保存指令与目标 quote 的直接相邻判定（doc5/04 §2）：消息去首尾空白后以
@@ -124,15 +131,25 @@ fn has_adjacent_save_instruction(message: &str, quote: &str) -> bool {
         return true;
     }
     // quote 后可带一个句末标点（保存的 quote 不含该标点时）。
-    rest.strip_suffix(TRAILING).map(|r| r.trim_end() == quote).unwrap_or(false)
+    rest.strip_suffix(TRAILING)
+        .map(|r| r.trim_end() == quote)
+        .unwrap_or(false)
 }
 
 /// 历史词（doc/12 §7）：include_history 仅当 query 含明确历史词。
 pub fn has_history_cue(query: &str) -> bool {
     let q = query.to_lowercase();
-    ["以前", "过去", "曾经", "当时", "previously", "used to", "before"]
-        .iter()
-        .any(|cue| q.contains(cue))
+    [
+        "以前",
+        "过去",
+        "曾经",
+        "当时",
+        "previously",
+        "used to",
+        "before",
+    ]
+    .iter()
+    .any(|cue| q.contains(cue))
 }
 
 /// FTS5 MATCH 转义：每个 token 变 quoted term（doc/13 §6）。
@@ -190,7 +207,10 @@ impl Store {
         keep: bool,
     ) -> Result<(), StoreError> {
         let tx = self.conn_mut().transaction()?;
-        tx.execute("DELETE FROM memory_fts WHERE memory_id=?1", params![memory_id])?;
+        tx.execute(
+            "DELETE FROM memory_fts WHERE memory_id=?1",
+            params![memory_id],
+        )?;
         tx.execute(
             "DELETE FROM memory_grams WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             params![scope.tenant_id, scope.user_id, memory_id],
@@ -221,10 +241,9 @@ impl Store {
             "SELECT evidence_id, start_byte, end_byte FROM memory_evidence
              WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3 ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -300,7 +319,8 @@ impl Store {
             )?;
             Self::mark_index_dirty(&tx)?;
             tx.commit()?;
-            return Ok(RememberOutcome::Dedup { memory_id, version });        }
+            return Ok(RememberOutcome::Dedup { memory_id, version });
+        }
 
         // 6. 新建 active memory + evidence + revision + audit，同事务 dirty=1。
         let memory_id = Uuid::now_v7().to_string();
@@ -365,7 +385,10 @@ impl Store {
         if let Err(e) = self.reindex_memory(scope, &memory_id, &claim, true) {
             eprintln!("[memoryd] 索引更新失败 memory_id={memory_id}: {e}");
         }
-        Ok(RememberOutcome::Created { memory_id, version: 1 })
+        Ok(RememberOutcome::Created {
+            memory_id,
+            version: 1,
+        })
     }
 
     /// exact 召回（doc6/09 §4.B.1）：scope 内同 kind+claim hash 的 active 记忆。
@@ -404,7 +427,11 @@ impl Store {
     }
 
     /// GET /v1/memories/{id}。普通读只返回 active；非 active 视为不存在（doc/12 §5）。
-    pub fn get_memory(&self, scope: &ScopeKey, memory_id: &str) -> Result<Option<MemoryRow>, StoreError> {
+    pub fn get_memory(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<MemoryRow>, StoreError> {
         let row = self
             .conn()
             .query_row(
@@ -425,7 +452,8 @@ impl Store {
                 },
             )
             .optional()?;
-        let Some((kind, claim, status, version, occurred_at, valid_until, agent, updated_at)) = row else {
+        let Some((kind, claim, status, version, occurred_at, valid_until, agent, updated_at)) = row
+        else {
             return Ok(None);
         };
         if status != "active" {
@@ -508,9 +536,10 @@ impl Store {
             let mut stmt = self.conn().prepare(
                 "SELECT memory_id, rank FROM memory_fts WHERE memory_fts MATCH ?1 ORDER BY rank LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![m, memory_contract::SEARCH_PER_CHANNEL_LIMIT as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-            })?;
+            let rows = stmt.query_map(
+                params![m, memory_contract::SEARCH_PER_CHANNEL_LIMIT as i64],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
+            )?;
             for row in rows {
                 let (id, bm25) = row?;
                 fts_hits.push((id, bm25));
@@ -541,7 +570,10 @@ impl Store {
             })?;
             for (i, row) in rows.enumerate() {
                 let (id, hits) = row?;
-                gram_hits.push((id, hits as f64 / grams.len().max(1) as f64 * (1.0 / (i as f64 + 1.0))));
+                gram_hits.push((
+                    id,
+                    hits as f64 / grams.len().max(1) as f64 * (1.0 / (i as f64 + 1.0)),
+                ));
             }
         }
 
@@ -556,7 +588,11 @@ impl Store {
                  ORDER BY updated_at DESC LIMIT ?",
             )?;
             let rows = stmt.query_map(
-                params![scope.tenant_id, scope.user_id, memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )?;
             for row in rows {
@@ -579,7 +615,11 @@ impl Store {
                  ORDER BY updated_at DESC LIMIT ?",
             )?;
             let rows = stmt.query_map(
-                params![scope.tenant_id, scope.user_id, memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )?;
             for row in rows {
@@ -594,13 +634,16 @@ impl Store {
         }
 
         // 融合排序
-        let mut scores: std::collections::HashMap<String, (f64, &'static str)> = std::collections::HashMap::new();
+        let mut scores: std::collections::HashMap<String, (f64, &'static str)> =
+            std::collections::HashMap::new();
         if !fts_hits.is_empty() && !gram_hits.is_empty() {
-            let mut fts_rank: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let mut fts_rank: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
             for (i, (id, _)) in fts_hits.iter().enumerate() {
                 fts_rank.insert(id.clone(), i as u32 + 1);
             }
-            let mut gram_rank: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let mut gram_rank: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
             for (i, (id, _)) in gram_hits.iter().enumerate() {
                 gram_rank.insert(id.clone(), i as u32 + 1);
             }
@@ -665,7 +708,9 @@ impl Store {
                     },
                 )
                 .optional()?;
-            let Some((kind, claim, status, version)) = row else { continue };
+            let Some((kind, claim, status, version)) = row else {
+                continue;
+            };
             let refs = self
                 .evidence_refs_of(scope, &id)?
                 .into_iter()
@@ -726,7 +771,11 @@ impl Store {
         let (host, session, role, source_kind, content) = self
             .get_evidence(scope, user_evidence_id)?
             .ok_or(StoreError::EvidenceNotFound)?;
-        if role != "user" || source_kind != "user" || host != origin.host_id || session != origin.session_id {
+        if role != "user"
+            || source_kind != "user"
+            || host != origin.host_id
+            || session != origin.session_id
+        {
             return Err(StoreError::StaleUserEvidence);
         }
         let (latest_id, _, _) = self
@@ -747,7 +796,9 @@ impl Store {
         memory_id: &str,
         req: &CorrectRequest,
     ) -> Result<CorrectOutcome, StoreError> {
-        let Some((kind, claim, version, status, claim_hash)) = self.memory_row_for_update(scope, memory_id)? else {
+        let Some((kind, claim, version, status, claim_hash)) =
+            self.memory_row_for_update(scope, memory_id)?
+        else {
             return Err(StoreError::MemoryNotFound);
         };
         if status != "active" {
@@ -756,7 +807,8 @@ impl Store {
         if version != req.expected_version {
             return Err(StoreError::VersionConflict);
         }
-        let (content, _, _) = self.check_latest_user_evidence(scope, &req.origin, &req.user_evidence_id)?;
+        let (content, _, _) =
+            self.check_latest_user_evidence(scope, &req.origin, &req.user_evidence_id)?;
         // 最新用户事件须同时包含 old_quote 与 replacement_quote；old_quote 须在旧 claim 中出现。
         let Some((rstart, rend)) = find_quote_span(&content, &req.replacement_quote) else {
             return Err(StoreError::QuoteMismatch);
@@ -784,7 +836,13 @@ impl Store {
         let n = tx.execute(
             "UPDATE memories SET status='superseded', version=version+1, updated_at=?1
              WHERE tenant_id=?2 AND user_id=?3 AND id=?4 AND version=?5",
-            params![now, scope.tenant_id, scope.user_id, memory_id, req.expected_version],
+            params![
+                now,
+                scope.tenant_id,
+                scope.user_id,
+                memory_id,
+                req.expected_version
+            ],
         )?;
         if n == 0 {
             return Err(StoreError::VersionConflict);
@@ -833,6 +891,8 @@ impl Store {
                 format!("{{\"old_memory_id\":\"{memory_id}\",\"old_claim_hash\":\"{claim_hash}\"}}")
             ],
         )?;
+        // 来源更改与派生页失效在同一业务事务内提交，避免页面越过已更正的来源。
+        let stale_pages = crate::pages::stale_pages_for_memory_tx(&tx, scope, memory_id, &now)?;
         // D6-8：旧记忆向量失效与业务变更同事务（doc6/02 §4）。
         Self::stale_vectors_in_tx(&tx, scope, "memory", memory_id)?;
         Self::mark_index_dirty(&tx)?;
@@ -843,6 +903,34 @@ impl Store {
         }
         if let Err(e) = self.reindex_memory(scope, &new_memory_id, &new_claim, true) {
             eprintln!("[memoryd] 索引插入失败 memory_id={new_memory_id}: {e}");
+        }
+        self.record_memory_audit_best_effort(
+            scope,
+            &MemoryAuditEntry {
+                record_id: memory_id.to_owned(),
+                layer: AuditLayer::L1,
+                action: AuditAction::Update,
+                agent_id: None,
+                task_id: None,
+                version: version + 1,
+                updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                request_id: None,
+            },
+        );
+        for (page_id, page_version) in stale_pages {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: page_id,
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Delete,
+                    agent_id: None,
+                    task_id: None,
+                    version: page_version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
         }
         Ok(CorrectOutcome {
             old_memory_id: memory_id.to_string(),
@@ -859,17 +947,22 @@ impl Store {
         memory_id: &str,
         req: &ForgetRequest,
     ) -> Result<ForgetOutcome, StoreError> {
-        let Some((kind, claim, version, status, claim_hash)) = self.memory_row_for_update(scope, memory_id)? else {
+        let Some((kind, claim, version, status, claim_hash)) =
+            self.memory_row_for_update(scope, memory_id)?
+        else {
             return Err(StoreError::MemoryNotFound);
         };
         let _ = kind;
-        let (content, _, _) = self.check_latest_user_evidence(scope, &req.origin, &req.user_evidence_id)?;
+        let (content, _, _) =
+            self.check_latest_user_evidence(scope, &req.origin, &req.user_evidence_id)?;
         if !has_forget_cue(&content) {
             return Err(StoreError::AmbiguousTarget);
         }
         // G-13（doc2/04 §3）：target_quote 必须同时定位到用户最新消息正文与目标 claim，
         // 否则带 ID + 泛称"忘记"可能误删未被用户明确指认的记忆。
-        if req.target_quote.trim().is_empty() || find_quote_span(&content, &req.target_quote).is_none() {
+        if req.target_quote.trim().is_empty()
+            || find_quote_span(&content, &req.target_quote).is_none()
+        {
             return Err(StoreError::AmbiguousTarget);
         }
         if find_quote_span(&claim, &req.target_quote).is_none() {
@@ -877,7 +970,10 @@ impl Store {
         }
         if status == "forgotten" {
             // 幂等确认：同一目标再次明确请求 → 返回当前状态（doc/12 §6）。
-            return Ok(ForgetOutcome { memory_id: memory_id.to_string(), version });
+            return Ok(ForgetOutcome {
+                memory_id: memory_id.to_string(),
+                version,
+            });
         }
         if status != "active" {
             return Err(StoreError::MemoryNotFound);
@@ -891,7 +987,13 @@ impl Store {
         let n = tx.execute(
             "UPDATE memories SET status='forgotten', version=version+1, updated_at=?1
              WHERE tenant_id=?2 AND user_id=?3 AND id=?4 AND version=?5",
-            params![now, scope.tenant_id, scope.user_id, memory_id, req.expected_version],
+            params![
+                now,
+                scope.tenant_id,
+                scope.user_id,
+                memory_id,
+                req.expected_version
+            ],
         )?;
         if n == 0 {
             return Err(StoreError::VersionConflict);
@@ -909,7 +1011,14 @@ impl Store {
                 "INSERT OR IGNORE INTO suppressed_sources
                  (tenant_id, user_id, evidence_id, claim_sha256, forgotten_memory_id, created_at)
                  VALUES (?1,?2,?3,?4,?5,?6)",
-                params![scope.tenant_id, scope.user_id, evidence_id, claim_hash, memory_id, now],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    evidence_id,
+                    claim_hash,
+                    memory_id,
+                    now
+                ],
             )?;
         }
         tx.execute(
@@ -917,6 +1026,7 @@ impl Store {
              VALUES (?1,?2,?3,'user',?4,'memory_forget',?5,?6,'{\"raw_evidence_retained\":true}')",
             params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, req.user_evidence_id, memory_id, now],
         )?;
+        let stale_pages = crate::pages::stale_pages_for_memory_tx(&tx, scope, memory_id, &now)?;
         // D6-8：向量失效与业务变更同事务（doc6/02 §4）；索引队列同步作废。
         Self::stale_vectors_in_tx(&tx, scope, "memory", memory_id)?;
         Self::mark_index_dirty(&tx)?;
@@ -924,7 +1034,38 @@ impl Store {
         if let Err(e) = self.reindex_memory(scope, memory_id, &claim, false) {
             eprintln!("[memoryd] 索引删除失败 memory_id={memory_id}: {e}");
         }
-        Ok(ForgetOutcome { memory_id: memory_id.to_string(), version: version + 1 })
+        self.record_memory_audit_best_effort(
+            scope,
+            &MemoryAuditEntry {
+                record_id: memory_id.to_owned(),
+                layer: AuditLayer::L1,
+                action: AuditAction::Update,
+                agent_id: None,
+                task_id: None,
+                version: version + 1,
+                updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                request_id: None,
+            },
+        );
+        for (page_id, page_version) in stale_pages {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: page_id,
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Delete,
+                    agent_id: None,
+                    task_id: None,
+                    version: page_version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
+        Ok(ForgetOutcome {
+            memory_id: memory_id.to_string(),
+            version: version + 1,
+        })
     }
 
     /// 从 active 规范表全量重建派生索引（CLI rebuild-index，doc/09）。
@@ -1035,7 +1176,9 @@ impl Store {
                 hit.memory_id, hit.claim
             );
             let entry_len = line.chars().count() + 1;
-            if body_chars + entry_len > max_chars.saturating_sub(header.chars().count() + footer.chars().count()) {
+            if body_chars + entry_len
+                > max_chars.saturating_sub(header.chars().count() + footer.chars().count())
+            {
                 truncated = true;
                 continue; // 超长单条跳过，不截断成可能失去否定词的句子（doc/13 §6）
             }
@@ -1048,7 +1191,12 @@ impl Store {
         } else {
             format!("{header}\n{}\n{footer}", lines.join("\n"))
         };
-        Ok(ComposeResult { text, items, truncated, index_degraded: degraded })
+        Ok(ComposeResult {
+            text,
+            items,
+            truncated,
+            index_degraded: degraded,
+        })
     }
 
     /// active 指令类记忆（compose 指令名额补齐用），updated_at DESC 固定序。
@@ -1090,7 +1238,9 @@ impl Store {
                     },
                 )
                 .optional()?;
-            let Some((kind, claim, status, version)) = row else { continue };
+            let Some((kind, claim, status, version)) = row else {
+                continue;
+            };
             let _ = kind;
             let refs = self
                 .evidence_refs_of(scope, &id)?
@@ -1119,7 +1269,9 @@ mod tests {
     use memory_domain::{MemoryKind, Origin};
 
     fn migrations_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
     }
 
     fn setup(tag: &str) -> (Store, ScopeKey) {
@@ -1134,12 +1286,19 @@ mod tests {
     }
 
     fn origin() -> Origin {
-        Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s".into() }
+        Origin {
+            host_id: "dsh".into(),
+            agent_id: "a".into(),
+            session_id: "s".into(),
+        }
     }
 
     fn ingest_user(store: &mut Store, scope: &ScopeKey, seq: i64, content: &str) -> String {
         let t = chrono::Utc::now();
-        match store.record_evidence(scope, &origin(), seq, "user", "user", &t, content).unwrap() {
+        match store
+            .record_evidence(scope, &origin(), seq, "user", "user", &t, content)
+            .unwrap()
+        {
             IngestOutcome::Recorded(id) => id,
             IngestOutcome::AlreadyRecorded(id) => id,
         }
@@ -1152,23 +1311,55 @@ mod tests {
         let (mut store, scope) = setup("compose-instr");
         let ev = ingest_user(&mut store, &scope, 8, "以后回答请始终用中文。今天先聊到这");
         store
-            .remember(&scope, &origin(), &ev, "以后回答请始终用中文", MemoryKind::Instruction)
+            .remember(
+                &scope,
+                &origin(),
+                &ev,
+                "以后回答请始终用中文",
+                MemoryKind::Instruction,
+            )
             .unwrap();
         // 与指令零词法重叠的查询也要召回该指令。
-        let r = store.compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000).unwrap();
+        let r = store
+            .compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000)
+            .unwrap();
         assert_eq!(r.items.len(), 1);
         assert!(r.text.contains("以后回答请始终用中文"));
-        assert!(r.items[0].1.iter().any(|e| e == &ev), "注入项须携带证据引用");
+        assert!(
+            r.items[0].1.iter().any(|e| e == &ev),
+            "注入项须携带证据引用"
+        );
         // 指令名额上限 2：第三条指令不得进入名额。
         let ev2 = ingest_user(&mut store, &scope, 16, "以后回答要给代码示例");
-        store.remember(&scope, &origin(), &ev2, "以后回答要给代码示例", MemoryKind::Instruction).unwrap();
+        store
+            .remember(
+                &scope,
+                &origin(),
+                &ev2,
+                "以后回答要给代码示例",
+                MemoryKind::Instruction,
+            )
+            .unwrap();
         let ev3 = ingest_user(&mut store, &scope, 24, "以后先说明风险再动手");
-        store.remember(&scope, &origin(), &ev3, "以后先说明风险再动手", MemoryKind::Instruction).unwrap();
-        let r2 = store.compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000).unwrap();
+        store
+            .remember(
+                &scope,
+                &origin(),
+                &ev3,
+                "以后先说明风险再动手",
+                MemoryKind::Instruction,
+            )
+            .unwrap();
+        let r2 = store
+            .compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000)
+            .unwrap();
         // 三条指令但名额只有 2：文本恰好包含两条 claim（最新的 updated_at DESC 两条）。
         assert!(r2.text.contains("以后回答要给代码示例"));
         assert!(r2.text.contains("以后先说明风险再动手"));
-        assert!(!r2.text.contains("以后回答请始终用中文"), "最旧的一条被挤出 2 个名额");
+        assert!(
+            !r2.text.contains("以后回答请始终用中文"),
+            "最旧的一条被挤出 2 个名额"
+        );
     }
 
     #[test]
@@ -1197,11 +1388,25 @@ mod tests {
         let ev5 = ingest_user(&mut store, &scope, 5, "我姐在成都教书");
         created(store.remember(&scope, &o, &ev5, "我姐在成都教书", MemoryKind::Fact));
         // 复合命题（原 doc5/09 决策 B 拒绝样本）→ active。
-        let ev6 = ingest_user(&mut store, &scope, 6, "我对芒果过敏，以后别再推荐含芒果的甜品");
-        created(store.remember(&scope, &o, &ev6, "我对芒果过敏，以后别再推荐含芒果的甜品", MemoryKind::Preference));
+        let ev6 = ingest_user(
+            &mut store,
+            &scope,
+            6,
+            "我对芒果过敏，以后别再推荐含芒果的甜品",
+        );
+        created(store.remember(
+            &scope,
+            &o,
+            &ev6,
+            "我对芒果过敏，以后别再推荐含芒果的甜品",
+            MemoryKind::Preference,
+        ));
         // 幂等不变：同 claim 重复 remember → Dedup（仅加证据，不新建）。
         let ev7 = ingest_user(&mut store, &scope, 7, "我对花生过敏");
-        match store.remember(&scope, &o, &ev7, "我对花生过敏", MemoryKind::Fact).unwrap() {
+        match store
+            .remember(&scope, &o, &ev7, "我对花生过敏", MemoryKind::Fact)
+            .unwrap()
+        {
             RememberOutcome::Dedup { memory_id, .. } => assert_eq!(memory_id, id1),
             other => panic!("期望 Dedup，实际 {other:?}"),
         }
@@ -1220,8 +1425,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("am-mem-open-u2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
-        let scope2 = ScopeKey { tenant_id: "t".into(), user_id: "u2".into() };
+        store
+            .principal_add("t", "u2", &dir.join("u2.token"))
+            .unwrap();
+        let scope2 = ScopeKey {
+            tenant_id: "t".into(),
+            user_id: "u2".into(),
+        };
         assert!(matches!(
             store.remember(&scope2, &o, &ev2, "我对花生过敏", MemoryKind::Fact),
             Err(StoreError::EvidenceNotFound)

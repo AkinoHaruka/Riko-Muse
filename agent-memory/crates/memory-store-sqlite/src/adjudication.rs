@@ -110,7 +110,8 @@ fn map_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<AdjudicationJobRow> {
     })
 }
 
-const JOB_COLS: &str = "id, dream_job_id, input_fingerprint, admission_version, adjudication_version,
+const JOB_COLS: &str =
+    "id, dream_job_id, input_fingerprint, admission_version, adjudication_version,
     embedding_model_id, status, attempts, run_after, claim_generation,
     model_name, input_tokens, output_tokens, error_code";
 
@@ -136,11 +137,17 @@ impl Store {
         let mut parts: Vec<String> = candidates
             .iter()
             .map(|c| {
-                format!("c|{}|{}|{}|{}", c.candidate_id, c.evidence_id, c.start_byte, c.end_byte)
+                format!(
+                    "c|{}|{}|{}|{}",
+                    c.candidate_id, c.evidence_id, c.start_byte, c.end_byte
+                )
             })
             .collect();
         parts.extend(recalls.iter().map(|r| {
-            format!("r|{}|{}|{}|{}", r.candidate_id, r.target_memory_id, r.target_version, r.channel)
+            format!(
+                "r|{}|{}|{}|{}",
+                r.candidate_id, r.target_memory_id, r.target_version, r.channel
+            )
         }));
         parts.sort();
         parts.dedup();
@@ -154,7 +161,13 @@ impl Store {
                      WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3
                        AND input_fingerprint=?4 AND adjudication_version=?5"
                 ),
-                params![scope.tenant_id, scope.user_id, dream_job_id, fingerprint, adjudication_version],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    dream_job_id,
+                    fingerprint,
+                    adjudication_version
+                ],
                 map_job,
             )
             .optional()?;
@@ -170,8 +183,17 @@ impl Store {
                 adjudication_version, embedding_model_id, status, attempts, run_after,
                 claim_generation, created_at, updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',0,?9,0,?9,?9)",
-            params![id, scope.tenant_id, scope.user_id, dream_job_id, fingerprint,
-                    admission_version, adjudication_version, embedding_model_id, now],
+            params![
+                id,
+                scope.tenant_id,
+                scope.user_id,
+                dream_job_id,
+                fingerprint,
+                admission_version,
+                adjudication_version,
+                embedding_model_id,
+                now
+            ],
         )?;
         // 冻结候选 evidence（同候选多 span 时按行展开；dream_candidates 每候选
         // 至少一条 evidence，dream_submit_candidates 已核验）。
@@ -203,7 +225,11 @@ impl Store {
     }
 
     /// 读取裁决作业。
-    pub fn adjudication_get(&self, scope: &ScopeKey, job_id: &str) -> Result<Option<AdjudicationJobRow>, StoreError> {
+    pub fn adjudication_get(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+    ) -> Result<Option<AdjudicationJobRow>, StoreError> {
         self.conn()
             .query_row(
                 &format!("SELECT {JOB_COLS} FROM adjudication_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3"),
@@ -237,7 +263,11 @@ impl Store {
     /// 领取（doc4 契约）：先恢复过期 running，再原子领取 due 的
     /// queued/retryable_failed/provider_wait（provider_wait 到期即自动续作，
     /// doc6/09 §7 端点恢复条件由调用方的退避 run_after 表达）。返回 (scope, 行)。
-    pub fn adjudication_claim(&mut self, now: &str, lease_secs: u64) -> Result<Option<(ScopeKey, AdjudicationJobRow)>, StoreError> {
+    pub fn adjudication_claim(
+        &mut self,
+        now: &str,
+        lease_secs: u64,
+    ) -> Result<Option<(ScopeKey, AdjudicationJobRow)>, StoreError> {
         let tx = self.conn_mut().transaction()?;
         // 过期 running 回原状态（输入冻结不变；attempts 计入丢失尝试）。
         tx.execute(
@@ -275,7 +305,10 @@ impl Store {
             return Ok(None);
         }
         tx.commit()?;
-        let scope = ScopeKey { tenant_id: tenant, user_id: user };
+        let scope = ScopeKey {
+            tenant_id: tenant,
+            user_id: user,
+        };
         let job = self.adjudication_get(&scope, &id)?;
         Ok(job.filter(|j| j.status == "running").map(|j| (scope, j)))
     }
@@ -331,21 +364,18 @@ impl Store {
              ORDER BY i.input_order",
         )?;
         let mut candidates: Vec<AdjudicationCandidate> = Vec::new();
-        let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, job_id],
-            |r| {
-                Ok(AdjudicationCandidate {
-                    candidate_id: r.get(0)?,
-                    kind: r.get(1)?,
-                    claim: r.get(2)?,
-                    quote: r.get(3)?,
-                    status: r.get(4)?,
-                    evidence_id: r.get(5)?,
-                    start_byte: r.get(6)?,
-                    end_byte: r.get(7)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id], |r| {
+            Ok(AdjudicationCandidate {
+                candidate_id: r.get(0)?,
+                kind: r.get(1)?,
+                claim: r.get(2)?,
+                quote: r.get(3)?,
+                status: r.get(4)?,
+                evidence_id: r.get(5)?,
+                start_byte: r.get(6)?,
+                end_byte: r.get(7)?,
+            })
+        })?;
         for row in rows {
             candidates.push(row?);
         }
@@ -399,7 +429,10 @@ impl Store {
         let mut by_candidate: std::collections::HashMap<&str, Vec<&AdjudicationCandidate>> =
             std::collections::HashMap::new();
         for c in &frozen_candidates {
-            by_candidate.entry(c.candidate_id.as_str()).or_default().push(c);
+            by_candidate
+                .entry(c.candidate_id.as_str())
+                .or_default()
+                .push(c);
         }
         // 召回 target 冻结版本（漂移检测基准）。
         let mut frozen_target_version: std::collections::HashMap<(&str, &str), i64> =
@@ -416,9 +449,12 @@ impl Store {
             let cur: Option<i64> = self
                 .conn()
                 .query_row(
-                    "SELECT version FROM memories
-                     WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'",
-                    params![scope.tenant_id, scope.user_id, r.target_memory_id],
+                    "SELECT version FROM memories m
+                     WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
+                       AND (m.valid_until IS NULL OR m.valid_until>?4)
+                       AND NOT EXISTS (SELECT 1 FROM memory_retirements mr
+                         WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)",
+                    params![scope.tenant_id, scope.user_id, r.target_memory_id, now],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -431,8 +467,36 @@ impl Store {
 
         let mut outcome = AdjudicationApplyOutcome::default();
         let tx = self.conn_mut().transaction()?;
+        let stale_sources: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM adjudication_job_inputs ai
+             JOIN evidence_events e ON e.tenant_id=ai.tenant_id AND e.user_id=ai.user_id AND e.id=ai.evidence_id
+             WHERE ai.tenant_id=?1 AND ai.user_id=?2 AND ai.job_id=?3 AND e.role='user'
+               AND (EXISTS (SELECT 1 FROM suppressed_sources ss
+                     WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+                 OR EXISTS (SELECT 1 FROM purge_tombstones pt
+                     WHERE pt.tenant_id=e.tenant_id AND pt.user_id=e.user_id
+                       AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)
+                 OR EXISTS (SELECT 1 FROM memory_evidence me
+                     JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                     WHERE me.tenant_id=e.tenant_id AND me.user_id=e.user_id AND me.evidence_id=e.id
+                       AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                         OR EXISTS (SELECT 1 FROM memory_retirements mr
+                           WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)
+                         OR EXISTS (SELECT 1 FROM purge_jobs pj
+                           WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
+                             AND pj.status IN ('pending','running')))))",
+            params![scope.tenant_id, scope.user_id, job_id, now],
+            |r| r.get(0),
+        )?;
+        if stale_sources > 0 {
+            return Err(StoreError::StaleInput);
+        }
+        let mut l1_audits: Vec<(String, i64)> = Vec::new();
+        let mut l2_deletes: Vec<(String, i64)> = Vec::new();
         for p in proposals {
-            let mut record = |application_status: &str, applied_id: &Option<String>, reason: &str,
+            let mut record = |application_status: &str,
+                              applied_id: &Option<String>,
+                              reason: &str,
                               outcome: &mut AdjudicationApplyOutcome| {
                 tx.execute(
                     "INSERT INTO adjudication_results
@@ -445,10 +509,20 @@ impl Store {
                        expected_target_version=?9, applied_result_memory_id=?10,
                        application_status=?11, model_confidence=?12, valid_until=?13",
                     params![
-                        scope.tenant_id, scope.user_id, job_id, p.candidate_id,
-                        p.durability, p.action, p.reason_code,
-                        p.target_memory_id, p.expected_target_version, applied_id,
-                        application_status, p.model_confidence, p.valid_until, now
+                        scope.tenant_id,
+                        scope.user_id,
+                        job_id,
+                        p.candidate_id,
+                        p.durability,
+                        p.action,
+                        p.reason_code,
+                        p.target_memory_id,
+                        p.expected_target_version,
+                        applied_id,
+                        application_status,
+                        p.model_confidence,
+                        p.valid_until,
+                        now
                     ],
                 )?;
                 outcome.rows.push((
@@ -472,7 +546,12 @@ impl Store {
 
             // 候选必须在冻结输入内。
             let Some(spans) = by_candidate.get(p.candidate_id.as_str()).cloned() else {
-                record("rejected", &None, "candidate_not_in_frozen_inputs", &mut outcome)?;
+                record(
+                    "rejected",
+                    &None,
+                    "candidate_not_in_frozen_inputs",
+                    &mut outcome,
+                )?;
                 continue;
             };
             // 候选仍处于可裁决状态（candidate 或 held 重裁）；committed/rejected 不再动。
@@ -493,9 +572,9 @@ impl Store {
             };
             // 引用核验：attach/update/conflict 的 target 必须是本候选的冻结召回。
             let target_in_recalls = p.target_memory_id.as_deref().map(|t| {
-                frozen_recalls.iter().any(|r| {
-                    r.candidate_id == p.candidate_id && r.target_memory_id == t
-                })
+                frozen_recalls
+                    .iter()
+                    .any(|r| r.candidate_id == p.candidate_id && r.target_memory_id == t)
             });
             let claim = fold_whitespace(&spans[0].claim);
             match p.action.as_str() {
@@ -509,22 +588,31 @@ impl Store {
                             // time_bound 须有可验证期限（doc6/09 §5）。
                             if p.durability == "time_bound" && p.valid_until.is_none() {
                                 Self::hold_candidate_tx(&tx, scope, &p.candidate_id)?;
-                                record("applied", &None, "held_time_bound_without_valid_until", &mut outcome)?;
+                                record(
+                                    "applied",
+                                    &None,
+                                    "held_time_bound_without_valid_until",
+                                    &mut outcome,
+                                )?;
                                 continue;
                             }
                             // 精确快速路径（doc6/09 §4.B.1）：完全相同 active 只加证据。
                             let hash = claim_sha256(kind, &claim);
                             let existing: Option<(String, i64)> = tx
                                 .query_row(
-                                    "SELECT id, version FROM memories
+                                    "SELECT id, version FROM memories m
                                      WHERE tenant_id=?1 AND user_id=?2 AND kind=?3
-                                       AND claim_sha256=?4 AND status='active'",
-                                    params![scope.tenant_id, scope.user_id, kind.as_str(), hash],
+                                       AND claim_sha256=?4 AND status='active'
+                                       AND (valid_until IS NULL OR valid_until>?5)
+                                       AND NOT EXISTS (SELECT 1 FROM memory_retirements mr
+                                         WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)",
+                                    params![scope.tenant_id, scope.user_id, kind.as_str(), hash, now],
                                     |r| Ok((r.get(0)?, r.get(1)?)),
                                 )
                                 .optional()?;
-                            if let Some((mid, _ver)) = existing {
+                            if let Some((mid, ver)) = existing {
                                 Self::attach_frozen_evidence_tx(&tx, scope, &mid, &spans)?;
+                                l1_audits.push((mid.clone(), ver));
                                 Self::commit_candidate_tx(&tx, scope, &p.candidate_id)?;
                                 record("applied", &Some(mid), "exact_dedup_attach", &mut outcome)?;
                                 continue;
@@ -575,10 +663,34 @@ impl Store {
                         continue;
                     };
                     if target_in_recalls != Some(true) {
-                        record("rejected", &None, "target_not_in_frozen_recalls", &mut outcome)?;
+                        record(
+                            "rejected",
+                            &None,
+                            "target_not_in_frozen_recalls",
+                            &mut outcome,
+                        )?;
                         continue;
                     }
+                    let frozen_version = frozen_target_version
+                        .get(&(p.candidate_id.as_str(), target.as_str()))
+                        .copied()
+                        .ok_or(StoreError::StaleInput)?;
+                    let target_current: Option<i64> = tx
+                        .query_row(
+                            "SELECT m.version FROM memories m
+                             WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
+                               AND m.version=?4 AND (m.valid_until IS NULL OR m.valid_until>?5)
+                               AND NOT EXISTS (SELECT 1 FROM memory_retirements mr
+                                 WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)",
+                            params![scope.tenant_id, scope.user_id, target, frozen_version, now],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if target_current.is_none() {
+                        return Err(StoreError::StaleInput);
+                    }
                     Self::attach_frozen_evidence_tx(&tx, scope, &target, &spans)?;
+                    l1_audits.push((target.clone(), frozen_version));
                     Self::commit_candidate_tx(&tx, scope, &p.candidate_id)?;
                     record("applied", &Some(target), "evidence_attached", &mut outcome)?;
                 }
@@ -586,19 +698,32 @@ impl Store {
                     let (Some(target), Some(expected_v)) =
                         (p.target_memory_id.clone(), p.expected_target_version)
                     else {
-                        record("rejected", &None, "update_requires_target_and_version", &mut outcome)?;
+                        record(
+                            "rejected",
+                            &None,
+                            "update_requires_target_and_version",
+                            &mut outcome,
+                        )?;
                         continue;
                     };
                     if target_in_recalls != Some(true) {
-                        record("rejected", &None, "target_not_in_frozen_recalls", &mut outcome)?;
+                        record(
+                            "rejected",
+                            &None,
+                            "target_not_in_frozen_recalls",
+                            &mut outcome,
+                        )?;
                         continue;
                     }
                     // CAS 换版（doc6/09 §5：更新必须带 expected_target_version）。
                     let cur: Option<(i64, String, String)> = tx
                         .query_row(
-                            "SELECT version, claim, kind FROM memories
-                             WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'",
-                            params![scope.tenant_id, scope.user_id, target],
+                            "SELECT version, claim, kind FROM memories m
+                             WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
+                               AND (m.valid_until IS NULL OR m.valid_until>?4)
+                               AND NOT EXISTS (SELECT 1 FROM memory_retirements mr
+                                 WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)",
+                            params![scope.tenant_id, scope.user_id, target, now],
                             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .optional()?;
@@ -618,6 +743,10 @@ impl Store {
                          WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND version=?5",
                         params![scope.tenant_id, scope.user_id, target, now, expected_v],
                     )?;
+                    l1_audits.push((target.clone(), expected_v + 1));
+                    l2_deletes.extend(crate::pages::stale_pages_for_memory_tx(
+                        &tx, scope, &target, &now,
+                    )?);
                     let hash = claim_sha256(kind, &claim);
                     tx.execute(
                         "INSERT INTO memories
@@ -626,8 +755,17 @@ impl Store {
                             origin_host_id, origin_agent_id, created_at, updated_at)
                          VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,?8,
                                  'dream','dream',?9,?9)",
-                        params![new_id, scope.tenant_id, scope.user_id, kind.as_str(), claim,
-                                memory_domain::normalize_v1(&claim), hash, p.valid_until, now],
+                        params![
+                            new_id,
+                            scope.tenant_id,
+                            scope.user_id,
+                            kind.as_str(),
+                            claim,
+                            memory_domain::normalize_v1(&claim),
+                            hash,
+                            p.valid_until,
+                            now
+                        ],
                     )?;
                     Self::attach_frozen_evidence_tx(&tx, scope, &new_id, &spans)?;
                     tx.execute(
@@ -646,10 +784,16 @@ impl Store {
                     record("applied", &Some(new_id), "updated_supersedes", &mut outcome)?;
                 }
                 "conflict" | "defer" => {
-                    if p.action == "conflict" && p.target_memory_id.is_some()
+                    if p.action == "conflict"
+                        && p.target_memory_id.is_some()
                         && target_in_recalls != Some(true)
                     {
-                        record("rejected", &None, "target_not_in_frozen_recalls", &mut outcome)?;
+                        record(
+                            "rejected",
+                            &None,
+                            "target_not_in_frozen_recalls",
+                            &mut outcome,
+                        )?;
                         continue;
                     }
                     Self::hold_candidate_tx(&tx, scope, &p.candidate_id)?;
@@ -669,6 +813,36 @@ impl Store {
             }
         }
         tx.commit()?;
+        for (memory_id, version) in l1_audits {
+            self.record_memory_audit_best_effort(
+                scope,
+                &crate::soul::MemoryAuditEntry {
+                    record_id: memory_id,
+                    layer: crate::soul::AuditLayer::L1,
+                    action: crate::soul::AuditAction::Update,
+                    agent_id: None,
+                    task_id: None,
+                    version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
+        for (page_id, version) in l2_deletes {
+            self.record_memory_audit_best_effort(
+                scope,
+                &crate::soul::MemoryAuditEntry {
+                    record_id: page_id,
+                    layer: crate::soul::AuditLayer::L2,
+                    action: crate::soul::AuditAction::Delete,
+                    agent_id: None,
+                    task_id: None,
+                    version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
         Ok(outcome)
     }
 
@@ -685,8 +859,15 @@ impl Store {
                 "INSERT OR IGNORE INTO memory_evidence
                    (id, tenant_id, user_id, memory_id, evidence_id, start_byte, end_byte)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id,
-                        memory_id, s.evidence_id, s.start_byte, s.end_byte],
+                params![
+                    Uuid::now_v7().to_string(),
+                    scope.tenant_id,
+                    scope.user_id,
+                    memory_id,
+                    s.evidence_id,
+                    s.start_byte,
+                    s.end_byte
+                ],
             )?;
         }
         tx.execute(
@@ -774,7 +955,12 @@ pub fn parse_adjudicate_v1(raw: &str) -> Result<Vec<AdjudicateV1Item>, StoreErro
         }
         if !matches!(
             i.action.as_str(),
-            "create" | "attach_evidence" | "update" | "keep_separate" | "conflict" | "defer"
+            "create"
+                | "attach_evidence"
+                | "update"
+                | "keep_separate"
+                | "conflict"
+                | "defer"
                 | "not_memory"
         ) {
             return Err(StoreError::InvalidPageField);

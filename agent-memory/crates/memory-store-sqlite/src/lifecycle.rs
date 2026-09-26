@@ -5,20 +5,37 @@
 //! 所有 read/query path 在排序前排除 retired（doc6/09 卡要求）。purge 只经
 //! 可信 UI/CLI 两阶段 preview+confirm，不注册 Agent/Dream 工具。
 
-use memory_domain::ScopeKey;
+use memory_domain::{Origin, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::soul::{insert_receipt_tx, AuditAction, AuditLayer, MemoryAuditEntry};
 use crate::{now_rfc3339, Store, StoreError};
 
-/// 退休覆盖请求（doc6/09 卡：API 须带最新真实用户事件 ID、指令 quote 与 span，
-/// 由调用方（HTTP/CLI handler）先行核验后传入核验结论；存储层仍核 scope/版本）。
+/// Agent 生命周期请求。最新用户事件、精确 quote/span、CAS 版本和幂等键均在
+/// 同一 SQLite 事务内复核；不能依赖 handler 先查后写。
 pub struct RetireRequest {
     pub expected_version: i64,
     pub actor_kind: &'static str,
     pub reason_code: Option<String>,
-    pub user_evidence_id: Option<String>,
+    pub idempotency_key: String,
+    pub origin: Origin,
+    pub user_evidence_id: String,
+    pub target_quote: String,
+    pub start_byte: i64,
+    pub end_byte: i64,
+}
+
+pub struct RestoreRequest {
+    pub expected_version: i64,
+    pub actor_kind: &'static str,
+    pub idempotency_key: String,
+    pub origin: Origin,
+    pub user_evidence_id: String,
+    pub target_quote: String,
+    pub start_byte: i64,
+    pub end_byte: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +58,43 @@ impl Store {
         memory_id: &str,
         req: &RetireRequest,
     ) -> Result<bool, StoreError> {
-        let Some((_kind, _claim, version, status)) = self.memory_status_row(scope, memory_id)? else {
+        let now = now_rfc3339()?;
+        let tx = self.conn_mut().transaction()?;
+        let request_sha = request_sha256(&serde_json::json!({
+            "memory_id": memory_id, "expected_version": req.expected_version,
+            "actor_kind": req.actor_kind, "reason_code": req.reason_code,
+            "origin": {"host_id": req.origin.host_id, "agent_id": req.origin.agent_id, "session_id": req.origin.session_id},
+            "user_evidence_id": req.user_evidence_id, "target_quote": req.target_quote,
+            "start_byte": req.start_byte, "end_byte": req.end_byte,
+        }));
+        if let Some(changed) = receipt_replay_tx(
+            &tx,
+            scope,
+            "memory_retire",
+            &req.idempotency_key,
+            &request_sha,
+        )? {
+            tx.commit()?;
+            return Ok(changed);
+        }
+        validate_latest_instruction_tx(
+            &tx,
+            scope,
+            &req.origin,
+            &req.user_evidence_id,
+            &req.target_quote,
+            req.start_byte,
+            req.end_byte,
+        )?;
+        let row: Option<(String, i64, String)> = tx
+            .query_row(
+                "SELECT claim, version, status FROM memories
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((claim, version, status)) = row else {
             return Err(StoreError::MemoryNotFound);
         };
         if status != "active" {
@@ -50,25 +103,81 @@ impl Store {
         if version != req.expected_version {
             return Err(StoreError::VersionConflict);
         }
-        let now = now_rfc3339()?;
-        let tx = self.conn_mut().transaction()?;
+        if !claim.contains(&req.target_quote) {
+            return Err(StoreError::AmbiguousTarget);
+        }
         let n = tx.execute(
             "INSERT INTO memory_retirements
                (tenant_id, user_id, memory_id, memory_version, actor_kind, reason_code,
                 user_evidence_id, retired_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT (tenant_id, user_id, memory_id) DO NOTHING",
-            params![scope.tenant_id, scope.user_id, memory_id, version,
-                    req.actor_kind, req.reason_code, req.user_evidence_id, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                memory_id,
+                version,
+                req.actor_kind,
+                req.reason_code,
+                req.user_evidence_id,
+                now
+            ],
         )?;
         if n == 0 {
-            return Ok(false); // 已退休：幂等确认
+            insert_receipt_tx(
+                &tx,
+                scope,
+                "memory_retire",
+                &req.idempotency_key,
+                &request_sha,
+                "200",
+                r#"{"changed":false}"#,
+            )?;
+            tx.commit()?;
+            return Ok(false);
         }
-        Self::record_l1_audit_tx(&tx, scope, memory_id, version, req.actor_kind)?;
+        let stale_pages = crate::pages::stale_pages_for_memory_tx(&tx, scope, memory_id, &now)?;
         // 退休与向量失效不互斥：置 stale 立即从语义支路消失（读路径另有 get_memory 门）。
         Self::stale_vectors_in_tx(&tx, scope, "memory", memory_id)?;
         Self::mark_index_dirty(&tx)?;
+        insert_receipt_tx(
+            &tx,
+            scope,
+            "memory_retire",
+            &req.idempotency_key,
+            &request_sha,
+            "200",
+            r#"{"changed":true}"#,
+        )?;
         tx.commit()?;
+        self.record_memory_audit_best_effort(
+            scope,
+            &MemoryAuditEntry {
+                record_id: memory_id.to_owned(),
+                layer: AuditLayer::L1,
+                action: AuditAction::Update,
+                agent_id: Some(req.origin.agent_id.clone()),
+                task_id: None,
+                version,
+                updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                request_id: None,
+            },
+        );
+        for (page_id, page_version) in stale_pages {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: page_id,
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Delete,
+                    agent_id: Some(req.origin.agent_id.clone()),
+                    task_id: None,
+                    version: page_version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
         Ok(true)
     }
 
@@ -78,45 +187,115 @@ impl Store {
         &mut self,
         scope: &ScopeKey,
         memory_id: &str,
-        actor_kind: &'static str,
+        req: &RestoreRequest,
     ) -> Result<bool, StoreError> {
         let now = now_rfc3339()?;
-        let row: Option<(i64, Option<String>)> = self
-            .conn()
+        let tx = self.conn_mut().transaction()?;
+        let request_sha = request_sha256(&serde_json::json!({
+            "memory_id": memory_id, "expected_version": req.expected_version,
+            "actor_kind": req.actor_kind,
+            "origin": {"host_id": req.origin.host_id, "agent_id": req.origin.agent_id, "session_id": req.origin.session_id},
+            "user_evidence_id": req.user_evidence_id, "target_quote": req.target_quote,
+            "start_byte": req.start_byte, "end_byte": req.end_byte,
+        }));
+        if let Some(changed) = receipt_replay_tx(
+            &tx,
+            scope,
+            "memory_restore",
+            &req.idempotency_key,
+            &request_sha,
+        )? {
+            tx.commit()?;
+            return Ok(changed);
+        }
+        validate_latest_instruction_tx(
+            &tx,
+            scope,
+            &req.origin,
+            &req.user_evidence_id,
+            &req.target_quote,
+            req.start_byte,
+            req.end_byte,
+        )?;
+        let row: Option<(i64, Option<String>)> = tx
             .query_row(
                 "SELECT m.version, m.valid_until FROM memories m
-                 WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
-                   AND (m.valid_until IS NULL OR m.valid_until > ?4)",
+             WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
+               AND (m.valid_until IS NULL OR m.valid_until > ?4)",
                 params![scope.tenant_id, scope.user_id, memory_id, now],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((version, _valid_until)) = row else {
-            return Err(StoreError::MemoryNotFound); // 非 active/已到期/不存在
+        let Some((version, _)) = row else {
+            return Err(StoreError::MemoryNotFound);
         };
-        let n_ev: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
-            params![scope.tenant_id, scope.user_id, memory_id],
-            |r| r.get::<_, i64>(0),
-        )?;
-        if n_ev == 0 {
-            return Err(StoreError::MemoryNotFound); // 至少一条有效 evidence
+        if version != req.expected_version {
+            return Err(StoreError::VersionConflict);
         }
-        let tx = self.conn_mut().transaction()?;
+        let valid_evidence: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memory_evidence me
+             JOIN evidence_events e ON e.tenant_id=me.tenant_id AND e.user_id=me.user_id AND e.id=me.evidence_id
+             WHERE me.tenant_id=?1 AND me.user_id=?2 AND me.memory_id=?3
+               AND NOT EXISTS (SELECT 1 FROM suppressed_sources ss
+                   WHERE ss.tenant_id=me.tenant_id AND ss.user_id=me.user_id AND ss.evidence_id=me.evidence_id)
+               AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt
+                   WHERE pt.tenant_id=me.tenant_id AND pt.user_id=me.user_id
+                     AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)",
+            params![scope.tenant_id, scope.user_id, memory_id],
+            |r| r.get(0),
+        )?;
+        if valid_evidence == 0 {
+            return Err(StoreError::MemoryNotFound);
+        }
         let n = tx.execute(
             "DELETE FROM memory_retirements WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             params![scope.tenant_id, scope.user_id, memory_id],
         )?;
         if n == 0 {
-            return Ok(false); // 未退休：幂等确认
+            insert_receipt_tx(
+                &tx,
+                scope,
+                "memory_restore",
+                &req.idempotency_key,
+                &request_sha,
+                "200",
+                r#"{"changed":false}"#,
+            )?;
+            tx.commit()?;
+            return Ok(false);
         }
-        Self::record_l1_audit_tx(&tx, scope, memory_id, version, actor_kind)?;
+        insert_receipt_tx(
+            &tx,
+            scope,
+            "memory_restore",
+            &req.idempotency_key,
+            &request_sha,
+            "200",
+            r#"{"changed":true}"#,
+        )?;
         tx.commit()?;
+        self.record_memory_audit_best_effort(
+            scope,
+            &MemoryAuditEntry {
+                record_id: memory_id.to_owned(),
+                layer: AuditLayer::L1,
+                action: AuditAction::Update,
+                agent_id: Some(req.origin.agent_id.clone()),
+                task_id: None,
+                version,
+                updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                request_id: None,
+            },
+        );
         Ok(true)
     }
 
     /// 退休覆盖行（诊断）。
-    pub fn retirement_get(&self, scope: &ScopeKey, memory_id: &str) -> Result<Option<RetireOverrideRow>, StoreError> {
+    pub fn retirement_get(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<RetireOverrideRow>, StoreError> {
         self.conn()
             .query_row(
                 "SELECT memory_id, memory_version, actor_kind, reason_code, retired_at
@@ -137,48 +316,93 @@ impl Store {
     }
 
     /// 退休 memory ID 集合（search/resident 组装后过滤用；有界 scope 内集合）。
-    pub fn retired_ids(&self, scope: &ScopeKey) -> Result<std::collections::HashSet<String>, StoreError> {
-        let mut stmt = self
-            .conn()
-            .prepare("SELECT memory_id FROM memory_retirements WHERE tenant_id=?1 AND user_id=?2")?;
+    pub fn retired_ids(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT memory_id FROM memory_retirements WHERE tenant_id=?1 AND user_id=?2",
+        )?;
         let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get(0))?;
         Ok(rows.collect::<Result<std::collections::HashSet<_>, _>>()?)
     }
+}
 
-    fn memory_status_row(
-        &self,
-        scope: &ScopeKey,
-        memory_id: &str,
-    ) -> Result<Option<(String, String, i64, String)>, StoreError> {
-        self.conn()
-            .query_row(
-                "SELECT kind, claim, version, status FROM memories
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, memory_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
+fn request_sha256(value: &serde_json::Value) -> String {
+    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+}
 
-    /// metadata-only L1 update 审计（doc6/14：不写正文/前后值；失败不回滚由调用方处理）。
-    pub(crate) fn record_l1_audit_tx(
-        tx: &rusqlite::Transaction<'_>,
-        scope: &ScopeKey,
-        memory_id: &str,
-        version: i64,
-        _actor_kind: &str,
-    ) -> Result<(), StoreError> {
-        let ms = chrono::Utc::now().timestamp_millis();
-        tx.execute(
-            "INSERT INTO memory_audit
-               (audit_id, record_id, layer, action, tenant_id, user_id, agent_id, task_id,
-                version, updated_at_ms, request_id)
-             VALUES (?1,?2,'L1','update',?3,?4,NULL,NULL,?5,?6,NULL)",
-            params![Uuid::now_v7().to_string(), memory_id, scope.tenant_id, scope.user_id, version, ms],
-        )?;
-        Ok(())
+fn receipt_replay_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &ScopeKey,
+    operation: &str,
+    idempotency_key: &str,
+    request_sha: &str,
+) -> Result<Option<bool>, StoreError> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT request_sha256, response_json FROM mutation_receipts
+         WHERE tenant_id=?1 AND user_id=?2 AND operation=?3 AND idempotency_key=?4",
+            params![scope.tenant_id, scope.user_id, operation, idempotency_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((sha, _)) if sha != request_sha => Err(StoreError::IdempotencyConflict),
+        Some((_, response)) => {
+            let changed = serde_json::from_str::<serde_json::Value>(&response)
+                .ok()
+                .and_then(|v| v.get("changed").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false);
+            Ok(Some(changed))
+        }
     }
+}
+
+fn validate_latest_instruction_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &ScopeKey,
+    origin: &Origin,
+    evidence_id: &str,
+    quote: &str,
+    start_byte: i64,
+    end_byte: i64,
+) -> Result<(), StoreError> {
+    let event: Option<(String, String)> = tx
+        .query_row(
+            "SELECT id, content FROM evidence_events e
+         WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.host_id=?3 AND e.session_id=?4
+           AND e.role='user' AND e.source_kind='user'
+           AND NOT EXISTS (SELECT 1 FROM evidence_events newer
+             WHERE newer.tenant_id=e.tenant_id AND newer.user_id=e.user_id
+               AND newer.host_id=e.host_id AND newer.session_id=e.session_id
+               AND newer.role='user' AND newer.source_kind='user' AND newer.event_seq>e.event_seq)",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                origin.host_id,
+                origin.session_id
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((latest_id, content)) = event else {
+        return Err(StoreError::StaleUserEvidence);
+    };
+    if latest_id != evidence_id {
+        return Err(StoreError::StaleUserEvidence);
+    }
+    if start_byte < 0
+        || end_byte <= start_byte
+        || end_byte > content.len() as i64
+        || !content.is_char_boundary(start_byte as usize)
+        || !content.is_char_boundary(end_byte as usize)
+        || content.get(start_byte as usize..end_byte as usize) != Some(quote)
+    {
+        return Err(StoreError::QuoteMismatch);
+    }
+    Ok(())
 }
 
 pub(crate) fn sha256_hex(input: &str) -> String {

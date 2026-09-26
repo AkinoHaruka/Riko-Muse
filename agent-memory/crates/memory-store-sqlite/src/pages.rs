@@ -11,6 +11,7 @@ use memory_recall::cjk_bigrams;
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
 
+use crate::soul::{AuditAction, AuditLayer, MemoryAuditEntry};
 use crate::{now_rfc3339, Store, StoreError};
 
 /// generator/Prompt 版本（doc6/05 §3）：修改 Prompt 必须新建版本；旧 job 按保存版本分派。
@@ -24,7 +25,9 @@ pub const PAGE_BODY_MAX_CHARS: usize = 1200;
 fn validate_question_key(key: &str) -> Result<(), StoreError> {
     let ok = !key.is_empty()
         && key.chars().count() <= 64
-        && key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
     if ok {
         Ok(())
     } else {
@@ -162,8 +165,9 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
             params![scope.tenant_id, scope.user_id, key, new_version, text, actor_kind, now],
         )?;
-        Self::stale_question_pages_tx(&tx, scope, key)?;
+        let stale = Self::stale_question_pages_tx(&tx, scope, key)?;
         tx.commit()?;
+        self.audit_stale_pages(scope, stale);
         Ok(new_version)
     }
 
@@ -219,7 +223,14 @@ impl Store {
         tx.execute(
             "UPDATE mental_model_questions SET version=?4, status=?5, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND question_key=?3",
-            params![scope.tenant_id, scope.user_id, key, new_version, new_status, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                key,
+                new_version,
+                new_status,
+                now
+            ],
         )?;
         tx.execute(
             "INSERT INTO mental_model_question_revisions
@@ -227,8 +238,9 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![scope.tenant_id, scope.user_id, key, new_version, current.1, new_status, actor_kind, now],
         )?;
-        Self::stale_question_pages_tx(&tx, scope, key)?;
+        let stale = Self::stale_question_pages_tx(&tx, scope, key)?;
         tx.commit()?;
+        self.audit_stale_pages(scope, stale);
         Ok(new_version)
     }
 
@@ -260,25 +272,46 @@ impl Store {
         tx: &rusqlite::Transaction<'_>,
         scope: &ScopeKey,
         key: &str,
-    ) -> Result<(), StoreError> {
-        let stale_ids: Vec<String> = {
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let stale_ids: Vec<(String, i64)> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM memory_pages
+                "SELECT id, version FROM memory_pages
                  WHERE tenant_id=?1 AND user_id=?2 AND document_kind='mental_model'
                    AND document_key=?3 AND status='published'",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, key], |r| r.get(0))?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, key], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        for id in stale_ids {
+        for (id, _) in &stale_ids {
             tx.execute(
                 "UPDATE memory_pages SET status='stale', updated_at=?4
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, id, now_rfc3339()?],
             )?;
             remove_page_index_tx(tx, scope, &id)?;
+            crate::Store::stale_vectors_in_tx(tx, scope, "page", id)?;
         }
-        Ok(())
+        Ok(stale_ids)
+    }
+
+    fn audit_stale_pages(&mut self, scope: &ScopeKey, stale: Vec<(String, i64)>) {
+        for (page_id, version) in stale {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: page_id,
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Delete,
+                    agent_id: None,
+                    task_id: None,
+                    version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
     }
 
     // ---- 页面发布与读取（doc6/05 §4）----
@@ -297,12 +330,14 @@ impl Store {
             return Err(StoreError::InvalidPageField);
         }
         let now = now_rfc3339()?;
+        let tx = self.conn_mut().transaction()?;
         for (mid, ver, sha) in req.sources {
-            let row: Option<(i64, String)> = self
-                .conn()
+            let row: Option<(i64, String)> = tx
                 .query_row(
                     "SELECT version, claim_sha256 FROM memories
                      WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'
+                       AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                         WHERE r.tenant_id=memories.tenant_id AND r.user_id=memories.user_id AND r.memory_id=memories.id)
                        AND (valid_until IS NULL OR valid_until > ?4)",
                     params![req.scope.tenant_id, req.scope.user_id, mid, now],
                     |r| Ok((r.get(0)?, r.get(1)?)),
@@ -313,20 +348,23 @@ impl Store {
                 _ => return Err(StoreError::StaleInput),
             }
         }
-        let existing: Option<(String, i64)> = self
-            .conn()
+        let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT id, version FROM memory_pages
                  WHERE tenant_id=?1 AND user_id=?2 AND document_kind=?3 AND document_key=?4
                    AND status IN ('published','stale') LIMIT 1",
-                params![req.scope.tenant_id, req.scope.user_id, req.document_kind, req.document_key],
+                params![
+                    req.scope.tenant_id,
+                    req.scope.user_id,
+                    req.document_kind,
+                    req.document_key
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         let (page_id, new_version, previous) = match &existing {
             Some((id, v)) => {
-                let prev: Option<(String, String, i64)> = self
-                    .conn()
+                let prev: Option<(String, String, i64)> = tx
                     .query_row(
                         "SELECT title, body_md, version FROM memory_pages WHERE id=?1",
                         params![id],
@@ -337,7 +375,6 @@ impl Store {
             }
             None => (Uuid::now_v7().to_string(), 1, None),
         };
-        let tx = self.conn_mut().transaction()?;
         if existing.is_some() {
             // 旧版快照已在首次发布时写入 page_revisions（version=旧值）；此处只
             // CAS 推进页面行并替换来源（doc6/05 §4：旧版留 revisions 供查证）。
@@ -390,7 +427,14 @@ impl Store {
                 "INSERT INTO page_sources
                    (tenant_id, user_id, page_id, memory_id, memory_version, claim_sha256)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![req.scope.tenant_id, req.scope.user_id, page_id, mid, ver, sha],
+                params![
+                    req.scope.tenant_id,
+                    req.scope.user_id,
+                    page_id,
+                    mid,
+                    ver,
+                    sha
+                ],
             )?;
         }
         // 新版本快照（doc6/02 §3：来源 ID/version 列表 JSON）。
@@ -444,6 +488,21 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        if previous.is_some() {
+            self.record_memory_audit_best_effort(
+                req.scope,
+                &MemoryAuditEntry {
+                    record_id: page_id.clone(),
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Update,
+                    agent_id: None,
+                    task_id: None,
+                    version: new_version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
         Ok((page_id, new_version))
     }
 
@@ -481,12 +540,17 @@ impl Store {
                 },
             )
             .optional()?;
-        let Some(mut page) = base else { return Ok(None) };
+        let Some(mut page) = base else {
+            return Ok(None);
+        };
         if page.status != "published" {
             return Ok(None);
         }
         let mut stmt = self.conn().prepare(
-            "SELECT s.memory_id, s.memory_version, s.claim_sha256, m.status, m.version, m.claim_sha256
+            "SELECT s.memory_id, s.memory_version, s.claim_sha256, m.status, m.version, m.claim_sha256,
+                    m.valid_until,
+                    EXISTS (SELECT 1 FROM memory_retirements r
+                            WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
              FROM page_sources s JOIN memories m
                ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id AND m.id=s.memory_id
              WHERE s.tenant_id=?1 AND s.user_id=?2 AND s.page_id=?3",
@@ -499,11 +563,18 @@ impl Store {
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, bool>(7)?,
             ))
         })?;
         for row in rows {
-            let (mid, ver, sha, status, cur_ver, cur_sha) = row?;
-            if status != "active" || cur_ver != ver || cur_sha != sha {
+            let (mid, ver, sha, status, cur_ver, cur_sha, valid_until, retired) = row?;
+            if status != "active"
+                || cur_ver != ver
+                || cur_sha != sha
+                || retired
+                || valid_until.as_deref().is_some_and(|until| until <= now)
+            {
                 return Ok(None); // 来源失效 → 不可见（doc6/05 §4）
             }
             page.sources.push((mid, ver));
@@ -517,38 +588,37 @@ impl Store {
     /// correct/forget/retire 引用源变化时调用（doc6/05 §4/§5）：引用该 memory
     /// 的 published 页置 stale 并移除索引（调用方与其业务修改同事务或随后
     /// 立即执行；doc6/02 §8.1 同事务失效）。
-    pub fn stale_pages_for_memory(&mut self, scope: &ScopeKey, memory_id: &str) -> Result<(), StoreError> {
-        let ids: Vec<String> = {
-            let mut stmt = self.conn().prepare(
-                "SELECT DISTINCT p.id FROM memory_pages p
-                 JOIN page_sources s ON s.tenant_id=p.tenant_id AND s.user_id=p.user_id
-                    AND s.page_id=p.id
-                 WHERE p.tenant_id=?1 AND p.user_id=?2 AND s.memory_id=?3 AND p.status='published'",
-            )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| r.get(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if ids.is_empty() {
-            return Ok(());
-        }
+    pub fn stale_pages_for_memory(
+        &mut self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<(), StoreError> {
         let tx = self.conn_mut().transaction()?;
-        for id in ids {
-            tx.execute(
-                "UPDATE memory_pages SET status='stale', updated_at=?4
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'",
-                params![scope.tenant_id, scope.user_id, id, now_rfc3339()?],
-            )?;
-            remove_page_index_tx(&tx, scope, &id)?;
-        }
+        let stale = stale_pages_for_memory_tx(&tx, scope, memory_id, &now_rfc3339()?)?;
         tx.commit()?;
+        for (page_id, version) in stale {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: page_id,
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Delete,
+                    agent_id: None,
+                    task_id: None,
+                    version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
         Ok(())
     }
 }
 
 impl Store {
-/// 页面列表（CLI/HTTP 审阅；默认只 published，可看 stale/archived）。
-/// 不做来源逐页复核（show/读取接口才复核），列表标 status 供审阅。
-pub fn page_list(
+    /// 页面列表（CLI/HTTP 审阅；默认只 published，可看 stale/archived）。
+    /// 不做来源逐页复核（show/读取接口才复核），列表标 status 供审阅。
+    pub fn page_list(
         &self,
         scope: &ScopeKey,
         statuses: &[&str],
@@ -557,32 +627,49 @@ pub fn page_list(
         let status_clause = if statuses.is_empty() {
             "status IN ('published','stale','archived')".to_string()
         } else {
-            let list = statuses.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+            let list = statuses
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
             format!("status IN ({list})")
         };
+        let now = now_rfc3339()?;
         let mut stmt = self.conn().prepare(&format!(
             "SELECT id, document_kind, document_key, question_version, question_text,
                     title, body_md, status, version, generator_version, input_fingerprint, updated_at
-             FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND {status_clause}
+             FROM memory_pages p WHERE tenant_id=?1 AND user_id=?2 AND {status_clause}
+               AND EXISTS (SELECT 1 FROM page_sources ps
+                 WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
+               AND NOT EXISTS (SELECT 1 FROM page_sources ps
+                 JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
+                 WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id
+                   AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
+                     OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                     OR EXISTS (SELECT 1 FROM memory_retirements r
+                       WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))
              ORDER BY updated_at DESC LIMIT ?3"
         ))?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, limit as i64], |r| {
-            Ok(PageRow {
-                page_id: r.get(0)?,
-                document_kind: r.get(1)?,
-                document_key: r.get(2)?,
-                question_version: r.get(3)?,
-                question_text: r.get(4)?,
-                title: r.get(5)?,
-                body_md: r.get(6)?,
-                status: r.get(7)?,
-                version: r.get(8)?,
-                generator_version: r.get(9)?,
-                input_fingerprint: r.get(10)?,
-                updated_at: r.get(11)?,
-                sources: Vec::new(),
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, limit as i64, now],
+            |r| {
+                Ok(PageRow {
+                    page_id: r.get(0)?,
+                    document_kind: r.get(1)?,
+                    document_key: r.get(2)?,
+                    question_version: r.get(3)?,
+                    question_text: r.get(4)?,
+                    title: r.get(5)?,
+                    body_md: r.get(6)?,
+                    status: r.get(7)?,
+                    version: r.get(8)?,
+                    generator_version: r.get(9)?,
+                    input_fingerprint: r.get(10)?,
+                    updated_at: r.get(11)?,
+                    sources: Vec::new(),
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -599,12 +686,33 @@ pub fn page_list(
             "UPDATE memory_pages SET status='archived', updated_at=?4
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status='published' AND version=?5",
-            params![scope.tenant_id, scope.user_id, page_id, now_rfc3339()?, expected_version],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                page_id,
+                now_rfc3339()?,
+                expected_version
+            ],
         )?;
         remove_page_index_tx(&tx, scope, page_id)?;
         // D6-8：页面向量失效与归档同事务（doc6/02 §4）。
         crate::Store::stale_vectors_in_tx(&tx, scope, "page", page_id)?;
         tx.commit()?;
+        if n > 0 {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: page_id.to_owned(),
+                    layer: AuditLayer::L2,
+                    action: AuditAction::Delete,
+                    agent_id: None,
+                    task_id: None,
+                    version: expected_version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
         Ok(n > 0)
     }
 
@@ -622,15 +730,27 @@ pub fn page_list(
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; grams.len()].join(",");
+        let now = now_rfc3339()?;
         let mut bind_values: Vec<String> = vec![scope.tenant_id.clone(), scope.user_id.clone()];
         bind_values.extend(grams.clone());
+        bind_values.push(now);
         let sql = format!(
             "SELECT DISTINCT g.page_id FROM page_grams g
              JOIN memory_pages p ON p.id=g.page_id AND p.tenant_id=g.tenant_id AND p.user_id=g.user_id
              WHERE g.tenant_id=?1 AND g.user_id=?2 AND p.status='published'
                AND g.gram IN ({placeholders})
+               AND EXISTS (SELECT 1 FROM page_sources ps
+                   WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
+               AND NOT EXISTS (SELECT 1 FROM page_sources ps
+                   JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
+                   WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id
+                     AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
+                       OR (m.valid_until IS NOT NULL AND m.valid_until<=?{})
+                       OR EXISTS (SELECT 1 FROM memory_retirements r
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))
              ORDER BY g.page_id LIMIT ?{}",
-            bind_values.len() + 1
+            grams.len() + 3,
+            grams.len() + 4
         );
         bind_values.push((limit as i64).to_string());
         let mut stmt = self.conn().prepare(&sql)?;
@@ -650,9 +770,18 @@ pub fn page_list(
         // 只允许 pin 当前 published 页（doc6/02 §3）。
         let published: Option<i64> = tx
             .query_row(
-                "SELECT version FROM memory_pages
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'",
-                params![scope.tenant_id, scope.user_id, page_id],
+                "SELECT p.version FROM memory_pages p
+                 WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.id=?3 AND p.status='published'
+                   AND EXISTS (SELECT 1 FROM page_sources ps
+                     WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
+                   AND NOT EXISTS (SELECT 1 FROM page_sources ps
+                     JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
+                     WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id
+                       AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
+                         OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                         OR EXISTS (SELECT 1 FROM memory_retirements r
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
+                params![scope.tenant_id, scope.user_id, page_id, now],
                 |r| r.get(0),
             )
             .optional()?;
@@ -667,38 +796,39 @@ pub fn page_list(
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let version = match existing {
-            None => {
-                let max: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(position), -1) FROM resident_page_pins
+        let version =
+            match existing {
+                None => {
+                    let max: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(position), -1) FROM resident_page_pins
                      WHERE tenant_id=?1 AND user_id=?2 AND enabled=1",
-                    params![scope.tenant_id, scope.user_id],
-                    |r| r.get(0),
-                )?;
-                tx.execute(
-                    "INSERT INTO resident_page_pins
+                        params![scope.tenant_id, scope.user_id],
+                        |r| r.get(0),
+                    )?;
+                    tx.execute(
+                        "INSERT INTO resident_page_pins
                        (tenant_id, user_id, page_id, enabled, position, pinned_at, version)
                      VALUES (?1, ?2, ?3, 1, ?4, ?5, 1)",
-                    params![scope.tenant_id, scope.user_id, page_id, max + 1, now],
-                )?;
-                1
-            }
-            Some((enabled, version)) if enabled == 0 => {
-                let max: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(position), -1) FROM resident_page_pins
+                        params![scope.tenant_id, scope.user_id, page_id, max + 1, now],
+                    )?;
+                    1
+                }
+                Some((enabled, version)) if enabled == 0 => {
+                    let max: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(position), -1) FROM resident_page_pins
                      WHERE tenant_id=?1 AND user_id=?2 AND enabled=1",
-                    params![scope.tenant_id, scope.user_id],
-                    |r| r.get(0),
-                )?;
-                tx.execute(
+                        params![scope.tenant_id, scope.user_id],
+                        |r| r.get(0),
+                    )?;
+                    tx.execute(
                     "UPDATE resident_page_pins SET enabled=1, position=?4, version=?5, pinned_at=?6
                      WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
                     params![scope.tenant_id, scope.user_id, page_id, max + 1, version + 1, now],
                 )?;
-                version + 1
-            }
-            Some((_, version)) => version, // 已 enabled：幂等
-        };
+                    version + 1
+                }
+                Some((_, version)) => version, // 已 enabled：幂等
+            };
         tx.commit()?;
         Ok(version)
     }
@@ -715,7 +845,9 @@ pub fn page_list(
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((enabled, version)) = existing else { return Ok(0) };
+        let Some((enabled, version)) = existing else {
+            return Ok(0);
+        };
         if enabled == 0 {
             return Ok(version);
         }
@@ -734,12 +866,23 @@ pub fn page_list(
         let tx = self.conn_mut().transaction()?;
         tx.execute("DELETE FROM page_fts", [])?;
         tx.execute("DELETE FROM page_grams", [])?;
+        let now = now_rfc3339()?;
         let mut inserted = 0usize;
         {
             let mut stmt = tx.prepare(
-                "SELECT id, tenant_id, user_id, title, body_md FROM memory_pages WHERE status='published'",
+                "SELECT p.id, p.tenant_id, p.user_id, p.title, p.body_md FROM memory_pages p
+                 WHERE p.status='published'
+                   AND EXISTS (SELECT 1 FROM page_sources ps
+                     WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
+                   AND NOT EXISTS (SELECT 1 FROM page_sources ps
+                     JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
+                     WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id
+                       AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
+                         OR (m.valid_until IS NOT NULL AND m.valid_until<=?1)
+                         OR EXISTS (SELECT 1 FROM memory_retirements r
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(params![now], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -768,6 +911,36 @@ pub fn page_list(
         tx.commit()?;
         Ok((inserted, 0))
     }
+}
+
+/// 同一个业务事务内置 stale、删词法/向量索引，并返回待写审计的页版本。
+pub(crate) fn stale_pages_for_memory_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &ScopeKey,
+    memory_id: &str,
+    now: &str,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    let ids: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT p.id, p.version FROM memory_pages p
+             JOIN page_sources s ON s.tenant_id=p.tenant_id AND s.user_id=p.user_id AND s.page_id=p.id
+             WHERE p.tenant_id=?1 AND p.user_id=?2 AND s.memory_id=?3 AND p.status='published'",
+        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, _) in &ids {
+        tx.execute(
+            "UPDATE memory_pages SET status='stale', updated_at=?4
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'",
+            params![scope.tenant_id, scope.user_id, id, now],
+        )?;
+        remove_page_index_tx(tx, scope, id)?;
+        crate::Store::stale_vectors_in_tx(tx, scope, "page", id)?;
+    }
+    Ok(ids)
 }
 
 /// 移除一页的 FTS/grams 索引行（同事务；doc6/02 §8.1）。
@@ -827,9 +1000,12 @@ fn strip_fence(raw: &str) -> &str {
 
 /// 校验 `mental_model_v1` 输出（doc6/05 §3.1）：字段集固定、答案 1—1200 字、
 /// 来源 1—20 条。来源是否在冻结输入内由调用方核（publish/路由侧）。
-pub fn parse_mental_model_output(raw: &str, expected_key: &str) -> Result<MentalModelOutput, StoreError> {
-    let out: MentalModelOutput = serde_json::from_str(strip_fence(raw))
-        .map_err(|_| StoreError::InvalidPageField)?;
+pub fn parse_mental_model_output(
+    raw: &str,
+    expected_key: &str,
+) -> Result<MentalModelOutput, StoreError> {
+    let out: MentalModelOutput =
+        serde_json::from_str(strip_fence(raw)).map_err(|_| StoreError::InvalidPageField)?;
     if out.question_key != expected_key {
         return Err(StoreError::InvalidPageField);
     }
@@ -844,13 +1020,14 @@ pub fn parse_mental_model_output(raw: &str, expected_key: &str) -> Result<Mental
 
 /// 校验 `consolidate_v1` 输出：≤4 页；title 1—80、正文 1—1200、来源 2—20。
 pub fn parse_consolidate_output(raw: &str) -> Result<ConsolidateOutput, StoreError> {
-    let out: ConsolidateOutput = serde_json::from_str(strip_fence(raw))
-        .map_err(|_| StoreError::InvalidPageField)?;
+    let out: ConsolidateOutput =
+        serde_json::from_str(strip_fence(raw)).map_err(|_| StoreError::InvalidPageField)?;
     if out.pages.is_empty() || out.pages.len() > 4 {
         return Err(StoreError::InvalidPageField);
     }
     for p in &out.pages {
-        if p.topic_key.is_empty() || p.source_memory_ids.len() < 2 || p.source_memory_ids.len() > 20 {
+        if p.topic_key.is_empty() || p.source_memory_ids.len() < 2 || p.source_memory_ids.len() > 20
+        {
             return Err(StoreError::InvalidPageField);
         }
         if p.title.is_empty() || p.title.chars().count() > PAGE_TITLE_MAX_CHARS {

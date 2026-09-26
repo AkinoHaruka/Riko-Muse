@@ -8,7 +8,7 @@
 
 use memory_domain::ScopeKey;
 use rusqlite::{params, OptionalExtension};
-use sha2::Digest;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::{lifecycle::sha256_hex, now_rfc3339, Store, StoreError};
@@ -61,9 +61,15 @@ impl Store {
                 dependency_fingerprint, idempotency_key, expires_at, consumed, created_at)
              VALUES (?1,?2,?3,'purge_memory',?4,?5,?6,?7,?8,0,?9)",
             params![
-                scope.tenant_id, scope.user_id, sha256_hex(&token),
-                memory_id, target_version,
-                fingerprint, idempotency_key, expires, now
+                scope.tenant_id,
+                scope.user_id,
+                sha256_hex(&token),
+                memory_id,
+                target_version,
+                fingerprint,
+                idempotency_key,
+                expires,
+                now
             ],
         )?;
         preview.memory_id = memory_id.to_string();
@@ -90,7 +96,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((target, _tver, frozen_fp, expires_at, consumed)) = row else {
+        let Some((target, _tver, frozen_fp, expires_at, _consumed)) = row else {
             // 同幂等键已消费：无正文结果（不重复执行，不泄露目标）。
             let replayed: i64 = self.conn().query_row(
                 "SELECT COUNT(*) FROM purge_confirmations
@@ -99,7 +105,10 @@ impl Store {
                 |r| r.get(0),
             )?;
             if replayed > 0 {
-                return Ok(PurgeOutcome { job_id: String::new(), deleted: serde_json::json!({"replayed": true}) });
+                return Ok(PurgeOutcome {
+                    job_id: String::new(),
+                    deleted: serde_json::json!({"replayed": true}),
+                });
             }
             return Err(StoreError::MemoryNotFound);
         };
@@ -115,19 +124,21 @@ impl Store {
         // 执行闭包（单事务）+ 原子消费 token。
         let job_id = Uuid::now_v7().to_string();
         let tx = self.conn_mut().transaction()?;
-        let deleted = Self::execute_purge_tx(&tx, scope, &target)?;
-        tx.execute(
-            "UPDATE purge_confirmations SET consumed=1, target_id=NULL, token_sha256='', dependency_fingerprint=''
-             WHERE tenant_id=?1 AND user_id=?2 AND token_sha256=?3",
-            params![scope.tenant_id, scope.user_id, token_sha],
-        )?;
+        let deleted = Self::execute_purge_tx(&tx, scope, &target, Some(&token_sha))?;
         tx.execute(
             "INSERT INTO purge_jobs
                (id, tenant_id, user_id, operation, target_id, dependency_fingerprint, status,
                 attempts, deleted_counts_json, created_at, updated_at)
              VALUES (?1,?2,?3,'purge_memory',?4,?5,'succeeded',1,?6,?7,?7)",
-            params![job_id, scope.tenant_id, scope.user_id, target, frozen_fp,
-                    deleted.to_string(), now],
+            params![
+                job_id,
+                scope.tenant_id,
+                scope.user_id,
+                target,
+                frozen_fp,
+                deleted.to_string(),
+                now
+            ],
         )?;
         // 终态清除可反查目标的 ID/fingerprint（doc6/02 §7）。
         tx.execute(
@@ -139,7 +150,11 @@ impl Store {
     }
 
     /// 依赖闭包计算（只读）。fingerprint = 排序后的依赖 ID 清单哈希。
-    pub fn purge_closure(&self, scope: &ScopeKey, memory_id: &str) -> Result<PurgePreview, StoreError> {
+    pub fn purge_closure(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<PurgePreview, StoreError> {
         let exists: Option<i64> = self
             .conn()
             .query_row(
@@ -151,12 +166,17 @@ impl Store {
         if exists.is_none() {
             return Err(StoreError::MemoryNotFound);
         }
-        let mut p = PurgePreview { memory_id: memory_id.to_string(), ..Default::default() };
+        let mut p = PurgePreview {
+            memory_id: memory_id.to_string(),
+            ..Default::default()
+        };
         let mut ids: Vec<String> = {
             let mut stmt = self.conn().prepare(
                 "SELECT evidence_id FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| r.get(0))?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| {
+                r.get(0)
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         ids.sort();
@@ -181,20 +201,26 @@ impl Store {
             let mut stmt = self.conn().prepare(
                 "SELECT DISTINCT s.page_id FROM page_sources s
                  JOIN memory_pages pg ON pg.id=s.page_id AND pg.tenant_id=s.tenant_id AND pg.user_id=s.user_id
-                 WHERE s.tenant_id=?1 AND s.user_id=?2 AND s.memory_id=?3 AND pg.status='published'",
+                 WHERE s.tenant_id=?1 AND s.user_id=?2 AND s.memory_id=?3",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| r.get(0))?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| {
+                r.get(0)
+            })?;
             p.page_ids = rows.collect::<Result<Vec<_>, _>>()?;
             p.page_ids.sort();
         }
         // 旧候选（quote/claim 闭包）：以本记忆 evidence 为来源的旧 memory_candidates。
         if !p.evidence_ids.is_empty() {
-            let placeholders = p.evidence_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let placeholders = p
+                .evidence_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
                 "SELECT COUNT(*) FROM memory_candidates WHERE tenant_id=?1 AND user_id=?2 AND primary_evidence_id IN ({placeholders})"
             );
-            let mut bind: Vec<&dyn rusqlite::ToSql> =
-                vec![&scope.tenant_id, &scope.user_id];
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&scope.tenant_id, &scope.user_id];
             for e in &p.evidence_ids {
                 bind.push(e);
             }
@@ -219,6 +245,7 @@ impl Store {
         tx: &rusqlite::Transaction<'_>,
         scope: &ScopeKey,
         memory_id: &str,
+        consumed_confirmation_sha: Option<&str>,
     ) -> Result<serde_json::Value, StoreError> {
         let now = now_rfc3339()?;
         // 1. 收集本记忆的 evidence（id + content sha；墓碑按 sha 防重放）。
@@ -233,6 +260,7 @@ impl Store {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let mut closure_ids: HashSet<String> = HashSet::from([memory_id.to_owned()]);
         // 2. 逐 evidence 判共享（其他记忆引用即共享，保留 evidence 本体）。
         let mut deleted_evidence: Vec<String> = Vec::new();
         for (eid, ev_sha) in &evidence_ids {
@@ -243,22 +271,24 @@ impl Store {
             )?;
             let shared: i64 = tx.query_row(
                 "SELECT (SELECT COUNT(*) FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3 AND memory_id<>?4)
-                       + (SELECT COUNT(*) FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3)
-                       + (SELECT COUNT(*) FROM dream_job_inputs WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3)",
+                       + (SELECT COUNT(*) FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3 AND forgotten_memory_id<>?4)",
                 params![scope.tenant_id, scope.user_id, eid, memory_id],
                 |r| r.get(0),
             )?;
             if shared > 0 {
                 continue; // 共享 evidence 不删本体（其他对象仍引用）
             }
+            closure_ids.insert(eid.clone());
             // 3a. 旧候选闭包：primary_evidence 指向该事件的 memory_candidates（quote/claim）。
             let old_candidates: Vec<String> = {
                 let mut stmt = tx.prepare(
                     "SELECT id FROM memory_candidates WHERE tenant_id=?1 AND user_id=?2 AND primary_evidence_id=?3",
                 )?;
-                let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
+            closure_ids.extend(old_candidates.iter().cloned());
             for oc in old_candidates {
                 tx.execute(
                     "DELETE FROM candidate_evidence WHERE tenant_id=?1 AND user_id=?2 AND candidate_id=?3",
@@ -275,9 +305,11 @@ impl Store {
                     "SELECT DISTINCT candidate_id FROM dream_candidate_evidence
                      WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
                 )?;
-                let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
+            closure_ids.extend(dream_candidates.iter().cloned());
             for dc in dream_candidates {
                 tx.execute(
                     "DELETE FROM adjudication_results WHERE tenant_id=?1 AND user_id=?2 AND candidate_id=?3",
@@ -304,10 +336,61 @@ impl Store {
                 "DELETE FROM adjudication_job_inputs WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
                 params![scope.tenant_id, scope.user_id, eid],
             )?;
+            let affected_adjudication_jobs: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT aj.id FROM adjudication_jobs aj
+                     JOIN dream_job_inputs di ON di.tenant_id=aj.tenant_id AND di.user_id=aj.user_id AND di.job_id=aj.dream_job_id
+                     WHERE di.tenant_id=?1 AND di.user_id=?2 AND di.evidence_id=?3",
+                )?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
+                rows.collect::<Result<Vec<String>, _>>()?
+            };
+            closure_ids.extend(affected_adjudication_jobs.iter().cloned());
+            for job_id in affected_adjudication_jobs {
+                tx.execute(
+                    "DELETE FROM adjudication_results WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3",
+                    params![scope.tenant_id, scope.user_id, job_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM adjudication_job_recalls WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3",
+                    params![scope.tenant_id, scope.user_id, job_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM adjudication_job_inputs WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3",
+                    params![scope.tenant_id, scope.user_id, job_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM adjudication_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                    params![scope.tenant_id, scope.user_id, job_id],
+                )?;
+            }
+            let affected_dream_jobs: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT job_id FROM dream_job_inputs
+                     WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                )?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
+                rows.collect::<Result<Vec<String>, _>>()?
+            };
+            closure_ids.extend(affected_dream_jobs.iter().cloned());
+            // Dream jobs are derived work records, not independent owners of L0.
+            // Remove every batch containing this evidence so no frozen prompt or
+            // retry can later reintroduce the purged source.
+            tx.execute(
+                "DELETE FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id IN
+                   (SELECT job_id FROM dream_job_inputs WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3)",
+                params![scope.tenant_id, scope.user_id, eid],
+            )?;
+            tx.execute(
+                "DELETE FROM dream_evidence_state WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id, scope.user_id, eid],
+            )?;
             // 3c. suppressed_sources 由墓碑替代（防 spool 重放复活）。
             tx.execute(
-                "DELETE FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
-                params![scope.tenant_id, scope.user_id, eid],
+                "DELETE FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3 AND forgotten_memory_id=?4",
+                params![scope.tenant_id, scope.user_id, eid, memory_id],
             )?;
             // 3d. 删事件本体 + 墓碑（source_id=content sha，防 spool 重放复活）。
             tx.execute(
@@ -326,21 +409,16 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT DISTINCT s.page_id FROM page_sources s
                  JOIN memory_pages pg ON pg.id=s.page_id AND pg.tenant_id=s.tenant_id AND pg.user_id=s.user_id
-                 WHERE s.tenant_id=?1 AND s.user_id=?2 AND s.memory_id=?3 AND pg.status='published'",
+                 WHERE s.tenant_id=?1 AND s.user_id=?2 AND s.memory_id=?3",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| r.get(0))?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| {
+                r.get(0)
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        closure_ids.extend(page_ids.iter().cloned());
         for pid in &page_ids {
-            tx.execute(
-                "UPDATE memory_pages SET status='archived', updated_at=?4
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, pid, now],
-            )?;
-            tx.execute(
-                "DELETE FROM page_fts WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
-                params![scope.tenant_id, scope.user_id, pid],
-            )?;
+            tx.execute("DELETE FROM page_fts WHERE page_id=?1", params![pid])?;
             tx.execute(
                 "DELETE FROM page_grams WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
                 params![scope.tenant_id, scope.user_id, pid],
@@ -349,8 +427,33 @@ impl Store {
                 "DELETE FROM semantic_vectors WHERE tenant_id=?1 AND user_id=?2 AND object_kind='page' AND object_id=?3",
                 params![scope.tenant_id, scope.user_id, pid],
             )?;
+            tx.execute(
+                "DELETE FROM semantic_jobs WHERE tenant_id=?1 AND user_id=?2 AND object_kind='page' AND object_id=?3",
+                params![scope.tenant_id, scope.user_id, pid],
+            )?;
+            tx.execute(
+                "DELETE FROM resident_page_pins WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+                params![scope.tenant_id, scope.user_id, pid],
+            )?;
+            tx.execute(
+                "DELETE FROM page_revisions WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+                params![scope.tenant_id, scope.user_id, pid],
+            )?;
+            tx.execute(
+                "DELETE FROM page_sources WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+                params![scope.tenant_id, scope.user_id, pid],
+            )?;
+            tx.execute(
+                "DELETE FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, pid],
+            )?;
         }
-        // 5. 记忆本体依赖闭包。
+        // 5. 记忆本体依赖闭包。suppressed_sources 的 forgotten_memory_id FK 指向
+        // 本记忆，无论其 evidence 是否共享都随闭包删除（防重放由墓碑承接）。
+        tx.execute(
+            "DELETE FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND forgotten_memory_id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+        )?;
         tx.execute(
             "DELETE FROM resident_pins WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             params![scope.tenant_id, scope.user_id, memory_id],
@@ -387,20 +490,93 @@ impl Store {
             "DELETE FROM page_sources WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
             params![scope.tenant_id, scope.user_id, memory_id],
         )?;
-        // 6. 两张审计表匹配行随闭包删除（doc6/02 §7）。
-        tx.execute(
-            "DELETE FROM audit_events WHERE tenant_id=?1 AND user_id=?2 AND target_id=?3",
-            params![scope.tenant_id, scope.user_id, memory_id],
-        )?;
-        tx.execute(
-            "DELETE FROM memory_audit WHERE tenant_id=?1 AND user_id=?2 AND record_id=?3",
-            params![scope.tenant_id, scope.user_id, memory_id],
-        )?;
-        // mutation_receipts 中可反查闭包目标的响应一并删除。
-        tx.execute(
-            "DELETE FROM mutation_receipts WHERE tenant_id=?1 AND user_id=?2 AND response_json LIKE ?3",
-            params![scope.tenant_id, scope.user_id, format!("%{memory_id}%")],
-        )?;
+        // 6. 两张审计表及幂等回执中可精确反查闭包对象的行一并清理。
+        // detail/response JSON 递归按完整字符串值匹配，避免 LIKE 子串误删相邻 ID。
+        let audit_rows: Vec<(String, Option<String>, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, target_id, detail_json FROM audit_events WHERE tenant_id=?1 AND user_id=?2",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (audit_id, target_id, detail_json) in audit_rows {
+            let detail_refs = serde_json::from_str::<serde_json::Value>(&detail_json)
+                .is_ok_and(|v| json_references_any(&v, &closure_ids));
+            if target_id
+                .as_ref()
+                .is_some_and(|id| closure_ids.contains(id))
+                || detail_refs
+            {
+                tx.execute(
+                    "DELETE FROM audit_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                    params![scope.tenant_id, scope.user_id, audit_id],
+                )?;
+            }
+        }
+        let metadata_rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT audit_id, record_id, request_id FROM memory_audit WHERE tenant_id=?1 AND user_id=?2",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (audit_id, record_id, request_id) in metadata_rows {
+            if closure_ids.contains(&record_id)
+                || request_id
+                    .as_ref()
+                    .is_some_and(|id| closure_ids.contains(id))
+            {
+                tx.execute(
+                    "DELETE FROM memory_audit WHERE tenant_id=?1 AND user_id=?2 AND audit_id=?3",
+                    params![scope.tenant_id, scope.user_id, audit_id],
+                )?;
+            }
+        }
+        let receipts: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT operation, idempotency_key, response_json FROM mutation_receipts WHERE tenant_id=?1 AND user_id=?2",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (operation, key, response_json) in receipts {
+            let response_refs = serde_json::from_str::<serde_json::Value>(&response_json)
+                .is_ok_and(|v| json_references_any(&v, &closure_ids));
+            if response_refs {
+                tx.execute(
+                    "DELETE FROM mutation_receipts WHERE tenant_id=?1 AND user_id=?2 AND operation=?3 AND idempotency_key=?4",
+                    params![scope.tenant_id, scope.user_id, operation, key],
+                )?;
+            }
+        }
+        // 清除所有可定位目标的预览。手动确认保留当前消费行供同键幂等重放。
+        match consumed_confirmation_sha {
+            Some(token_sha) => {
+                tx.execute(
+                    "DELETE FROM purge_confirmations
+                     WHERE tenant_id=?1 AND user_id=?2 AND target_id=?3 AND token_sha256<>?4",
+                    params![scope.tenant_id, scope.user_id, memory_id, token_sha],
+                )?;
+                tx.execute(
+                    "UPDATE purge_confirmations SET consumed=1, target_id=NULL, target_version=NULL,
+                            token_sha256='', dependency_fingerprint=NULL
+                     WHERE tenant_id=?1 AND user_id=?2 AND token_sha256=?3",
+                    params![scope.tenant_id, scope.user_id, token_sha],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM purge_confirmations WHERE tenant_id=?1 AND user_id=?2 AND target_id=?3",
+                    params![scope.tenant_id, scope.user_id, memory_id],
+                )?;
+            }
+        }
         // 7. 记忆本体最后删（FK 依赖已清）。
         tx.execute(
             "DELETE FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
@@ -448,16 +624,30 @@ impl Store {
              ON CONFLICT (tenant_id, user_id) DO UPDATE SET
                policy_version=?3, effective_at=?4, raw_evidence_retention_days=?5,
                expired_memory_purge_after_days=?6, enabled=?7, updated_at=?4",
-            params![scope.tenant_id, scope.user_id, version, now,
-                    raw_evidence_retention_days, expired_memory_purge_after_days, enabled as i64],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                version,
+                now,
+                raw_evidence_retention_days,
+                expired_memory_purge_after_days,
+                enabled as i64
+            ],
         )?;
         tx.execute(
             "INSERT INTO retention_policy_history
                (tenant_id, user_id, policy_version, raw_evidence_retention_days,
                 expired_memory_purge_after_days, enabled, effective_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![scope.tenant_id, scope.user_id, version,
-                    raw_evidence_retention_days, expired_memory_purge_after_days, enabled as i64, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                version,
+                raw_evidence_retention_days,
+                expired_memory_purge_after_days,
+                enabled as i64,
+                now
+            ],
         )?;
         tx.commit()?;
         Ok(version)
@@ -465,7 +655,10 @@ impl Store {
 
     /// 执行一轮 retention（无 LLM；复用 purge 闭包与墓碑；提交前复核当前策略版本）。
     /// 批次 fingerprint = (policy_version, cutoffs, 目标清单)；默认策略（0/关闭）无目标。
-    pub fn retention_run(&mut self, scope: &ScopeKey) -> Result<Option<serde_json::Value>, StoreError> {
+    pub fn retention_run(
+        &mut self,
+        scope: &ScopeKey,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
         let (version, raw_days, expired_days, enabled): (i64, i64, i64, i64) = match self
             .conn()
             .query_row(
@@ -487,7 +680,7 @@ impl Store {
             Ok((chrono::DateTime::parse_from_rfc3339(&now)
                 .map_err(|e| StoreError::Time(e.to_string()))?
                 - chrono::Duration::days(days))
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
         };
         // 目标 1：过期超过 expired_days 的记忆（读时已过期的 active 行）。
         let mut targets: Vec<String> = Vec::new();
@@ -498,7 +691,10 @@ impl Store {
                  WHERE tenant_id=?1 AND user_id=?2 AND status='active'
                    AND valid_until IS NOT NULL AND valid_until < ?3",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, cutoff_mem], |r| r.get(0))?;
+            let rows = stmt
+                .query_map(params![scope.tenant_id, scope.user_id, cutoff_mem], |r| {
+                    r.get(0)
+                })?;
             targets.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         // 目标 2：过期超 expired_days 的非 active 记忆（superseded/expired 行同理物理清理）。
@@ -509,7 +705,10 @@ impl Store {
                  WHERE tenant_id=?1 AND user_id=?2 AND status IN ('superseded','expired')
                    AND updated_at < ?3",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, cutoff_mem], |r| r.get(0))?;
+            let rows = stmt
+                .query_map(params![scope.tenant_id, scope.user_id, cutoff_mem], |r| {
+                    r.get(0)
+                })?;
             targets.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         targets.sort();
@@ -585,7 +784,7 @@ impl Store {
                 )
                 .optional()?;
             if exists.is_some() {
-                Self::execute_purge_tx(&tx, scope, mid)?;
+                Self::execute_purge_tx(&tx, scope, mid, None)?;
                 purged += 1;
             }
         }
@@ -614,6 +813,19 @@ impl Store {
             "memories_purged": purged,
             "raw_evidence_deleted": raw_deleted,
         })))
+    }
+}
+
+fn json_references_any(value: &serde_json::Value, ids: &HashSet<String>) -> bool {
+    match value {
+        serde_json::Value::String(s) => ids.contains(s),
+        serde_json::Value::Array(items) => items.iter().any(|item| json_references_any(item, ids)),
+        serde_json::Value::Object(fields) => {
+            fields.values().any(|item| json_references_any(item, ids))
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
     }
 }
 

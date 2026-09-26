@@ -150,9 +150,9 @@ pub(crate) fn insert_receipt_tx(
 /// 幂等键规则（doc6/02 §2）：1—128 个 ASCII [A-Za-z0-9._-]。
 fn validate_idempotency_key(key: &str) -> Result<(), StoreError> {
     let ok_len = !key.is_empty() && key.len() <= 128;
-    let ok_chars = key.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
-    });
+    let ok_chars = key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
     if ok_len && ok_chars {
         Ok(())
     } else {
@@ -168,7 +168,11 @@ pub fn receipt_hash(parts: &[&str]) -> String {
 
 impl Store {
     /// 读取当前 Soul；不存在返回 None（HTTP 层表现为 version 0）。
-    pub fn get_soul(&self, scope: &ScopeKey, agent_id: &str) -> Result<Option<SoulProfile>, StoreError> {
+    pub fn get_soul(
+        &self,
+        scope: &ScopeKey,
+        agent_id: &str,
+    ) -> Result<Option<SoulProfile>, StoreError> {
         let row = self
             .conn()
             .query_row(
@@ -279,7 +283,9 @@ impl Store {
                         )?;
                     }
                     return Ok(SoulUpsertReport {
-                        outcome: SoulUpsertOutcome::Unchanged { version: current_version },
+                        outcome: SoulUpsertOutcome::Unchanged {
+                            version: current_version,
+                        },
                         audit_recorded: true,
                     });
                 }
@@ -292,7 +298,15 @@ impl Store {
                     "UPDATE soul_profiles
                      SET body_md=?4, version=?5, body_sha256=?6, updated_at=?7
                      WHERE tenant_id=?1 AND user_id=?2 AND agent_id=?3",
-                    params![scope.tenant_id, scope.user_id, agent_id, body_md, new_version, sha, now],
+                    params![
+                        scope.tenant_id,
+                        scope.user_id,
+                        agent_id,
+                        body_md,
+                        new_version,
+                        sha,
+                        now
+                    ],
                 )?;
                 tx.execute(
                     "INSERT INTO soul_revisions
@@ -313,23 +327,23 @@ impl Store {
                 }
                 tx.commit()?;
                 // best-effort L3 audit（doc6/14 §4）：失败只丢审计行，业务写入已提交。
-                let audit_recorded = self
-                    .record_memory_audit(
-                        scope,
-                        &MemoryAuditEntry {
-                            record_id: agent_id.to_string(),
-                            layer: AuditLayer::L3,
-                            action: AuditAction::Update,
-                            agent_id: Some(agent_id.to_string()),
-                            task_id: None,
-                            version: new_version,
-                            updated_at_ms: chrono::Utc::now().timestamp_millis(),
-                            request_id: request_id.map(str::to_string),
-                        },
-                    )
-                    .is_ok();
+                let audit_recorded = self.record_memory_audit_best_effort(
+                    scope,
+                    &MemoryAuditEntry {
+                        record_id: agent_id.to_string(),
+                        layer: AuditLayer::L3,
+                        action: AuditAction::Update,
+                        agent_id: Some(agent_id.to_string()),
+                        task_id: None,
+                        version: new_version,
+                        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                        request_id: request_id.map(str::to_string),
+                    },
+                );
                 Ok(SoulUpsertReport {
-                    outcome: SoulUpsertOutcome::Updated { version: new_version },
+                    outcome: SoulUpsertOutcome::Updated {
+                        version: new_version,
+                    },
                     audit_recorded,
                 })
             }
@@ -472,9 +486,34 @@ impl Store {
             return Err(StoreError::IdempotencyConflict);
         }
         let tx = self.conn_mut().transaction()?;
-        insert_receipt_tx(&tx, scope, operation, idempotency_key, request_sha256, result_status, response_json)?;
+        insert_receipt_tx(
+            &tx,
+            scope,
+            operation,
+            idempotency_key,
+            request_sha256,
+            result_status,
+            response_json,
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Append metadata audit after the business transaction has committed.
+    /// Audit outages must be observable and must not roll back the mutation.
+    pub(crate) fn record_memory_audit_best_effort(
+        &mut self,
+        scope: &ScopeKey,
+        entry: &MemoryAuditEntry,
+    ) -> bool {
+        match self.record_memory_audit(scope, entry) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("[memoryd] memory_audit write failed layer={} action={} request_id={:?}: {error}",
+                    entry.layer.as_str(), entry.action.as_str(), entry.request_id);
+                false
+            }
+        }
     }
 }
 
@@ -502,7 +541,9 @@ mod tests {
     fn scope_of(store: &mut Store, tenant: &str, user: &str, tag: &str) -> ScopeKey {
         let dir = std::env::temp_dir().join(format!("am-soul-test-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        store.principal_add(tenant, user, &dir.join(format!("{tenant}-{user}.token"))).unwrap();
+        store
+            .principal_add(tenant, user, &dir.join(format!("{tenant}-{user}.token")))
+            .unwrap();
         let token = std::fs::read_to_string(dir.join(format!("{tenant}-{user}.token"))).unwrap();
         store.verify_token(token.trim()).unwrap().unwrap()
     }
@@ -512,31 +553,73 @@ mod tests {
         // doc6/02 §2 / doc6/14：CAS 版本链、同内容幂等不增、L3 update 审计。
         let (mut store, scope) = setup("upsert");
         let report = store
-            .upsert_soul(&scope, "agent-a", "# 角色\n先给结论。", 0, "user_cli", None, None)
+            .upsert_soul(
+                &scope,
+                "agent-a",
+                "# 角色\n先给结论。",
+                0,
+                "user_cli",
+                None,
+                None,
+            )
             .unwrap();
-        assert!(matches!(report.outcome, SoulUpsertOutcome::Created { version: 1 }));
+        assert!(matches!(
+            report.outcome,
+            SoulUpsertOutcome::Created { version: 1 }
+        ));
         assert!(report.audit_recorded);
         // 同内容同版本：幂等不增版本、不新增 revision。
         let same = store
-            .upsert_soul(&scope, "agent-a", "# 角色\n先给结论。", 1, "user_cli", None, None)
+            .upsert_soul(
+                &scope,
+                "agent-a",
+                "# 角色\n先给结论。",
+                1,
+                "user_cli",
+                None,
+                None,
+            )
             .unwrap();
-        assert!(matches!(same.outcome, SoulUpsertOutcome::Unchanged { version: 1 }));
+        assert!(matches!(
+            same.outcome,
+            SoulUpsertOutcome::Unchanged { version: 1 }
+        ));
         // CAS 冲突：旧版本更新被拒，原版保持。
         let conflict = store.upsert_soul(&scope, "agent-a", "v2", 0, "user_cli", None, None);
         assert!(matches!(conflict, Err(StoreError::VersionConflict)));
-        assert_eq!(store.get_soul(&scope, "agent-a").unwrap().unwrap().version, 1);
+        assert_eq!(
+            store.get_soul(&scope, "agent-a").unwrap().unwrap().version,
+            1
+        );
         // 正常更新：版本 +1、revision 两条、L3 update 审计一条（record_id=agent_id）。
         let v2 = store
-            .upsert_soul(&scope, "agent-a", "# 角色\n先给结论，再讲取舍。", 1, "user_api", Some("req-1"), None)
+            .upsert_soul(
+                &scope,
+                "agent-a",
+                "# 角色\n先给结论，再讲取舍。",
+                1,
+                "user_api",
+                Some("req-1"),
+                None,
+            )
             .unwrap();
-        assert!(matches!(v2.outcome, SoulUpsertOutcome::Updated { version: 2 }));
+        assert!(matches!(
+            v2.outcome,
+            SoulUpsertOutcome::Updated { version: 2 }
+        ));
         assert!(v2.audit_recorded);
         let profile = store.get_soul(&scope, "agent-a").unwrap().unwrap();
         assert_eq!(profile.version, 2);
-        assert_eq!(profile.body_sha256, sha256_hex("# 角色\n先给结论，再讲取舍。"));
+        assert_eq!(
+            profile.body_sha256,
+            sha256_hex("# 角色\n先给结论，再讲取舍。")
+        );
         let revisions = store.list_soul_revisions(&scope, "agent-a").unwrap();
         assert_eq!(revisions.len(), 2);
-        let rev2 = store.get_soul_revision(&scope, "agent-a", 2).unwrap().unwrap();
+        let rev2 = store
+            .get_soul_revision(&scope, "agent-a", 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(rev2.body_md, "# 角色\n先给结论，再讲取舍。");
         assert_eq!(rev2.actor_kind, "user_api");
         let (layer, action, version, request_id): (String, String, i64, Option<String>) = store
@@ -548,7 +631,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!((layer.as_str(), action.as_str(), version), ("L3", "update", 2));
+        assert_eq!(
+            (layer.as_str(), action.as_str(), version),
+            ("L3", "update", 2)
+        );
         assert_eq!(request_id.as_deref(), Some("req-1"));
         // expected>0 且无行：拒绝创建。
         assert!(matches!(
@@ -567,7 +653,10 @@ mod tests {
                 Some(("key-create", "hash-create")),
             )
             .unwrap();
-        let receipt = store.fetch_mutation_receipt(&scope, "soul_import", "key-create").unwrap().unwrap();
+        let receipt = store
+            .fetch_mutation_receipt(&scope, "soul_import", "key-create")
+            .unwrap()
+            .unwrap();
         assert_eq!(receipt.result_status, "created");
         assert_eq!(receipt.request_sha256, "hash-create");
         // 同键同请求第二次：CAS 命中且哈希同 → Unchanged；前置 fetch 重放由 HTTP 层做，
@@ -583,7 +672,10 @@ mod tests {
                 Some(("key-create", "hash-create")),
             )
             .unwrap();
-        assert!(matches!(replay.outcome, SoulUpsertOutcome::Unchanged { version: 1 }));
+        assert!(matches!(
+            replay.outcome,
+            SoulUpsertOutcome::Unchanged { version: 1 }
+        ));
     }
 
     #[test]
@@ -598,7 +690,10 @@ mod tests {
         // 恰好 2000：允许（多字节字符按标量计）。
         let exact = "好".repeat(SOUL_BODY_MAX_CHARS);
         assert!(matches!(
-            store.upsert_soul(&scope, "a", &exact, 0, "user_cli", None, None).unwrap().outcome,
+            store
+                .upsert_soul(&scope, "a", &exact, 0, "user_cli", None, None)
+                .unwrap()
+                .outcome,
             SoulUpsertOutcome::Created { .. }
         ));
         assert!(matches!(
@@ -617,31 +712,85 @@ mod tests {
         // doc6/02 §8.7：跨用户 404 语义（存储层为 None / MemoryNotFound 类）。
         let (mut store, scope_a) = setup("iso-a");
         let scope_b = scope_of(&mut store, "t", "u2", "iso-b");
-        store.upsert_soul(&scope_a, "agent-a", "Alice 的 soul", 0, "user_cli", None, None).unwrap();
+        store
+            .upsert_soul(
+                &scope_a,
+                "agent-a",
+                "Alice 的 soul",
+                0,
+                "user_cli",
+                None,
+                None,
+            )
+            .unwrap();
         assert!(store.get_soul(&scope_b, "agent-a").unwrap().is_none());
-        assert!(store.list_soul_revisions(&scope_b, "agent-a").unwrap().is_empty());
-        assert!(store.get_soul_revision(&scope_b, "agent-a", 1).unwrap().is_none());
+        assert!(store
+            .list_soul_revisions(&scope_b, "agent-a")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_soul_revision(&scope_b, "agent-a", 1)
+            .unwrap()
+            .is_none());
         // B 无法写 A 的 agent 键产生混淆——B 写同名键是 B 自己的新 profile。
-        store.upsert_soul(&scope_b, "agent-a", "Bob 的 soul", 0, "user_cli", None, None).unwrap();
-        assert_eq!(store.get_soul(&scope_a, "agent-a").unwrap().unwrap().body_md, "Alice 的 soul");
-        assert_eq!(store.get_soul(&scope_b, "agent-a").unwrap().unwrap().body_md, "Bob 的 soul");
+        store
+            .upsert_soul(
+                &scope_b,
+                "agent-a",
+                "Bob 的 soul",
+                0,
+                "user_cli",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_soul(&scope_a, "agent-a")
+                .unwrap()
+                .unwrap()
+                .body_md,
+            "Alice 的 soul"
+        );
+        assert_eq!(
+            store
+                .get_soul(&scope_b, "agent-a")
+                .unwrap()
+                .unwrap()
+                .body_md,
+            "Bob 的 soul"
+        );
     }
 
     #[test]
     fn audit_failure_does_not_rollback_soul_update() {
         // doc6/14 §4：审计写失败告警但不回滚业务修改——删除审计表模拟持久故障。
         let (mut store, scope) = setup("audit-fail");
-        store.upsert_soul(&scope, "agent-a", "v1", 0, "user_cli", None, None).unwrap();
-        store.conn_mut().execute_batch("DROP TABLE memory_audit;").unwrap();
+        store
+            .upsert_soul(&scope, "agent-a", "v1", 0, "user_cli", None, None)
+            .unwrap();
+        store
+            .conn_mut()
+            .execute_batch("DROP TABLE memory_audit;")
+            .unwrap();
         let result = store
             .upsert_soul(&scope, "agent-a", "v2", 1, "user_cli", None, None)
             .unwrap();
-        assert!(matches!(result.outcome, SoulUpsertOutcome::Updated { version: 2 }), "业务写入必须成功");
-        assert!(!result.audit_recorded, "审计失败必须经 audit_recorded 上报供告警");
+        assert!(
+            matches!(result.outcome, SoulUpsertOutcome::Updated { version: 2 }),
+            "业务写入必须成功"
+        );
+        assert!(
+            !result.audit_recorded,
+            "审计失败必须经 audit_recorded 上报供告警"
+        );
         let profile = store.get_soul(&scope, "agent-a").unwrap().unwrap();
         assert_eq!(profile.version, 2);
         assert_eq!(profile.body_md, "v2");
-        assert_eq!(store.list_soul_revisions(&scope, "agent-a").unwrap().len(), 2);
+        assert_eq!(
+            store.list_soul_revisions(&scope, "agent-a").unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -660,10 +809,16 @@ mod tests {
             store.save_mutation_receipt(&scope, "soul_import", "key-1", "hash-b", "200", "{}"),
             Err(StoreError::IdempotencyConflict)
         ));
-        let receipt = store.fetch_mutation_receipt(&scope, "soul_import", "key-1").unwrap().unwrap();
+        let receipt = store
+            .fetch_mutation_receipt(&scope, "soul_import", "key-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(receipt.request_sha256, "hash-a");
         // 跨 operation 同键互不干扰。
-        assert!(store.fetch_mutation_receipt(&scope, "pin", "key-1").unwrap().is_none());
+        assert!(store
+            .fetch_mutation_receipt(&scope, "pin", "key-1")
+            .unwrap()
+            .is_none());
         // 坏键：空、超长、非法字符。
         assert!(matches!(
             store.save_mutation_receipt(&scope, "soul_import", "", "h", "200", "{}"),
