@@ -1,11 +1,11 @@
 # Agent-Memory 实施交接说明（给下一个 Harness）
 
-> **当前入口（2026-09-26）**：D6 规范差距修复已按五组实施；当前 schema 11。开工前读根目录 `AGENTS.md`、D6 规范与 [15-D6规范差距修复](15-D6规范差距修复.md)。原始 D6 实施时点记录见 [14](14-D6交付记录.md)，源码事实与官方 DSH 复验见 [13](13-D6源码核对.md)。dana/realtest 原库未触碰、未升级。
+> **当前入口（2026-09-27）**：D6 规范差距修复已按五组实施；当前 schema 11。真实 OpenRouter + 官方 DSH 的受控 Soul/Resident 单样本已通过；Dream 子 Agent 真实模型与 embedding 集成仍未验证。开工前读根目录 `AGENTS.md`、D6 规范与 [15-D6规范差距修复](15-D6规范差距修复.md)。原始 D6 实施时点记录见 [14](14-D6交付记录.md)，源码事实与官方 DSH 复验见 [13](13-D6源码核对.md)。dana/realtest 原库未触碰、未升级。
 
 交接时间：2026-09-25 上午（本机 GMT+8）。
 > **进展更新（2026-09-25 下午）**：V2-3 注入复验、纠错/遗忘/取记忆宿主回路、跨用户 404、spool 离线恢复、V2-6 交付记录均已完成（含三项真实缺陷修复，见 [04](04-V2-6交付记录.md)）。03 的待办已清空。
 > **真实模型验证（2026-09-25 晚）**：两条模型链路（提取 worker / DSH 会话）已接真实模型实测通过，「模型真实连通」不再是未验证项，见 [05](05-真实模型验证.md)。
-> **D6 真实模型小样本探针（2026-09-26）**：Gemini chat/embedding 与 SiliconFlow/Qwen 已做少量真实 API 请求；Gemini 单样本提取结构通过，embedding 对照出现一次反向排序。memoryd/DSH 集成链路和整体语义质量仍未验证，见 [16](16-真实模型小范围验证.md)。
+> **OpenRouter + DSH 真实模型验证（2026-09-27）**：OpenRouter chat 单样本直连通过；全新 schema 11 临时库上，官方 DSH headless + OpenRouter 实际回答出只存在于 Resident 的合成代号，并遵循 Soul 格式；L0 spool 5/5 获得 receipt。全量 Rust/TS 回归通过。真实 Dream 子 Agent/准入裁决、memoryd embedding 集成与整体语义质量仍未验证，见 [16](16-真实模型小范围验证.md) §7—8。
 
 这份目录只做交接，不改规范。规范来源优先级仍然是：`doc2/` > `doc/`；当 `doc2/` 与官方 `deepseek-harness@477b4f4` 源码事实冲突时，以官方源码为准并回来更新 `doc2/`（本次已发生一次，见 [03](03-待办与已知冲突.md) 第 2 节）。
 
@@ -24,7 +24,7 @@
 | [13 D6-0 源码核对与运行补充](13-D6源码核对.md) | 官方 DSH 源码基线、运行时 compact 事件、prompt/子 Agent seam 和本轮宿主复验 |
 | [14 D6 原始交付记录](14-D6交付记录.md) | D6-0—D6-10 首轮交付时点记录；其中过时结论由 15 号记录覆盖 |
 | [15 D6 规范差距修复](15-D6规范差距修复.md) | 当前五组提交、C01—C09 修复结果、E01—E25 验收矩阵、验证边界 |
-| [16 D6 真实模型小范围验证](16-真实模型小范围验证.md) | Gemini 与 SiliconFlow 的真实 API 小样本探针、embedding 反例和未验证边界 |
+| [16 D6 真实模型小范围验证](16-真实模型小范围验证.md) | Gemini/SiliconFlow 历史 API 探针，以及 OpenRouter + 官方 DSH 本轮真实调用和当前未验证边界 |
 
 ## 30 秒状态
 
@@ -32,7 +32,7 @@
 根仓库 branch/HEAD：开工现场检查；本次收口后为 main，HEAD 见最新交付记录
 当前实现：D6 C01—C09 差距修复已提交；schema 11（迁移 0001—0010 字节未改，仅新增 0011）
 验证：`cargo build --workspace`、`cargo test --workspace`（120 passed）、DSH adapter `npm test`（16 passed）；官方 DSH + 固定响应验证 compact、Dream 子 Agent、页面发布和离线 spool 重放
-已验证：少量真实 Gemini chat/embedding 与 SiliconFlow/Qwen API 端点请求；未验证：memoryd/DSH 真实模型集成、整体语义质量、reranker、规模性能基线、安装部署
+已验证：OpenRouter API 及官方 DSH + memoryd Soul/Resident 的单样本真实模型调用；此前 Gemini/SiliconFlow API 探针见 16 §1—6。未验证：真实 Dream child/Rust 准入闭环、memoryd embedding 集成、整体语义质量、reranker、规模性能基线、安装部署
 数据库边界：dana/realtest 原库未打开或升级；任何迁移演练只用临时库/副本
 用户工作区：根 `AGENTS.md` 与 `agent-memory/README.md` 的用户改动保留未提交；`deepseek-harness/`、`MiMo-Code/`、`doc2/`、`doc3/`、`doc5/`、`doc6/` 未跟踪，禁止递归暂存
 ```
