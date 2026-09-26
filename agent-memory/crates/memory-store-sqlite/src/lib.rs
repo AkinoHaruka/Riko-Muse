@@ -83,8 +83,11 @@ pub mod diagnostics;
 #[cfg(test)]
 mod d65_tests;
 #[cfg(test)]
+mod d67_tests;
+#[cfg(test)]
 mod probes;
 pub mod consolidation_jobs;
+pub mod dream_jobs;
 pub mod evidence;
 pub mod jobs;
 pub mod memories;

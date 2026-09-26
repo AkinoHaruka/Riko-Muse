@@ -463,6 +463,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => None,
             };
             worker::spawn_worker(state.clone(), model_cfg);
+            // D6-7：Auto Dream scheduler（doc6/10 §4.2，默认启用；memoryd 内置受控
+            // runner，doc6/10 §8 路径——由持久 trigger/jobs 驱动）。周期 15 分钟
+            // tick；每 scope 24 小时一次 + 空闲 15 分钟 + ≥1 条新 user event 才入队。
+            // 无模型配置时作业停在 queued，doctor 报 dream_status=missing_model。
+            {
+                let sched_state = state.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+                    loop {
+                        tick.tick().await;
+                        let Ok(mut store) = sched_state.store.lock() else { continue };
+                        let Ok(now) = memory_store_sqlite::now_rfc3339_pub() else { continue };
+                        let Ok(due) = store.dream_auto_due(&now, 24, 15) else { continue };
+                        for (tenant, user, _) in due {
+                            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+                            let key = format!("auto-{}", &now[..10.min(now.len())]);
+                            let _ = store.dream_trigger(&scope, "scheduled", &key, None, None, None);
+                        }
+                    }
+                });
+            }
             let addr: SocketAddr = cfg.listen_addr.parse().expect("配置已校验为 loopback");
             let app = Router::new()
                 .route("/v1/health", get(health))
@@ -488,6 +509,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/pages", get(list_pages))
                 .route("/v1/pages/{page_id}", get(get_page))
                 .route("/v1/mental-model/questions", get(list_questions))
+                .route("/v1/dream/triggers", post(post_dream_trigger))
+                .route("/v1/dream/jobs", get(list_dream_jobs))
+                .route("/v1/dream/jobs/{job_id}", get(get_dream_job))
                 .route("/v1/resident/page-pins", post(post_page_pin))
                 .route("/v1/resident/page-pins/{page_id}", delete(delete_page_pin))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
@@ -1133,7 +1157,6 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
             let cfg = Config::load(&config)?;
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
             let scope = ScopeKey { tenant_id: tenant, user_id: user };
-            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             let job = store
                 .consolidation_get(&scope, &job_id)
                 .map_err(|e| e.to_string())?
@@ -2643,6 +2666,145 @@ async fn delete_page_pin(
             "pin_version": version,
         }))
         .into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- D6-7：POST /v1/dream/triggers、GET /v1/dream/jobs(/{id})（doc6/06 §2、doc6/10 §4）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DreamTriggerRequest {
+    trigger_kind: String,
+    trigger_key: String,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+async fn post_dream_trigger(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<DreamTriggerRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    if req.trigger_key.is_empty() || req.trigger_key.chars().count() > 128 {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "trigger_key 须 1—128 字符");
+    }
+    // 只入队不等待完成（doc6/10 §4：触发器只负责入队）。
+    let result = {
+        let mut guard = state.store.lock().unwrap();
+        guard.dream_trigger(
+            &scope,
+            &req.trigger_kind,
+            &req.trigger_key,
+            req.agent_id.as_deref(),
+            req.host_id.as_deref(),
+            req.session_id.as_deref(),
+        )
+    };
+    match result {
+        Ok(Some(job)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "status": "trigger_queued",
+                "job": {
+                    "job_id": job.id,
+                    "trigger_kind": job.trigger_kind,
+                    "status": job.status,
+                    "input_fingerprint": job.input_fingerprint,
+                    "extract_version": job.extract_version,
+                },
+            })),
+        )
+            .into_response(),
+        // 无待处理 L0：不建空作业（doc6/10 §4.2）。
+        Ok(None) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "status": "nothing_to_process",
+        }))
+        .into_response(),
+        Err(StoreError::StateConflict) => err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "trigger_kind 非法"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DreamJobsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+fn dream_job_json(job: &memory_store_sqlite::dream_jobs::DreamJobRow) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": job.id,
+        "trigger_kind": job.trigger_kind,
+        "trigger_key": job.trigger_key,
+        "extract_version": job.extract_version,
+        "status": job.status,
+        "attempts": job.attempts,
+        "run_after": job.run_after,
+        "lease_until": job.lease_until,
+        "input_fingerprint": job.input_fingerprint,
+        "error_code": job.error_code,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    })
+}
+
+async fn list_dream_jobs(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<DreamJobsQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "limit 必须 1～100");
+    }
+    if let Some(s) = query.status.as_deref() {
+        if !matches!(s, "queued" | "running" | "succeeded" | "retryable_failed" | "provider_wait" | "dead" | "stale_input") {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "status 非法");
+        }
+    }
+    let guard = state.store.lock().unwrap();
+    match guard.dream_list(&scope, query.status.as_deref(), limit) {
+        Ok(rows) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "jobs": rows.iter().map(dream_job_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn get_dream_job(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let guard = state.store.lock().unwrap();
+    match guard.dream_get(&scope, &job_id) {
+        Ok(Some(job)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "job": dream_job_json(&job),
+        }))
+        .into_response(),
+        // 跨用户/不存在均 404（doc6/06 §2）。
+        Ok(None) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "作业不存在或不属于当前 scope"),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }
