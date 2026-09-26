@@ -15,6 +15,7 @@
  * 5. 失败分类：可恢复(离线/超时/429/5xx)退避重试；401 暂停该令牌全部出站并报配置问题；
  *    400/409 永久标记该 session 停发，等人工修复。
  */
+import { createHash } from "node:crypto";
 import type { MemoryClient } from "./client.js";
 import { Spool, SpoolLimitError, type SpooledOp } from "./spool.js";
 
@@ -44,6 +45,15 @@ export interface LatestUserMessage {
 export interface GapChecker {
   /** 返回该 session 指定 seq 的原始事件；不存在/不可读返回 undefined。 */
   readEvent(sessionId: string, seq: number): Promise<unknown>;
+}
+
+/** L0 只接收顶层宿主会话；子 Agent 与 fork 会话不是用户原始证据。 */
+export function isCapturableSessionHeader(
+  header: { origin?: unknown; parentSession?: unknown } | undefined,
+): boolean {
+  return header !== undefined
+    && header.origin !== "subagent"
+    && header.parentSession === undefined;
 }
 
 const QUEUE_MAX_ENTRIES = 1024;
@@ -111,6 +121,15 @@ export class EventPipeline {
     const type = ev.type;
     if (type === "turn/end") {
       this.enqueueFlush(sessionId);
+      return;
+    }
+    if (type === "compaction/end") {
+      const data = ev.data as { compactionId?: unknown } | undefined;
+      if (typeof data?.compactionId === "string" && data.compactionId.length > 0) {
+        this.enqueueCompactionTrigger(sessionId, data.compactionId);
+      } else {
+        this.logger.warn(`DREAM_TRIGGER_SKIPPED: compaction/end 缺少 compactionId session=${sessionId}`);
+      }
       return;
     }
     const mapped = this.mapEvent(sessionId, ev);
@@ -314,24 +333,86 @@ export class EventPipeline {
     const sessionId = String(origin?.session_id ?? op.request.session_id ?? "");
     if (sessionId.length === 0) return;
     const bodySeq = op.op === "event" ? Number(op.request.event_seq) : undefined;
+    if (bodySeq !== undefined && Number.isSafeInteger(bodySeq)) {
+      this.lastBodySeq.set(sessionId, Math.max(this.lastBodySeq.get(sessionId) ?? -1, bodySeq));
+    }
     this.enqueueToChain({ op, sessionId, bodySeq, bytes: 0 });
   }
 
-  private enqueueFlush(sessionId: string): void {
+  private enqueueFlush(sessionId: string): boolean {
     const through = this.lastBodySeq.get(sessionId);
-    if (through === undefined) return; // 无正文证据，无需 flush
+    if (through === undefined) return true; // 无正文证据，无需 flush
     // 本段计数覆盖的事件都 ≤ through；无论本次是否去重，一律清零（doc4/03 §5）。
     // 阈值触发的多次 flush：through 随新事件递增 → opId 递增，不重复排已 ack 窗口。
     this.segEvents.set(sessionId, 0);
     this.segBytes.set(sessionId, 0);
     const opId = `${this.hostId}/${sessionId}/flush:${through}`;
-    if (this.spool.isAcked(opId) || this.isPending(opId)) return;
-    this.push({
+    if (this.spool.isAcked(opId) || this.isPending(opId)) return true;
+    return this.push({
       op: { opId, op: "flush", request: { host_id: this.hostId, session_id: sessionId, through_event_seq: through } },
       sessionId,
       bodySeq: undefined,
       bytes: 64,
     });
+  }
+
+  /**
+   * Compact trigger enters the same durable per-session chain after a flush.
+   * Thus offline replay sends all preceding L0 receipts before memoryd freezes
+   * the Dream input. The compaction summary itself is never sent as evidence.
+   */
+  private enqueueCompactionTrigger(sessionId: string, compactionId: string): void {
+    // The callback must not lose a trigger merely because the bounded in-memory
+    // queue is full. Persist all accepted earlier operations first, freeing the
+    // queue while preserving the per-session order in chainPending.
+    if (!this.persistQueuedToSpool()) return;
+    if (!this.enqueueFlush(sessionId)) {
+      this.logger.warn(`DREAM_TRIGGER_SKIPPED: compact flush 未能入队 session=${sessionId}`);
+      return;
+    }
+    const digest = createHash("sha256").update(`${this.hostId}\0${sessionId}\0${compactionId}`).digest("hex");
+    const opId = `${this.hostId}/${sessionId}/dream:${digest}`;
+    if (this.spool.isAcked(opId) || this.isPending(opId)) return;
+    const request = {
+      trigger_kind: "compact",
+      trigger_key: `dsh-compact-${digest}`,
+      agent_id: sessionId,
+      host_id: this.hostId,
+      session_id: sessionId,
+    };
+    const accepted = this.push({
+      op: { opId, op: "dream", request },
+      sessionId,
+      bodySeq: undefined,
+      bytes: Buffer.byteLength(JSON.stringify(request)),
+    });
+    if (!accepted) {
+      this.logger.warn(`DREAM_TRIGGER_SKIPPED: spool 写入队列已满 session=${sessionId}`);
+      return;
+    }
+    // Compact is a durable trigger. Fsync its flush and trigger in this callback
+    // so a process exit before the asynchronous writer wakes cannot erase it.
+    if (!this.persistQueuedToSpool()) {
+      this.logger.error?.(`DREAM_TRIGGER_NOT_DURABLE: compact trigger 未能落盘 session=${sessionId}`);
+    }
+  }
+
+  private persistQueuedToSpool(): boolean {
+    while (this.queue.length > 0) {
+      const item = this.queue[0] as QueueItem;
+      try {
+        this.spool.append(item.op, item.sessionId, item.bodySeq);
+      } catch (e) {
+        this.captureBroken = true;
+        this.logger.error?.(`CAPTURE_GAP: compact 操作无法写入 spool: ${String(e)}`);
+        this.rejectAllWaiters();
+        return false;
+      }
+      this.queue.shift();
+      this.queueBytes -= item.bytes;
+      this.enqueueToChain(item);
+    }
+    return true;
   }
 
   // ---------------------------------------------------------------- 内部：发送链
@@ -345,10 +426,11 @@ export class EventPipeline {
       if (list === undefined || list.length === 0) return;
       const item = list[0] as QueueItem;
       if (!(await this.ensureProtocol())) return;
-      const result =
-        item.op.op === "event"
-          ? await this.client.recordEvent(item.op.request)
-          : await this.client.flush(item.op.request);
+      const result = item.op.op === "event"
+        ? await this.client.recordEvent(item.op.request)
+        : item.op.op === "flush"
+          ? await this.client.flush(item.op.request)
+          : await this.client.dreamTrigger(item.op.request);
       if (result.failure === "ok" && (result.status === 200 || result.status === 201 || result.status === 202)) {
         const body = (result.body ?? {}) as { evidence_id?: string };
         const evidenceId = typeof body.evidence_id === "string" ? body.evidence_id : undefined;

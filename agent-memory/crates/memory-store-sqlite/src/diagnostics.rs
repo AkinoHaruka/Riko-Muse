@@ -119,7 +119,9 @@ impl Store {
                     params![scope.tenant_id, scope.user_id, c_at, c_id],
                     job_list_mapper(),
                 )?,
-                None => stmt.query_map(params![scope.tenant_id, scope.user_id], job_list_mapper())?,
+                None => {
+                    stmt.query_map(params![scope.tenant_id, scope.user_id], job_list_mapper())?
+                }
             }
         };
         let out = rows.collect::<Result<Vec<_>, _>>()?;
@@ -127,7 +129,11 @@ impl Store {
     }
 
     /// scope 内作业详情；跨 scope/缺失一律 None（HTTP 404，不泄露存在性）。
-    pub fn get_job_detail(&self, scope: &ScopeKey, job_id: &str) -> Result<Option<JobDetail>, StoreError> {
+    pub fn get_job_detail(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+    ) -> Result<Option<JobDetail>, StoreError> {
         let row = self
             .conn()
             .query_row(
@@ -325,9 +331,16 @@ impl JobDoctorStats {
         format!(
             "jobs queued={} running={} retryable={} succeeded={} dead={}（未跳过={} 已跳过={}）\
              lease_expired_running={} held_candidates={} oldest_pending={}",
-            self.queued, self.running, self.retryable_failed, self.succeeded, self.dead,
-            self.dead_unskipped, self.dead_skipped, self.lease_expired_running,
-            self.held_candidates, oldest
+            self.queued,
+            self.running,
+            self.retryable_failed,
+            self.succeeded,
+            self.dead,
+            self.dead_unskipped,
+            self.dead_skipped,
+            self.lease_expired_running,
+            self.held_candidates,
+            oldest
         )
     }
 }
@@ -368,7 +381,9 @@ mod tests {
     use memory_domain::Origin;
 
     fn migrations_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
     }
 
     fn plus_secs(rfc3339: &str, secs: i64) -> String {
@@ -384,18 +399,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("am-diag-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        store.principal_add("t", "u1", &dir.join("u1.token")).unwrap();
-        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+        store
+            .principal_add("t", "u1", &dir.join("u1.token"))
+            .unwrap();
+        store
+            .principal_add("t", "u2", &dir.join("u2.token"))
+            .unwrap();
         store
     }
 
     fn scope(user: &str) -> ScopeKey {
-        ScopeKey { tenant_id: "t".into(), user_id: user.into() }
+        ScopeKey {
+            tenant_id: "t".into(),
+            user_id: user.into(),
+        }
     }
 
     fn ingest(store: &mut Store, user: &str, session: &str, seq: i64, content: &str) -> String {
         let t = chrono::Utc::now();
-        let o = Origin { host_id: "dsh".into(), agent_id: "agent-a".into(), session_id: session.into() };
+        let o = Origin {
+            host_id: "dsh".into(),
+            agent_id: "agent-a".into(),
+            session_id: session.into(),
+        };
         match store
             .record_evidence(&scope(user), &o, seq, "user", "user", &t, content)
             .unwrap()
@@ -405,7 +431,10 @@ mod tests {
     }
 
     fn flush(store: &mut Store, user: &str, session: &str, through: i64) -> String {
-        match store.flush_window(&scope(user), "dsh", session, through).unwrap() {
+        match store
+            .flush_window(&scope(user), "dsh", session, through)
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             other => panic!("应创建作业，实际 {other:?}"),
         }
@@ -443,13 +472,21 @@ mod tests {
         assert_eq!(dead_u2_list[0].id, dead_u2);
 
         // 状态过滤：all 含两种状态；queued 只含 queued。
-        assert_eq!(store.list_jobs(&scope("u1"), "all", 20, None).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .list_jobs(&scope("u1"), "all", 20, None)
+                .unwrap()
+                .len(),
+            2
+        );
         let queued = store.list_jobs(&scope("u1"), "queued", 20, None).unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, queued_u1);
 
         // skip 标记出现在列表中。
-        assert!(store.skip_dead_job(&scope("u1"), &dead_u1, "测试跳过").unwrap());
+        assert!(store
+            .skip_dead_job(&scope("u1"), &dead_u1, "测试跳过")
+            .unwrap());
         let after = store.list_jobs(&scope("u1"), "dead", 20, None).unwrap();
         assert_eq!(after.len(), 1, "skip 不改变列表可见性，只加标记");
         assert!(after[0].skipped);
@@ -470,7 +507,12 @@ mod tests {
         let mut cursor: Option<(String, String)> = None;
         loop {
             let page = store
-                .list_jobs(&scope("u1"), "dead", 2, cursor.as_ref().map(|(a, b)| (a.as_str(), b.as_str())))
+                .list_jobs(
+                    &scope("u1"),
+                    "dead",
+                    2,
+                    cursor.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                )
                 .unwrap();
             if page.is_empty() {
                 break;
@@ -494,7 +536,10 @@ mod tests {
         ingest(&mut store, "u1", "s1", 1, "我叫洛溪");
         let job_id = flush(&mut store, "u1", "s1", 1);
         let run_after = {
-            let d = store.get_job_detail(&scope("u1"), &job_id).unwrap().unwrap();
+            let d = store
+                .get_job_detail(&scope("u1"), &job_id)
+                .unwrap()
+                .unwrap();
             assert_eq!(d.item.status, "queued");
             assert_eq!(d.prompt_version, memory_contract::EXTRACT_PROMPT_VERSION);
             d.item.run_after.clone()
@@ -504,16 +549,29 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .complete_job(&job_id, claimed.claim_generation, 1, "test-model", Some(11), Some(22))
+            .complete_job(
+                &job_id,
+                claimed.claim_generation,
+                1,
+                "test-model",
+                Some(11),
+                Some(22),
+            )
             .unwrap();
-        let d = store.get_job_detail(&scope("u1"), &job_id).unwrap().unwrap();
+        let d = store
+            .get_job_detail(&scope("u1"), &job_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(d.item.status, "succeeded");
         assert_eq!(d.model_name.as_deref(), Some("test-model"));
         assert_eq!(d.input_tokens, Some(11));
         assert_eq!(d.output_tokens, Some(22));
         assert_eq!(d.window_key, "v1:1");
         // 跨 scope：None（HTTP 404，不泄露存在性）。
-        assert!(store.get_job_detail(&scope("u2"), &job_id).unwrap().is_none());
+        assert!(store
+            .get_job_detail(&scope("u2"), &job_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -536,7 +594,10 @@ mod tests {
         assert_eq!(stats.running, 0);
         assert_eq!(stats.lease_expired_running, 0);
         assert_eq!(stats.held_candidates, 0);
-        assert!(stats.oldest_pending_age_secs.is_some(), "存在待办时最老待办时长应给出");
+        assert!(
+            stats.oldest_pending_age_secs.is_some(),
+            "存在待办时最老待办时长应给出"
+        );
         let summary = stats.summary();
         assert!(!summary.contains("u1"), "聚合输出不得打印用户列表");
     }
@@ -547,12 +608,21 @@ mod tests {
         // u1：一个 held 候选。
         let ev = ingest(&mut store, "u1", "s1", 1, "我喜欢深色主题");
         let job_id = flush(&mut store, "u1", "s1", 1);
-        let run_after = store.get_job_detail(&scope("u1"), &job_id).unwrap().unwrap().item.run_after;
+        let run_after = store
+            .get_job_detail(&scope("u1"), &job_id)
+            .unwrap()
+            .unwrap()
+            .item
+            .run_after;
         let claimed = store
             .claim_next_ordered_job(&plus_secs(&run_after, 1))
             .unwrap()
             .unwrap();
-        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "extract".into(),
+            session_id: "s1".into(),
+        };
         let c = memory_extract::ModelCandidate {
             source_event_id: ev.clone(),
             quote: "我喜欢深色主题".into(),
@@ -562,7 +632,13 @@ mod tests {
             confidence: None,
         };
         let outcome = store
-            .save_candidate(&scope("u1"), &claimed, &origin, &c, memory_extract::Admission::Held("NOT_EXPLICIT"))
+            .save_candidate(
+                &scope("u1"),
+                &claimed,
+                &origin,
+                &c,
+                memory_extract::Admission::Held("NOT_EXPLICIT"),
+            )
             .unwrap();
         assert!(matches!(outcome, crate::CandidateOutcome::Held { .. }));
         let candidate_id: String = store
@@ -575,12 +651,17 @@ mod tests {
             .unwrap();
 
         // 列表：u1 可见（quote 长度 7 字符），u2 不可见。
-        let u1_list = store.list_candidates(&scope("u1"), "held", 20, None).unwrap();
+        let u1_list = store
+            .list_candidates(&scope("u1"), "held", 20, None)
+            .unwrap();
         assert_eq!(u1_list.len(), 1);
         assert_eq!(u1_list[0].id, candidate_id);
         assert_eq!(u1_list[0].quote_len, 7);
         assert_eq!(u1_list[0].reason_code.as_deref(), Some("NOT_EXPLICIT"));
-        assert!(store.list_candidates(&scope("u2"), "held", 20, None).unwrap().is_empty());
+        assert!(store
+            .list_candidates(&scope("u2"), "held", 20, None)
+            .unwrap()
+            .is_empty());
 
         // before：边界 ID 跨 scope / 不存在 → JobNotFound；同 scope 的正确边界 → 空页。
         assert!(matches!(
@@ -592,15 +673,27 @@ mod tests {
             store.list_candidates(&scope("u1"), "held", 20, Some(fake.as_str())),
             Err(StoreError::JobNotFound)
         ));
-        assert!(store.list_candidates(&scope("u1"), "held", 20, Some(&candidate_id)).unwrap().is_empty());
+        assert!(store
+            .list_candidates(&scope("u1"), "held", 20, Some(&candidate_id))
+            .unwrap()
+            .is_empty());
 
         // show：quote 与证据定位可见；跨 scope None。只读。
-        let d1 = store.get_candidate(&scope("u1"), &candidate_id).unwrap().unwrap();
+        let d1 = store
+            .get_candidate(&scope("u1"), &candidate_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(d1.quote, "我喜欢深色主题");
         assert_eq!(d1.primary_evidence_id, ev);
         assert!(d1.evidence_start_byte.is_some(), "应有证据定位 span");
-        assert!(store.get_candidate(&scope("u2"), &candidate_id).unwrap().is_none());
+        assert!(store
+            .get_candidate(&scope("u2"), &candidate_id)
+            .unwrap()
+            .is_none());
         // 非 held 状态不在 held 列表。
-        assert!(store.list_candidates(&scope("u1"), "rejected", 20, None).unwrap().is_empty());
+        assert!(store
+            .list_candidates(&scope("u1"), "rejected", 20, None)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -10,16 +10,17 @@
 import { readFileSync } from "node:fs";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Session, SessionEvent, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
+import { DreamRunner } from "./dream-runner.js";
 import type { PreStepPayload } from "./recall.js";
 import { makeBundleHook, makePreStepHook, makeSoulAssembleHook } from "./recall.js";
 import { MemoryClient } from "./client.js";
 import { loadConfig, type AdapterConfig } from "./config.js";
-import { EventPipeline, type GapChecker, type Logger } from "./events.js";
+import { EventPipeline, isCapturableSessionHeader, type GapChecker, type Logger } from "./events.js";
 import { Spool } from "./spool.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
 export const name = "agent-memory";
-export const inject = ["tools"];
+export const inject = ["tools", "subagents"];
 
 /** D6 capability（doc6/06 §1）：v6 注入（Soul section + bundle 前插）所需。 */
 const REQUIRED_CAPABILITY = "context_bundle_v1";
@@ -53,6 +54,7 @@ class AgentMemoryPlugin {
   private readonly client: MemoryClient;
   private readonly spool: Spool;
   private readonly pipeline: EventPipeline;
+  private readonly dreamRunner: DreamRunner;
   private disposed = false;
   /** 装载期可降级：握手缺 capability 时停用 v6（doc6/06 §1 不静默落回）。 */
   private cfg: AdapterConfig;
@@ -80,17 +82,35 @@ class AgentMemoryPlugin {
       this.cfg.hostId,
       this.cfg.captureEnabled,
     );
+    this.dreamRunner = new DreamRunner(
+      this.ctx,
+      this.client,
+      this.logger,
+      this.cfg.hostId,
+      () => this.disposed,
+    );
   }
 
   async start(): Promise<void> {
     const gapChecker = this.resolveGapChecker();
     await this.pipeline.start(gapChecker);
 
+    // DSH 自身持久 Agent 的 pre-step 是 runner 可见的父 Agent seam。
+    // runner 只从一个仍登记的父 Agent 启动，子 Agent 工具集为空。
+    this.ctx.on("agent/pre-step" as never, ((payload: PreStepPayload, next: () => Promise<never>) => {
+      this.dreamRunner.start(payload.agent);
+      return next();
+    }) as never);
+
     if (this.cfg.contextBundleEnabled) await this.negotiateContextBundle();
 
     if (this.cfg.captureEnabled) {
       // session/event 是提交后的同步受保护通知；回调只做有界入队（doc2/03 §2）。
       this.ctx.on("session/event" as never, ((session: Session, event: SessionEvent) => {
+        // DSH 的子 Agent prompt 也会以 source.kind='user' 写入自己的 session。
+        // 只按消息 source 判定会把内部 Dream 指令误记成用户 L0；header 是
+        // 官方持久 session 的来源分类，fork 同样排除以免重复摄入继承事件。
+        if (!isCapturableSessionHeader(session.header)) return;
         this.pipeline.observeSessionEvent(String(session.id), event);
       }) as never);
     }
@@ -201,6 +221,7 @@ class AgentMemoryPlugin {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    await this.dreamRunner.dispose();
     await this.pipeline.dispose();
     this.spool.dispose();
   }

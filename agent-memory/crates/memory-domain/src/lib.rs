@@ -115,7 +115,9 @@ pub fn claim_sha256(kind: MemoryKind, claim: &str) -> String {
 /// quote 验证辅助：quote 必须是 content 的连续 UTF-8 原文子串。
 /// 返回字节偏移（start_byte, end_byte）。
 pub fn find_quote_span(content: &str, quote: &str) -> Option<(usize, usize)> {
-    content.find(quote).map(|start| (start, start + quote.len()))
+    content
+        .find(quote)
+        .map(|start| (start, start + quote.len()))
 }
 
 #[cfg(test)]

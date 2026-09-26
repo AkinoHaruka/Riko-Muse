@@ -46,15 +46,25 @@ mod probes {
     }
 
     fn u1() -> ScopeKey {
-        ScopeKey { tenant_id: "t".into(), user_id: "u1".into() }
+        ScopeKey {
+            tenant_id: "t".into(),
+            user_id: "u1".into(),
+        }
     }
 
     fn u2() -> ScopeKey {
-        ScopeKey { tenant_id: "t".into(), user_id: "u2".into() }
+        ScopeKey {
+            tenant_id: "t".into(),
+            user_id: "u2".into(),
+        }
     }
 
     fn origin(session: &str, agent: &str) -> Origin {
-        Origin { host_id: "dsh".into(), agent_id: agent.into(), session_id: session.into() }
+        Origin {
+            host_id: "dsh".into(),
+            agent_id: agent.into(),
+            session_id: session.into(),
+        }
     }
 
     /// 记入最新用户消息并经 remember 直写（普通内容沿既有路径）。
@@ -69,23 +79,45 @@ mod probes {
     ) -> String {
         let t = chrono::Utc::now();
         let ev = match store
-            .record_evidence(scope, &origin(session, "agent-a"), seq, "user", "user", &t, message)
+            .record_evidence(
+                scope,
+                &origin(session, "agent-a"),
+                seq,
+                "user",
+                "user",
+                &t,
+                message,
+            )
             .unwrap()
         {
             IngestOutcome::Recorded(id) => id,
             IngestOutcome::AlreadyRecorded(id) => id,
             other => panic!("意外 ingest 结果: {other:?}"),
         };
-        match store.remember(scope, &origin(session, "agent-a"), &ev, quote, kind).unwrap() {
-            RememberOutcome::Created { memory_id, .. } | RememberOutcome::Dedup { memory_id, .. } => {
-                memory_id
-            }
+        match store
+            .remember(scope, &origin(session, "agent-a"), &ev, quote, kind)
+            .unwrap()
+        {
+            RememberOutcome::Created { memory_id, .. }
+            | RememberOutcome::Dedup { memory_id, .. } => memory_id,
         }
     }
 
-    fn compose_ids(store: &Store, scope: &ScopeKey, query: &str, max_items: usize, max_chars: usize) -> (Vec<String>, bool, String) {
-        let r = store.compose_context(scope, "agent-b", query, max_items, max_chars).unwrap();
-        (r.items.into_iter().map(|(id, _)| id).collect(), r.truncated, r.text)
+    fn compose_ids(
+        store: &Store,
+        scope: &ScopeKey,
+        query: &str,
+        max_items: usize,
+        max_chars: usize,
+    ) -> (Vec<String>, bool, String) {
+        let r = store
+            .compose_context(scope, "agent-b", query, max_items, max_chars)
+            .unwrap();
+        (
+            r.items.into_iter().map(|(id, _)| id).collect(),
+            r.truncated,
+            r.text,
+        )
     }
 
     #[test]
@@ -94,19 +126,33 @@ mod probes {
         let dir = std::env::temp_dir().join(format!("am-probes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        store.principal_add("t", "u1", &dir.join("u1.token")).unwrap();
-        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+        store
+            .principal_add("t", "u1", &dir.join("u1.token"))
+            .unwrap();
+        store
+            .principal_add("t", "u2", &dir.join("u2.token"))
+            .unwrap();
         let mut report: Vec<ProbeRecord> = Vec::new();
 
         // ---- P1 该生效：同用户跨 Agent 词法命中 + 跨用户隔离（doc5/05 §2）----
         let p1_u1 = save_direct(
-            &mut store, &u1(), "s1", 1,
-            "我喜欢用暗色主题写代码", "我喜欢用暗色主题写代码", MemoryKind::Preference,
+            &mut store,
+            &u1(),
+            "s1",
+            1,
+            "我喜欢用暗色主题写代码",
+            "我喜欢用暗色主题写代码",
+            MemoryKind::Preference,
         );
         // 干扰：另一用户的同句（Agent C 写入，Agent B 查询）。
         let p1_u2 = save_direct(
-            &mut store, &u2(), "s1", 1,
-            "我喜欢用暗色主题写代码", "我喜欢用暗色主题写代码", MemoryKind::Preference,
+            &mut store,
+            &u2(),
+            "s1",
+            1,
+            "我喜欢用暗色主题写代码",
+            "我喜欢用暗色主题写代码",
+            MemoryKind::Preference,
         );
         let (ids, degraded, text) = compose_ids(&store, &u1(), "VSCode 暗色主题怎么配", 5, 2000);
         let p1 = ProbeRecord {
@@ -128,8 +174,13 @@ mod probes {
         // ---- P2 正确沉默：无关查询不注入偏好；指令仍占名额 ----
         let p2_pref = p1_u1.clone();
         let p2_instr = save_direct(
-            &mut store, &u1(), "s1", 2,
-            "以后回答请用中文", "以后回答请用中文", MemoryKind::Instruction,
+            &mut store,
+            &u1(),
+            "s1",
+            2,
+            "以后回答请用中文",
+            "以后回答请用中文",
+            MemoryKind::Instruction,
         );
         let (ids, degraded, text) = compose_ids(&store, &u1(), "如何焯西兰花", 5, 2000);
         let p2 = ProbeRecord {
@@ -169,8 +220,24 @@ mod probes {
         report.push(p3);
 
         // ---- P4 冲突：两条同属性 active 共存不自动消歧；correct 后 superseded 退出普通查询 ----
-        let p4_hz = save_direct(&mut store, &u2(), "s2", 1, "我住在杭州", "我住在杭州", MemoryKind::Fact);
-        let p4_cd = save_direct(&mut store, &u2(), "s2", 2, "我住在成都", "我住在成都", MemoryKind::Fact);
+        let p4_hz = save_direct(
+            &mut store,
+            &u2(),
+            "s2",
+            1,
+            "我住在杭州",
+            "我住在杭州",
+            MemoryKind::Fact,
+        );
+        let p4_cd = save_direct(
+            &mut store,
+            &u2(),
+            "s2",
+            2,
+            "我住在成都",
+            "我住在成都",
+            MemoryKind::Fact,
+        );
         let (ids_hz, _, _) = compose_ids(&store, &u2(), "杭州", 5, 2000);
         let (ids_cd, _, _) = compose_ids(&store, &u2(), "成都", 5, 2000);
         let both_active = {
@@ -199,13 +266,24 @@ mod probes {
                 .into(),
             passed: ids_hz == vec![p4_hz.clone()] && ids_cd == vec![p4_cd.clone()] && both_active,
         };
-        assert!(p4a.passed, "P4a 各查询应命中各自 active，实际 {ids_hz:?}/{ids_cd:?}，both_active={both_active}");
+        assert!(
+            p4a.passed,
+            "P4a 各查询应命中各自 active，实际 {ids_hz:?}/{ids_cd:?}，both_active={both_active}"
+        );
         report.push(p4a);
         // correct：旧杭州 superseded，新成都 active；普通查询不再见杭州。
         {
             let t = chrono::Utc::now();
             let ev = match store
-                .record_evidence(&u2(), &origin("s2", "agent-a"), 3, "user", "user", &t, "过去我住在杭州，现在我住在成都")
+                .record_evidence(
+                    &u2(),
+                    &origin("s2", "agent-a"),
+                    3,
+                    "user",
+                    "user",
+                    &t,
+                    "过去我住在杭州，现在我住在成都",
+                )
                 .unwrap()
             {
                 IngestOutcome::Recorded(id) => id,
@@ -226,7 +304,10 @@ mod probes {
                 .unwrap();
         }
         let (ids_after, _, _) = compose_ids(&store, &u2(), "杭州", 5, 2000);
-        let hist = store.search_memories(&u2(), "我住在杭州", 5, true).unwrap().0;
+        let hist = store
+            .search_memories(&u2(), "我住在杭州", 5, true)
+            .unwrap()
+            .0;
         let p4b = ProbeRecord {
             probe_id: "P4b_superseded_exits_normal_query",
             query: "杭州（普通） / 我住在杭州（历史）".into(),
@@ -234,20 +315,32 @@ mod probes {
             expected_inject: vec![],
             actual_inject: ids_after.clone(),
             expected_absent: vec![p4_hz.clone()],
-            leaked_absent: ids_after.iter().filter(|id| **id == p4_hz).cloned().collect(),
+            leaked_absent: ids_after
+                .iter()
+                .filter(|id| **id == p4_hz)
+                .cloned()
+                .collect(),
             index_degraded: false,
             notes: "correct 后旧记忆 superseded：普通查询不见；历史查询（include_history=true\
                     ，历史词门槛在 HTTP/适配器层）可见 superseded，forgotten 仍永不返回"
                 .into(),
             passed: ids_after.is_empty() && hist.iter().any(|h| h.memory_id == p4_hz),
         };
-        assert!(p4b.passed, "P4b superseded 应退出普通查询、历史查询可见，实际 {ids_after:?}");
+        assert!(
+            p4b.passed,
+            "P4b superseded 应退出普通查询、历史查询可见，实际 {ids_after:?}"
+        );
         report.push(p4b);
 
         // ---- P5 失效/遗忘/抑制：valid_until 过期、forgotten、SUPPRESSED_SOURCE ----
         let p5_exp = save_direct(
-            &mut store, &u2(), "s3", 1,
-            "我喜欢骑单车通勤", "我喜欢骑单车通勤", MemoryKind::Preference,
+            &mut store,
+            &u2(),
+            "s3",
+            1,
+            "我喜欢骑单车通勤",
+            "我喜欢骑单车通勤",
+            MemoryKind::Preference,
         );
         // 夹具：从规范表直接置过期（公共 API 无写入 valid_until 的路径；探针构造许可）。
         store
@@ -258,13 +351,26 @@ mod probes {
             )
             .unwrap();
         let p5_forget = save_direct(
-            &mut store, &u2(), "s3", 2,
-            "我喜欢手工咖啡", "我喜欢手工咖啡", MemoryKind::Preference,
+            &mut store,
+            &u2(),
+            "s3",
+            2,
+            "我喜欢手工咖啡",
+            "我喜欢手工咖啡",
+            MemoryKind::Preference,
         );
         {
             let t = chrono::Utc::now();
             let ev = match store
-                .record_evidence(&u2(), &origin("s3", "agent-a"), 3, "user", "user", &t, "忘记我喜欢手工咖啡")
+                .record_evidence(
+                    &u2(),
+                    &origin("s3", "agent-a"),
+                    3,
+                    "user",
+                    "user",
+                    &t,
+                    "忘记我喜欢手工咖啡",
+                )
                 .unwrap()
             {
                 IngestOutcome::Recorded(id) => id,
@@ -305,18 +411,47 @@ mod probes {
                     → rejected:SUPPRESSED_SOURCE（A23，jobs 测试覆盖）"
                 .into(),
             passed: c_ids.is_empty()
-                && search_ids.iter().all(|h| h.memory_id != p5_exp && h.memory_id != p5_forget)
+                && search_ids
+                    .iter()
+                    .all(|h| h.memory_id != p5_exp && h.memory_id != p5_forget)
                 && hist_ids.iter().all(|h| h.memory_id != p5_forget),
         };
-        assert!(p5.passed, "P5 过期/遗忘必须不可见，实际 search={search_ids:?} compose={c_ids:?}");
+        assert!(
+            p5.passed,
+            "P5 过期/遗忘必须不可见，实际 search={search_ids:?} compose={c_ids:?}"
+        );
         report.push(p5);
 
         // ---- P6 预算：指令名额 2、max_items、单条超长跳过（不截断否定词）----
-        let p6_i1 = save_direct(&mut store, &u1(), "s4", 1, "以后先说明风险再动手", "以后先说明风险再动手", MemoryKind::Instruction);
-        let p6_i2 = save_direct(&mut store, &u1(), "s4", 2, "以后回答要给代码示例", "以后回答要给代码示例", MemoryKind::Instruction);
+        let p6_i1 = save_direct(
+            &mut store,
+            &u1(),
+            "s4",
+            1,
+            "以后先说明风险再动手",
+            "以后先说明风险再动手",
+            MemoryKind::Instruction,
+        );
+        let p6_i2 = save_direct(
+            &mut store,
+            &u1(),
+            "s4",
+            2,
+            "以后回答要给代码示例",
+            "以后回答要给代码示例",
+            MemoryKind::Instruction,
+        );
         // 第三条与 P2 指令同文 → remember 去重返回既有记忆（p6_i3 == p2_instr）并刷新
         // updated_at；名额按 updated_at DESC 取最新两条 = 该记忆与 p6_i2，p6_i1 被挤出。
-        let p6_i3 = save_direct(&mut store, &u1(), "s4", 3, "以后回答请用中文", "以后回答请用中文", MemoryKind::Instruction);
+        let p6_i3 = save_direct(
+            &mut store,
+            &u1(),
+            "s4",
+            3,
+            "以后回答请用中文",
+            "以后回答请用中文",
+            MemoryKind::Instruction,
+        );
         assert_eq!(p6_i3, p2_instr, "同文指令应去重为同一记忆");
         let (ids, degraded, text) = compose_ids(&store, &u1(), "随便聊聊今天天气", 5, 2000);
         let p6a = ProbeRecord {
@@ -333,7 +468,10 @@ mod probes {
             passed: ids.len() == 2 && ids.contains(&p6_i3) && ids.contains(&p6_i2),
         };
         assert!(p6a.passed, "P6a 指令名额应为最新两条，实际 {ids:?}");
-        assert!(!text.contains(p6_i1.as_str()), "被挤出名额的指令不得出现：{text:?}");
+        assert!(
+            !text.contains(p6_i1.as_str()),
+            "被挤出名额的指令不得出现：{text:?}"
+        );
         report.push(p6a);
 
         // max_items=2：6 条同词偏好只有 2 条注入（按命中顺序）。
@@ -341,7 +479,13 @@ mod probes {
         for (i, w) in ["蓝", "绿", "红", "黄", "紫", "橙"].iter().enumerate() {
             let claim = format!("我喜欢{w}色便签");
             p6_pref_ids.push(save_direct(
-                &mut store, &u2(), &format!("s5_{i}"), 1, &claim, &claim, MemoryKind::Preference,
+                &mut store,
+                &u2(),
+                &format!("s5_{i}"),
+                1,
+                &claim,
+                &claim,
+                MemoryKind::Preference,
             ));
         }
         let (ids, _, _) = compose_ids(&store, &u2(), "色便签", 2, 2000);
@@ -362,8 +506,13 @@ mod probes {
 
         // 单条超长跳过：max_chars 小于单行 → truncated 且整条跳过，不截断否定词。
         let p6_neg = save_direct(
-            &mut store, &u2(), "s6", 1,
-            "我不喜欢嘈杂环境", "我不喜欢嘈杂环境", MemoryKind::Preference,
+            &mut store,
+            &u2(),
+            "s6",
+            1,
+            "我不喜欢嘈杂环境",
+            "我不喜欢嘈杂环境",
+            MemoryKind::Preference,
         );
         let (ids, truncated, text) = compose_ids(&store, &u2(), "嘈杂", 5, 80);
         let p6c = ProbeRecord {
@@ -378,11 +527,17 @@ mod probes {
             notes: "预算不足时整条跳过（truncated=true），绝不截出可能丢失否定词的半句".into(),
             passed: truncated && ids.is_empty() && !text.contains("我不喜欢"),
         };
-        assert!(p6c.passed, "P6c 应整条跳过，实际 truncated={truncated} ids={ids:?} text={text:?}");
+        assert!(
+            p6c.passed,
+            "P6c 应整条跳过，实际 truncated={truncated} ids={ids:?} text={text:?}"
+        );
         report.push(p6c);
         // 预算充足时否定词完整出现。
         let (_, _, text) = compose_ids(&store, &u2(), "嘈杂", 5, 2000);
-        assert!(text.contains("我不喜欢嘈杂环境"), "预算充足须完整注入否定句：{text:?}");
+        assert!(
+            text.contains("我不喜欢嘈杂环境"),
+            "预算充足须完整注入否定句：{text:?}"
+        );
 
         // ---- 汇总报告：写临时文件并打印（不作为任何质量提升证明）----
         let all_passed = report.iter().all(|p| p.passed);

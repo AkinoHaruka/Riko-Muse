@@ -3,7 +3,7 @@
 //! 只在 D6-7 固化的 Dream job 内执行；dream_job_id 关联，绝无 extraction_job_id。
 
 use memory_domain::{claim_sha256, fold_whitespace, MemoryKind, ScopeKey};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -469,18 +469,66 @@ impl Store {
         expected_generation: i64,
         proposals: &[AdjudicationProposal],
     ) -> Result<AdjudicationApplyOutcome, StoreError> {
-        let (status, gen): (String, i64) = self
+        self.adjudication_apply_inner(scope, job_id, expected_generation, None, proposals)
+    }
+
+    /// Apply a DSH runner proposal and finish the adjudication + parent Dream job
+    /// in the same SQLite transaction. A crash can therefore occur before or
+    /// after this operation, but never between committed memory changes and the
+    /// processed receipt for the exact frozen input.
+    pub fn adjudication_apply_and_complete(
+        &mut self,
+        scope: &ScopeKey,
+        job_id: &str,
+        expected_generation: i64,
+        expected_dream_generation: i64,
+        proposals: &[AdjudicationProposal],
+    ) -> Result<AdjudicationApplyOutcome, StoreError> {
+        self.adjudication_apply_inner(
+            scope,
+            job_id,
+            expected_generation,
+            Some(expected_dream_generation),
+            proposals,
+        )
+    }
+
+    fn adjudication_apply_inner(
+        &mut self,
+        scope: &ScopeKey,
+        job_id: &str,
+        expected_generation: i64,
+        complete_dream_generation: Option<i64>,
+        proposals: &[AdjudicationProposal],
+    ) -> Result<AdjudicationApplyOutcome, StoreError> {
+        let (status, gen, dream_job_id): (String, i64, String) = self
             .conn()
             .query_row(
-                "SELECT status, claim_generation FROM adjudication_jobs
+                "SELECT status, claim_generation, dream_job_id FROM adjudication_jobs
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, job_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
             .ok_or(StoreError::JobNotFound)?;
         if status != "running" || gen != expected_generation {
             return Err(StoreError::StaleClaim);
+        }
+        if let Some(expected_dream_generation) = complete_dream_generation {
+            let parent_matches: bool = self.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2
+                 AND id=?3 AND status='running' AND claim_generation=?4)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    dream_job_id,
+                    expected_dream_generation
+                ],
+                |row| row.get(0),
+            )?;
+            if !parent_matches {
+                return Err(StoreError::StaleClaim);
+            }
         }
         let (frozen_candidates, frozen_recalls) = self.adjudication_inputs(scope, job_id)?;
         let mut by_candidate: std::collections::HashMap<&str, Vec<&AdjudicationCandidate>> =
@@ -523,7 +571,65 @@ impl Store {
         }
 
         let mut outcome = AdjudicationApplyOutcome::default();
-        let tx = self.conn_mut().transaction()?;
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(dream_generation) = complete_dream_generation {
+            let claims_match: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM adjudication_jobs a JOIN dream_jobs d
+                   ON d.tenant_id=a.tenant_id AND d.user_id=a.user_id AND d.id=a.dream_job_id
+                 WHERE a.tenant_id=?1 AND a.user_id=?2 AND a.id=?3
+                   AND a.status='running' AND a.claim_generation=?4
+                   AND d.status='running' AND d.claim_generation=?5)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    job_id,
+                    expected_generation,
+                    dream_generation
+                ],
+                |row| row.get(0),
+            )?;
+            if !claims_match {
+                return Err(StoreError::StaleClaim);
+            }
+
+            // A Dream completion consumes the whole frozen evidence window.
+            // Require exactly one decision for every distinct candidate before
+            // applying any proposal or marking its evidence processed.
+            let expected: std::collections::HashSet<&str> = frozen_candidates
+                .iter()
+                .map(|candidate| candidate.candidate_id.as_str())
+                .collect();
+            let mut actual = std::collections::HashSet::new();
+            if proposals.len() != expected.len()
+                || proposals.iter().any(|proposal| {
+                    !expected.contains(proposal.candidate_id.as_str())
+                        || !actual.insert(proposal.candidate_id.as_str())
+                })
+            {
+                return Err(StoreError::InvalidAdjudicationCoverage);
+            }
+        }
+        // Recheck frozen recall targets after acquiring the write lock. The
+        // preflight check above improves diagnostics; this one closes the race
+        // with concurrent correct/forget/retire/purge operations.
+        for recall in &frozen_recalls {
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM memories m
+                 WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
+                   AND (m.valid_until IS NULL OR m.valid_until>?4)
+                   AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                     WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)",
+                    params![scope.tenant_id, scope.user_id, recall.target_memory_id, now],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current != Some(recall.target_version) {
+                return Err(StoreError::StaleInput);
+            }
+        }
         let stale_sources: i64 = tx.query_row(
             "SELECT COUNT(*) FROM adjudication_job_inputs ai
              JOIN evidence_events e ON e.tenant_id=ai.tenant_id AND e.user_id=ai.user_id AND e.id=ai.evidence_id
@@ -868,6 +974,46 @@ impl Store {
                     record("rejected", &None, "unknown_action", &mut outcome)?;
                 }
             }
+        }
+        if let Some(dream_generation) = complete_dream_generation {
+            let completed_at = now_rfc3339()?;
+            let adj_updated = tx.execute(
+                "UPDATE adjudication_jobs SET status='succeeded',error_code=NULL,
+                        model_name=COALESCE(model_name,'dsh-subagent'),lease_until=NULL,updated_at=?5
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='running'
+                   AND claim_generation=?4",
+                params![scope.tenant_id, scope.user_id, job_id, expected_generation, completed_at],
+            )?;
+            let dream_updated = tx.execute(
+                "UPDATE dream_jobs SET status='succeeded',error_code=NULL,lease_until=NULL,
+                        model_name=COALESCE(model_name,'dsh-subagent'),updated_at=?5
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='running'
+                   AND claim_generation=?4",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    dream_job_id,
+                    dream_generation,
+                    completed_at
+                ],
+            )?;
+            if adj_updated != 1 || dream_updated != 1 {
+                return Err(StoreError::StaleClaim);
+            }
+            tx.execute(
+                "UPDATE dream_evidence_state SET status='processed',updated_at=?4
+                 WHERE tenant_id=?1 AND user_id=?2 AND pipeline_version=?3
+                   AND status='assigned' AND active_job_id=?5
+                   AND evidence_id IN (SELECT evidence_id FROM dream_job_inputs
+                     WHERE tenant_id=?1 AND user_id=?2 AND job_id=?5)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    crate::dream_jobs::DREAM_PIPELINE_V1,
+                    completed_at,
+                    dream_job_id
+                ],
+            )?;
         }
         tx.commit()?;
         for (memory_id, version) in l1_audits {

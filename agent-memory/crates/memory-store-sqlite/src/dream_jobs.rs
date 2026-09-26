@@ -5,10 +5,12 @@
 //! 触发器与输入始终先由 memoryd 持久化。
 
 use memory_domain::ScopeKey;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::adjudication::AdjudicationJobRow;
+use crate::consolidation_jobs::ConsolidationJobRow;
 use crate::{now_rfc3339, Store, StoreError};
 
 /// extract 版本（doc6/10）：独立版本化，旧 extract_v1/v2/v3 不用于 Dream。
@@ -59,6 +61,13 @@ pub struct DreamRedecisionRecord {
     pub strategy_fingerprint: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DreamRunnerClaim {
+    pub dream_job: DreamJobRow,
+    pub adjudication_job: Option<AdjudicationJobRow>,
+    pub consolidation_job: Option<ConsolidationJobRow>,
+}
+
 fn sha256_hex(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
@@ -72,6 +81,441 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Count live DSH runners advertising one required execution capability.
+    /// Capabilities are parsed from the persisted heartbeat, never inferred
+    /// from memoryd's unrelated model-client configuration.
+    pub fn dream_live_runner_capability_count(
+        &self,
+        now: &str,
+        capability: &str,
+    ) -> Result<usize, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT capabilities_json FROM dream_runners WHERE lease_until>?1")?;
+        let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
+        let mut count = 0;
+        for row in rows {
+            let value: serde_json::Value = match serde_json::from_str(&row?) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(capability)))
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn dream_runner_has_capability(
+        &self,
+        scope: &ScopeKey,
+        runner_id: &str,
+        capability: &str,
+        now: &str,
+    ) -> Result<bool, StoreError> {
+        let capabilities: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT capabilities_json FROM dream_runners
+                 WHERE tenant_id=?1 AND user_id=?2 AND runner_id=?3 AND lease_until>?4",
+                params![scope.tenant_id, scope.user_id, runner_id, now],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(capabilities) = capabilities else {
+            return Ok(false);
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&capabilities) {
+            Ok(value) => value,
+            Err(_) => return Ok(false),
+        };
+        Ok(parsed
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(capability))))
+    }
+
+    /// Verifies that the currently live DSH runner owns this exact parent claim.
+    pub fn dream_runner_owns(
+        &self,
+        scope: &ScopeKey,
+        runner_id: &str,
+        dream_job_id: &str,
+        generation: i64,
+    ) -> Result<bool, StoreError> {
+        let now = now_rfc3339()?;
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(
+               SELECT 1 FROM dream_jobs j JOIN dream_runners r
+                 ON r.tenant_id=j.tenant_id AND r.user_id=j.user_id AND r.runner_id=j.runner_id
+               WHERE j.tenant_id=?1 AND j.user_id=?2 AND j.id=?3 AND j.runner_id=?4
+                 AND j.status='running' AND j.claim_generation=?5
+                 AND j.lease_until>?6 AND r.lease_until>?6)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    dream_job_id,
+                    runner_id,
+                    generation,
+                    now
+                ],
+                |r| r.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn dream_consolidation_linked(
+        &self,
+        scope: &ScopeKey,
+        dream_job_id: &str,
+        consolidation_job_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM dream_consolidation_links
+             WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3 AND consolidation_job_id=?4)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    dream_job_id,
+                    consolidation_job_id
+                ],
+                |r| r.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    /// 由 DSH 插件注册/续租常驻 runner；scope 完全来自已验证 Bearer token。
+    pub fn dream_runner_heartbeat(
+        &mut self,
+        scope: &ScopeKey,
+        runner_id: &str,
+        host_id: &str,
+        agent_id: &str,
+        capabilities_json: &str,
+        lease_secs: u64,
+    ) -> Result<(), StoreError> {
+        for value in [runner_id, host_id, agent_id] {
+            if value.trim().is_empty() || value.chars().count() > 256 {
+                return Err(StoreError::InvalidPageField);
+            }
+        }
+        let capabilities: serde_json::Value =
+            serde_json::from_str(capabilities_json).map_err(|_| StoreError::InvalidPageField)?;
+        if !capabilities.is_array() || capabilities.as_array().unwrap().len() > 16 {
+            return Err(StoreError::InvalidPageField);
+        }
+        let now = now_rfc3339()?;
+        let lease_until = lease_from(&now, lease_secs)?;
+        self.conn_mut().execute(
+            "INSERT INTO dream_runners
+               (tenant_id,user_id,runner_id,host_id,agent_id,capabilities_json,heartbeat_at,
+                lease_until,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?7,?7)
+             ON CONFLICT (tenant_id,user_id,runner_id) DO UPDATE SET
+               host_id=excluded.host_id, agent_id=excluded.agent_id,
+               capabilities_json=excluded.capabilities_json, heartbeat_at=excluded.heartbeat_at,
+               lease_until=excluded.lease_until, updated_at=excluded.updated_at",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                runner_id,
+                host_id,
+                agent_id,
+                capabilities_json,
+                now,
+                lease_until
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 原子领取 DSH runner 工作：同 scope/runner 同时最多一个 Dream job；
+    /// 若该 job 已有冻结裁决输入，则直接返回裁决阶段，不重新抽取。
+    pub fn dream_runner_claim(
+        &mut self,
+        scope: &ScopeKey,
+        runner_id: &str,
+        now: &str,
+        lease_secs: u64,
+    ) -> Result<Option<DreamRunnerClaim>, StoreError> {
+        let lease = lease_from(now, lease_secs)?;
+        let tx = self.conn_mut().transaction()?;
+        let runner_live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dream_runners
+             WHERE tenant_id=?1 AND user_id=?2 AND runner_id=?3 AND lease_until>?4)",
+            params![scope.tenant_id, scope.user_id, runner_id, now],
+            |r| r.get(0),
+        )?;
+        if !runner_live {
+            return Err(StoreError::StateConflict);
+        }
+        tx.execute(
+            "UPDATE dream_jobs SET status='queued', runner_id=NULL, lease_until=NULL,
+                    attempts=attempts+1, updated_at=?3
+             WHERE tenant_id=?1 AND user_id=?2 AND status='running'
+               AND (lease_until IS NULL OR lease_until<=?4)",
+            params![scope.tenant_id, scope.user_id, now, now],
+        )?;
+        tx.execute(
+            "UPDATE adjudication_jobs SET status='queued', lease_until=NULL,
+                    attempts=attempts+1, updated_at=?3
+             WHERE tenant_id=?1 AND user_id=?2 AND status='running'
+               AND (lease_until IS NULL OR lease_until<=?4)",
+            params![scope.tenant_id, scope.user_id, now, now],
+        )?;
+        // Recovery for a crash after page publication/consolidation completion but
+        // before the parent Dream receipt was written.
+        tx.execute(
+            "UPDATE dream_jobs SET status='succeeded',runner_id=NULL,lease_until=NULL,updated_at=?3
+             WHERE tenant_id=?1 AND user_id=?2 AND purpose='consolidation'
+               AND status IN ('queued','provider_wait')
+               AND EXISTS (SELECT 1 FROM dream_consolidation_links l
+                 JOIN consolidation_jobs c ON c.tenant_id=l.tenant_id AND c.user_id=l.user_id
+                   AND c.id=l.consolidation_job_id
+                 WHERE l.tenant_id=dream_jobs.tenant_id AND l.user_id=dream_jobs.user_id
+                   AND l.dream_job_id=dream_jobs.id AND c.status='succeeded')",
+            params![scope.tenant_id, scope.user_id, now],
+        )?;
+
+        let active: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id,runner_id FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2
+             AND status='running' AND lease_until>?3 LIMIT 1",
+                params![scope.tenant_id, scope.user_id, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let dream_id = if let Some((id, owner)) = active {
+            if owner != runner_id {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let has_due_adjudication: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM adjudication_jobs
+                 WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3
+                   AND status IN ('queued','retryable_failed','provider_wait') AND run_after<=?4)",
+                params![scope.tenant_id, scope.user_id, id, now],
+                |r| r.get(0),
+            )?;
+            if !has_due_adjudication {
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.execute(
+                "UPDATE dream_jobs SET lease_until=?5, updated_at=?6
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND runner_id=?4 AND status='running'",
+                params![scope.tenant_id, scope.user_id, id, runner_id, lease, now],
+            )?;
+            id
+        } else {
+            let next: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2
+                 AND status IN ('queued','provider_wait') AND run_after<=?3
+                 ORDER BY run_after,created_at,id LIMIT 1",
+                    params![scope.tenant_id, scope.user_id, now],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(id) = next else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE dream_jobs SET status='running', runner_id=?4, lease_until=?5,
+                        claim_generation=claim_generation+1, attempts=attempts+1, updated_at=?6
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND status IN ('queued','provider_wait') AND run_after<=?7",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    id,
+                    runner_id,
+                    lease,
+                    now,
+                    now
+                ],
+            )?;
+            id
+        };
+
+        let adjudication_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM adjudication_jobs WHERE tenant_id=?1 AND user_id=?2
+             AND dream_job_id=?3 AND status IN ('queued','retryable_failed','provider_wait')
+             AND run_after<=?4 ORDER BY run_after,created_at,id LIMIT 1",
+                params![scope.tenant_id, scope.user_id, dream_id, now],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = &adjudication_id {
+            tx.execute(
+                "UPDATE adjudication_jobs SET status='running', lease_until=?5,
+                        claim_generation=claim_generation+1, attempts=attempts+1, updated_at=?6
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND status IN ('queued','retryable_failed','provider_wait') AND run_after<=?4",
+                params![scope.tenant_id, scope.user_id, id, now, lease, now],
+            )?;
+        }
+        let purpose: String = tx.query_row(
+            "SELECT purpose FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            params![scope.tenant_id, scope.user_id, dream_id],
+            |r| r.get(0),
+        )?;
+        let consolidation_id: Option<String> = if purpose == "consolidation" {
+            tx.execute(
+                "UPDATE consolidation_jobs SET status='queued',lease_until=NULL,updated_at=?4
+                 WHERE tenant_id=?1 AND user_id=?2 AND status='running'
+                   AND lease_until<=?3 AND id IN (
+                     SELECT consolidation_job_id FROM dream_consolidation_links
+                     WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?5)",
+                params![scope.tenant_id, scope.user_id, now, now, dream_id],
+            )?;
+            let id: Option<String> = tx
+                .query_row(
+                    "SELECT cj.id FROM consolidation_jobs cj
+                 JOIN dream_consolidation_links l
+                   ON l.tenant_id=cj.tenant_id AND l.user_id=cj.user_id
+                  AND l.consolidation_job_id=cj.id
+                 WHERE cj.tenant_id=?1 AND cj.user_id=?2 AND l.dream_job_id=?3
+                   AND cj.status='queued' AND cj.run_after<=?4
+                 ORDER BY cj.run_after,cj.created_at,cj.id LIMIT 1",
+                    params![scope.tenant_id, scope.user_id, dream_id, now],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = &id {
+                tx.execute(
+                    "UPDATE consolidation_jobs SET status='running',lease_until=?5,
+                       claim_generation=claim_generation+1,attempts=attempts+1,updated_at=?6
+                     WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='queued' AND run_after<=?4",
+                    params![scope.tenant_id, scope.user_id, id, now, lease, now],
+                )?;
+            }
+            id
+        } else {
+            None
+        };
+        tx.commit()?;
+        let dream_job = self
+            .dream_get(scope, &dream_id)?
+            .ok_or(StoreError::JobNotFound)?;
+        let adjudication_job = match adjudication_id {
+            Some(id) => self.adjudication_get(scope, &id)?,
+            None => None,
+        };
+        let consolidation_job = match consolidation_id {
+            Some(id) => self.consolidation_get(scope, &id)?,
+            None => None,
+        };
+        Ok(Some(DreamRunnerClaim {
+            dream_job,
+            adjudication_job,
+            consolidation_job,
+        }))
+    }
+
+    /// 长模型调用期间续租 parent Dream 与可选的 adjudication lease。
+    pub fn dream_runner_lease(
+        &mut self,
+        scope: &ScopeKey,
+        runner_id: &str,
+        dream_job_id: &str,
+        dream_generation: i64,
+        adjudication: Option<(&str, i64)>,
+        consolidation: Option<(&str, i64)>,
+        lease_secs: u64,
+    ) -> Result<bool, StoreError> {
+        let now = now_rfc3339()?;
+        let lease = lease_from(&now, lease_secs)?;
+        let tx = self.conn_mut().transaction()?;
+        let n = tx.execute(
+            "UPDATE dream_jobs SET lease_until=?6,updated_at=?7
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND runner_id=?4
+               AND claim_generation=?5 AND status='running'",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                dream_job_id,
+                runner_id,
+                dream_generation,
+                lease,
+                now
+            ],
+        )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if let Some((adj_id, adj_generation)) = adjudication {
+            let adj = tx.execute(
+                "UPDATE adjudication_jobs SET lease_until=?6,updated_at=?7
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND dream_job_id=?4
+                   AND claim_generation=?5 AND status='running'",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    adj_id,
+                    dream_job_id,
+                    adj_generation,
+                    lease,
+                    now
+                ],
+            )?;
+            if adj == 0 {
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
+        if let Some((job_id, generation)) = consolidation {
+            let updated = tx.execute(
+                "UPDATE consolidation_jobs SET lease_until=?6,updated_at=?7
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND claim_generation=?4
+                   AND status='running' AND EXISTS (
+                     SELECT 1 FROM dream_consolidation_links l
+                     WHERE l.tenant_id=?1 AND l.user_id=?2 AND l.consolidation_job_id=?3
+                       AND l.dream_job_id=?5)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    job_id,
+                    generation,
+                    dream_job_id,
+                    lease,
+                    now
+                ],
+            )?;
+            if updated == 0 {
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 创建一个无 L0 输入的、持久化的手动整理 Dream trigger，并与已冻结的
+    /// consolidation job 原子关联。普通 consolidation job 本身永远不能被 runner 领取。
+    pub fn dream_link_manual_consolidation(
+        &mut self,
+        scope: &ScopeKey,
+        consolidation_job_id: &str,
+        trigger_key: &str,
+    ) -> Result<DreamJobRow, StoreError> {
+        let now = now_rfc3339()?;
+        let tx = self.conn_mut().transaction()?;
+        let dream_id =
+            link_manual_consolidation_tx(&tx, scope, consolidation_job_id, trigger_key, &now)?;
+        tx.commit()?;
+        self.dream_get(scope, &dream_id)?
+            .ok_or(StoreError::JobNotFound)
     }
 
     /// trigger 入队（doc6/10 §4）：同 trigger_key 重放返回原 job（幂等 coalesce）。
@@ -275,7 +719,7 @@ impl Store {
         };
         let mut inputs = Vec::new();
         {
-        let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare(
             "SELECT e.id,e.host_id,e.session_id,e.event_seq,e.content_sha256,e.content,
                     ce.start_byte,ce.end_byte
              FROM dream_candidate_evidence ce
@@ -299,35 +743,35 @@ impl Store {
                          AND pj.target_id=m.id AND pj.status IN ('pending','running'))))
              ORDER BY e.host_id,e.session_id,e.event_seq",
         )?;
-        let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, candidate_id, now],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)?,
-                ))
-            },
-        )?;
-        for row in rows {
-            let (evidence_id, host, session, seq, hash, content, start, end) = row?;
-            if start < 0
-                || end <= start
-                || end > content.len() as i64
-                || !content.is_char_boundary(start as usize)
-                || !content.is_char_boundary(end as usize)
-                || content.get(start as usize..end as usize) != Some(quote.as_str())
-                || sha256_hex(&content) != hash
-            {
-                continue;
+            let rows = stmt.query_map(
+                params![scope.tenant_id, scope.user_id, candidate_id, now],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (evidence_id, host, session, seq, hash, content, start, end) = row?;
+                if start < 0
+                    || end <= start
+                    || end > content.len() as i64
+                    || !content.is_char_boundary(start as usize)
+                    || !content.is_char_boundary(end as usize)
+                    || content.get(start as usize..end as usize) != Some(quote.as_str())
+                    || sha256_hex(&content) != hash
+                {
+                    continue;
+                }
+                inputs.push((evidence_id, host, session, seq, hash));
             }
-            inputs.push((evidence_id, host, session, seq, hash));
-        }
         }
         if inputs.is_empty() {
             return Err(StoreError::StaleInput);
@@ -390,20 +834,37 @@ impl Store {
                    (tenant_id,user_id,job_id,input_order,evidence_id,role,host_id,session_id,
                     event_seq,content_sha256)
                  VALUES (?1,?2,?3,?4,?5,'user',?6,?7,?8,?9)",
-                params![scope.tenant_id, scope.user_id, job_id, order as i64,
-                    evidence_id, host, session, seq, hash],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    job_id,
+                    order as i64,
+                    evidence_id,
+                    host,
+                    session,
+                    seq,
+                    hash
+                ],
             )?;
             tx.execute(
                 "INSERT INTO dream_candidate_redecisions
                    (tenant_id,user_id,candidate_id,dream_job_id,evidence_id,redecision_kind,
                     strategy_fingerprint,created_at)
                  VALUES (?1,?2,?3,?4,?5,'user_request',?6,?7)",
-                params![scope.tenant_id, scope.user_id, candidate_id, job_id,
-                    evidence_id, strategy, now],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    candidate_id,
+                    job_id,
+                    evidence_id,
+                    strategy,
+                    now
+                ],
             )?;
         }
         tx.commit()?;
-        self.dream_get(scope, &job_id)?.ok_or(StoreError::JobNotFound)
+        self.dream_get(scope, &job_id)?
+            .ok_or(StoreError::JobNotFound)
     }
 
     /// 领取（doc4 契约）。
@@ -955,7 +1416,13 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM dream_candidate_redecisions
              WHERE tenant_id=?1 AND user_id=?2 AND candidate_id=?3 AND evidence_id=?4
                AND strategy_fingerprint=?5)",
-            params![scope.tenant_id, scope.user_id, candidate_id, evidence_id, strategy_fingerprint],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                candidate_id,
+                evidence_id,
+                strategy_fingerprint
+            ],
             |r| r.get(0),
         )?;
         Ok(exists)
@@ -1047,17 +1514,14 @@ impl Store {
              WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3
              ORDER BY candidate_id,evidence_id",
         )?;
-        let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, dream_job_id],
-            |r| {
-                Ok(DreamRedecisionRecord {
-                    candidate_id: r.get(0)?,
-                    evidence_id: r.get(1)?,
-                    redecision_kind: r.get(2)?,
-                    strategy_fingerprint: r.get(3)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, dream_job_id], |r| {
+            Ok(DreamRedecisionRecord {
+                candidate_id: r.get(0)?,
+                evidence_id: r.get(1)?,
+                redecision_kind: r.get(2)?,
+                strategy_fingerprint: r.get(3)?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1187,6 +1651,95 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// Add the manual Dream parent and its consolidation association within the
+/// caller's transaction. Keeping this helper transaction-scoped lets the CLI
+/// create both jobs atomically.
+pub(crate) fn link_manual_consolidation_tx(
+    tx: &Transaction<'_>,
+    scope: &ScopeKey,
+    consolidation_job_id: &str,
+    trigger_key: &str,
+    now: &str,
+) -> Result<String, StoreError> {
+    if trigger_key.is_empty() || trigger_key.len() > 128 {
+        return Err(StoreError::InvalidPageField);
+    }
+    let job: Option<(String, String)> = tx
+        .query_row(
+            "SELECT input_fingerprint,generator_version FROM consolidation_jobs
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            params![scope.tenant_id, scope.user_id, consolidation_job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((fingerprint, generator)) = job else {
+        return Err(StoreError::JobNotFound);
+    };
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT id,purpose FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND trigger_key=?3",
+            params![scope.tenant_id, scope.user_id, trigger_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let dream_id = match existing {
+        Some((id, purpose)) if purpose == "consolidation" => id,
+        Some(_) => return Err(StoreError::StateConflict),
+        None => {
+            let id = Uuid::now_v7().to_string();
+            tx.execute(
+                "INSERT INTO dream_jobs
+                   (id,tenant_id,user_id,trigger_kind,trigger_key,pipeline_version,extract_version,
+                    status,attempts,run_after,claim_generation,input_fingerprint,created_at,updated_at,purpose)
+                 VALUES (?1,?2,?3,'manual',?4,?5,?6,'queued',0,?7,0,?8,?7,?7,'consolidation')",
+                params![id,scope.tenant_id,scope.user_id,trigger_key,DREAM_PIPELINE_V1,generator,now,fingerprint],
+            )?;
+            id
+        }
+    };
+    let by_dream: Option<String> = tx
+        .query_row(
+            "SELECT consolidation_job_id FROM dream_consolidation_links
+             WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3",
+            params![scope.tenant_id, scope.user_id, dream_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if by_dream
+        .as_deref()
+        .is_some_and(|linked| linked != consolidation_job_id)
+    {
+        return Err(StoreError::StateConflict);
+    }
+    let by_consolidation: Option<String> = tx
+        .query_row(
+            "SELECT dream_job_id FROM dream_consolidation_links
+             WHERE tenant_id=?1 AND user_id=?2 AND consolidation_job_id=?3",
+            params![scope.tenant_id, scope.user_id, consolidation_job_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if by_consolidation
+        .as_deref()
+        .is_some_and(|linked| linked != dream_id)
+    {
+        return Err(StoreError::StateConflict);
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO dream_consolidation_links
+           (tenant_id,user_id,dream_job_id,consolidation_job_id,purpose,created_at)
+         VALUES (?1,?2,?3,?4,'manual',?5)",
+        params![
+            scope.tenant_id,
+            scope.user_id,
+            dream_id,
+            consolidation_job_id,
+            now
+        ],
+    )?;
+    Ok(dream_id)
 }
 
 fn map_dream_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DreamJobRow> {

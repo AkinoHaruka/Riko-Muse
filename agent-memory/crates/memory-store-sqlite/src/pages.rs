@@ -320,6 +320,23 @@ impl Store {
     /// published（旧版留 revisions）；同事务更新 FTS/grams。任一来源失效 →
     /// StaleInput 整批不发布（doc6/05 §4：不做部分发布）。
     pub fn publish_page(&mut self, req: &PublishRequest<'_>) -> Result<(String, i64), StoreError> {
+        self.publish_page_inner(req, false)
+    }
+
+    /// DSH runner submit 重放专用：同一冻结输入、输出和来源集合已发布时
+    /// 返回原回执，避免进程在页面提交后崩溃造成重复版本。
+    pub fn publish_page_idempotent(
+        &mut self,
+        req: &PublishRequest<'_>,
+    ) -> Result<(String, i64), StoreError> {
+        self.publish_page_inner(req, true)
+    }
+
+    fn publish_page_inner(
+        &mut self,
+        req: &PublishRequest<'_>,
+        idempotent_replay: bool,
+    ) -> Result<(String, i64), StoreError> {
         if req.title.is_empty() || req.title.chars().count() > PAGE_TITLE_MAX_CHARS {
             return Err(StoreError::InvalidPageField);
         }
@@ -362,6 +379,47 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        if let Some((id, version)) = &existing {
+            let same_page: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_pages
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'
+                   AND title=?4 AND body_md=?5 AND generator_version=?6 AND input_fingerprint=?7)",
+                params![
+                    req.scope.tenant_id,
+                    req.scope.user_id,
+                    id,
+                    req.title,
+                    req.body_md,
+                    req.generator_version,
+                    req.input_fingerprint
+                ],
+                |r| r.get(0),
+            )?;
+            if idempotent_replay && same_page {
+                let mut existing_sources = {
+                    let mut stmt = tx.prepare(
+                        "SELECT memory_id,memory_version,claim_sha256 FROM page_sources
+                         WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3 ORDER BY memory_id",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![req.scope.tenant_id, req.scope.user_id, id], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, String>(2)?,
+                            ))
+                        })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let mut requested_sources = req.sources.to_vec();
+                existing_sources.sort();
+                requested_sources.sort();
+                if existing_sources == requested_sources {
+                    tx.commit()?;
+                    return Ok((id.clone(), *version));
+                }
+            }
+        }
         let (page_id, new_version, previous) = match &existing {
             Some((id, v)) => {
                 let prev: Option<(String, String, i64)> = tx

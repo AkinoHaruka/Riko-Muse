@@ -54,7 +54,13 @@ impl Store {
                    AND role='user' AND source_kind='user'
                  ORDER BY event_seq DESC LIMIT 1",
                 rusqlite::params![scope.tenant_id, scope.user_id, host_id, session_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
         Ok(row)
@@ -184,7 +190,9 @@ mod tests {
     use chrono::TimeZone;
 
     fn migrations_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
     }
 
     fn setup(tag: &str) -> (Store, ScopeKey) {
@@ -192,9 +200,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("am-ev-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        store
-            .principal_add("t", "u", &dir.join("u.token"))
-            .unwrap();
+        store.principal_add("t", "u", &dir.join("u.token")).unwrap();
         let token = std::fs::read_to_string(dir.join("u.token")).unwrap();
         let scope = store.verify_token(token.trim()).unwrap().unwrap();
         (store, scope)
@@ -242,12 +248,23 @@ mod tests {
         let (mut store, scope) = setup("latest");
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
-        store.record_evidence(&scope, &o, 0, "user", "user", &t, "第一句").unwrap();
-        store.record_evidence(&scope, &o, 1, "assistant", "assistant", &t, "助手回复").unwrap();
+        store
+            .record_evidence(&scope, &o, 0, "user", "user", &t, "第一句")
+            .unwrap();
+        store
+            .record_evidence(&scope, &o, 1, "assistant", "assistant", &t, "助手回复")
+            .unwrap();
         // plugin 来源的 user 消息不算用户证据（doc/05 §1）
-        store.record_evidence(&scope, &o, 2, "user", "plugin", &t, "注入的记忆块").unwrap();
-        store.record_evidence(&scope, &o, 3, "user", "user", &t, "第二句").unwrap();
-        let (id, seq, content) = store.latest_user_event(&scope, "dsh", "s1").unwrap().unwrap();
+        store
+            .record_evidence(&scope, &o, 2, "user", "plugin", &t, "注入的记忆块")
+            .unwrap();
+        store
+            .record_evidence(&scope, &o, 3, "user", "user", &t, "第二句")
+            .unwrap();
+        let (id, seq, content) = store
+            .latest_user_event(&scope, "dsh", "s1")
+            .unwrap()
+            .unwrap();
         assert_eq!(seq, 3);
         assert_eq!(content, "第二句");
         let _ = id;
@@ -266,7 +283,9 @@ mod tests {
         // 已有事件的会话：through 未越界 → 正常建作业（验证 max_event_seq 正路径未受影响）。
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
-        store.record_evidence(&scope, &o, 8, "user", "user", &t, "你好").unwrap();
+        store
+            .record_evidence(&scope, &o, 8, "user", "user", &t, "你好")
+            .unwrap();
         let outcome = store.flush_window(&scope, "dsh", "s1", 8).unwrap();
         assert!(matches!(outcome, crate::jobs::FlushOutcome::Created { .. }));
     }

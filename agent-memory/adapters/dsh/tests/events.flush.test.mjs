@@ -10,36 +10,56 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EventPipeline } from "../dist/events.js";
+import { EventPipeline, isCapturableSessionHeader } from "../dist/events.js";
 import { Spool } from "../dist/spool.js";
 
 const ok = (extra = {}) => ({ failure: "ok", status: 200, requestId: "req-test", ...extra });
 
 function fakeClient(overrides = {}) {
-  const calls = { version: 0, recordEvent: 0, flush: 0 };
+  const calls = { version: 0, recordEvent: 0, flush: 0, dreamTrigger: 0 };
   const flushRequests = [];
   const recordRequests = [];
+  const dreamRequests = [];
   return {
     calls,
     flushRequests,
     recordRequests,
+    dreamRequests,
+    order: [],
     async version() { calls.version += 1; return ok({ body: { protocol_version: 1 } }); },
     async recordEvent(request) {
       calls.recordEvent += 1;
+      this.order.push("event");
       recordRequests.push(request);
       if (overrides.recordEvent) return overrides.recordEvent(request);
       return ok({ status: 201, body: { evidence_id: "ev" } });
     },
     async flush(request) {
       calls.flush += 1;
+      this.order.push("flush");
       flushRequests.push(request);
       if (overrides.flush) return overrides.flush(request);
       return ok({ body: {} });
+    },
+    async dreamTrigger(request) {
+      calls.dreamTrigger += 1;
+      this.order.push("dream");
+      dreamRequests.push(request);
+      if (overrides.dreamTrigger) return overrides.dreamTrigger(request);
+      return ok({ status: 202, body: { status: "trigger_queued" } });
     },
   };
 }
 
 const quiet = { warn() {}, error() {}, info() {} };
+
+test("L0 capture excludes DSH subagent and fork session headers", () => {
+  assert.equal(isCapturableSessionHeader({}), true);
+  assert.equal(isCapturableSessionHeader({ origin: "subagent" }), false);
+  assert.equal(isCapturableSessionHeader({ parentSession: "parent-session" }), false);
+  assert.equal(isCapturableSessionHeader(undefined), false);
+});
+
 function spyLogger() {
   return {
     warns: [],
@@ -174,6 +194,103 @@ test("重启重放不丢 flush：未 ack 的 flush 在新实例 start 后发出"
     assert.ok(client.calls.flush >= 1, "重放应补发 flush（不丢）");
     const replayedFlush = client.flushRequests.find((r) => r.through_event_seq === 5);
     assert.ok(replayedFlush, "flush 应指向既有 through=5");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("compaction/end 按 event → flush receipt → 持久 Dream trigger 排序", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "am-dream-trigger-order-"));
+  try {
+    const spool = new Spool(dir);
+    const client = fakeClient();
+    const pipeline = new EventPipeline(spool, client, quiet, "stable-host", true);
+    await pipeline.start(undefined);
+    pipeline.observeSessionEvent("session-a", userEvent(18, "我在杭州做 Rust 开发"));
+    pipeline.observeSessionEvent("session-a", {
+      type: "compaction/end",
+      data: { compactionId: "compact-01" },
+    });
+    await pipeline.dispose();
+
+    assert.deepEqual(client.order, ["event", "flush", "dream"]);
+    assert.equal(client.flushRequests[0].through_event_seq, 18);
+    assert.equal(client.calls.dreamTrigger, 1);
+    assert.equal(client.dreamRequests[0].trigger_kind, "compact");
+    assert.match(client.dreamRequests[0].trigger_key, /^dsh-compact-[a-f0-9]{64}$/);
+    assert.equal("compaction_id" in client.dreamRequests[0], false, "只发送 Rust trigger DTO 中定义的字段");
+    const pending = spool.pending();
+    assert.deepEqual(pending, [], "三个操作均已收到 receipt");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("DSH 离线时 compaction trigger 与前序 flush 一起落盘并按序恢复", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "am-dream-trigger-replay-"));
+  try {
+    const offline = fakeClient({
+      recordEvent: () => ({ failure: "offline", status: 0 }),
+      flush: () => ({ failure: "offline", status: 0 }),
+      dreamTrigger: () => ({ failure: "offline", status: 0 }),
+    });
+    const spoolA = new Spool(dir);
+    const pipelineA = new EventPipeline(spoolA, offline, quiet, "stable-host", true);
+    await pipelineA.start(undefined);
+    pipelineA.observeSessionEvent("session-b", userEvent(7, "我平时使用 PostgreSQL"));
+    pipelineA.observeSessionEvent("session-b", {
+      type: "compaction/end",
+      data: { compactionId: "compact-offline" },
+    });
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && spoolA.pending().length < 3) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.deepEqual(spoolA.pending().map((op) => op.op), ["event", "flush", "dream"]);
+    await pipelineA.dispose();
+
+    const client = fakeClient();
+    const spoolB = new Spool(dir);
+    const pipelineB = new EventPipeline(spoolB, client, quiet, "stable-host", true);
+    await pipelineB.start(undefined);
+    await pipelineB.dispose();
+    assert.deepEqual(client.order, ["event", "flush", "dream"]);
+    assert.equal(client.flushRequests[0].through_event_seq, 7);
+    assert.equal(client.calls.dreamTrigger, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("compaction/end 遇到满内存队列时先持久化旧队列并同步落盘 trigger", () => {
+  const dir = mkdtempSync(join(tmpdir(), "am-dream-trigger-full-"));
+  try {
+    const spool = new Spool(dir);
+    const pipeline = new EventPipeline(spool, fakeClient(), quiet, "stable-host", true);
+    // 模拟回调执行前已接收但尚未由异步 writer 落盘的满队列。
+    pipeline.queue = Array.from({ length: 1024 }, (_, index) => ({
+      op: {
+        opId: `stable-host/session-full/${index}`,
+        op: "event",
+        request: { event_seq: index },
+      },
+      sessionId: "session-full",
+      bodySeq: index,
+      bytes: 1,
+    }));
+    pipeline.queueBytes = 1024;
+    pipeline.lastBodySeq.set("session-full", 1023);
+
+    pipeline.observeSessionEvent("session-full", {
+      type: "compaction/end",
+      data: { compactionId: "compact-queue-full" },
+    });
+
+    const pending = spool.pending();
+    assert.equal(pending.length, 1026, "1024 个已接收事件、flush、Dream trigger 全部 fsync 落盘");
+    assert.deepEqual(pending.slice(-2).map((op) => op.op), ["flush", "dream"]);
+    assert.equal(pipeline.queue.length, 0, "compact 回调返回前控制操作已从内存队列写入 spool");
+    spool.dispose();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

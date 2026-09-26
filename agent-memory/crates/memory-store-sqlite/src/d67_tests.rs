@@ -19,13 +19,26 @@ fn setup(tag: &str) -> (Store, ScopeKey, Origin) {
     store.principal_add("t", "u", &dir.join("u.token")).unwrap();
     let token = std::fs::read_to_string(dir.join("u.token")).unwrap();
     let scope = store.verify_token(token.trim()).unwrap().unwrap();
-    let origin = Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s".into() };
+    let origin = Origin {
+        host_id: "dsh".into(),
+        agent_id: "a".into(),
+        session_id: "s".into(),
+    };
     (store, scope, origin)
 }
 
-fn ingest_user(store: &mut Store, scope: &ScopeKey, origin: &Origin, seq: i64, content: &str) -> String {
+fn ingest_user(
+    store: &mut Store,
+    scope: &ScopeKey,
+    origin: &Origin,
+    seq: i64,
+    content: &str,
+) -> String {
     let t = chrono::Utc::now();
-    match store.record_evidence(scope, origin, seq, "user", "user", &t, content).unwrap() {
+    match store
+        .record_evidence(scope, origin, seq, "user", "user", &t, content)
+        .unwrap()
+    {
         crate::IngestOutcome::Recorded(id) => id,
         crate::IngestOutcome::AlreadyRecorded(id) => id,
     }
@@ -37,7 +50,10 @@ fn dream_trigger_snapshot_idempotent_and_freezes_inputs() {
     // 快照后新事件留 pending（等待下一 job）；无事件时不建空作业。
     let (mut store, scope, origin) = setup("trigger");
     // 无事件：不建作业。
-    assert!(store.dream_trigger(&scope, "manual", "k0", None, None, None).unwrap().is_none());
+    assert!(store
+        .dream_trigger(&scope, "manual", "k0", None, None, None)
+        .unwrap()
+        .is_none());
     let e1 = ingest_user(&mut store, &scope, &origin, 1, "我住在杭州");
     let e2 = ingest_user(&mut store, &scope, &origin, 2, "我对芒果过敏");
     let now = crate::now_rfc3339_pub().unwrap();
@@ -48,7 +64,10 @@ fn dream_trigger_snapshot_idempotent_and_freezes_inputs() {
     assert_eq!(job.extract_version, DREAM_EXTRACT_V1);
     assert_eq!(job.status, "queued");
     // 同 key 重放：返回原 job（幂等 coalesce）。
-    let replay = store.dream_trigger(&scope, "manual", "k1", None, None, None).unwrap().unwrap();
+    let replay = store
+        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .unwrap()
+        .unwrap();
     assert_eq!(replay.id, job.id);
     // 快照固化：两条输入、账本 assigned。
     let inputs = store.dream_input_evidence_ids(&scope, &job.id).unwrap();
@@ -61,7 +80,10 @@ fn dream_trigger_snapshot_idempotent_and_freezes_inputs() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((st.as_str(), active.as_str()), ("assigned", job.id.as_str()));
+    assert_eq!(
+        (st.as_str(), active.as_str()),
+        ("assigned", job.id.as_str())
+    );
     // 快照后新事件留 pending：不再进当前 job 的输入。
     let e3 = ingest_user(&mut store, &scope, &origin, 3, "下周一要体检");
     let inputs2 = store.dream_input_evidence_ids(&scope, &job.id).unwrap();
@@ -91,7 +113,10 @@ fn dream_submit_candidates_validates_spans_and_lifecycle() {
     let (mut store, scope, origin) = setup("submit");
     let content = "我住在杭州，喜欢简短回答。";
     let e1 = ingest_user(&mut store, &scope, &origin, 1, content);
-    let job = store.dream_trigger(&scope, "manual", "k1", None, None, None).unwrap().unwrap();
+    let job = store
+        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .unwrap()
+        .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
     let now = crate::now_rfc3339_pub().unwrap();
     let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
@@ -123,9 +148,20 @@ fn dream_submit_candidates_validates_spans_and_lifecycle() {
         evidence_id: "01a0not-in-job".into(),
         ..good.clone()
     };
-    let (accepted, rejected) =
-        store.dream_submit_candidates(&scope, &job.id, gen, "dream_policy_v1", &[good, bad_quote, foreign]).unwrap();
-    assert_eq!((accepted, rejected), (1, 2), "逐字 span 与输入归属被强制核验");
+    let (accepted, rejected) = store
+        .dream_submit_candidates(
+            &scope,
+            &job.id,
+            gen,
+            "dream_policy_v1",
+            &[good, bad_quote, foreign],
+        )
+        .unwrap();
+    assert_eq!(
+        (accepted, rejected),
+        (1, 2),
+        "逐字 span 与输入归属被强制核验"
+    );
     let candidates: Vec<(String, String)> = store
         .conn()
         .prepare("SELECT id, status FROM dream_candidates WHERE dream_job_id=?1")
@@ -137,7 +173,9 @@ fn dream_submit_candidates_validates_spans_and_lifecycle() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].1, "candidate");
     // succeed：状态推进 + 账本 processed。
-    assert!(store.dream_succeed(&scope, &job.id, gen, Some("mock"), Some(10), Some(5)).unwrap());
+    assert!(store
+        .dream_succeed(&scope, &job.id, gen, Some("mock"), Some(10), Some(5))
+        .unwrap());
     let (jstatus, estatus): (String, String) = store
         .conn()
         .query_row(
@@ -147,7 +185,10 @@ fn dream_submit_candidates_validates_spans_and_lifecycle() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((jstatus.as_str(), estatus.as_str()), ("succeeded", "processed"));
+    assert_eq!(
+        (jstatus.as_str(), estatus.as_str()),
+        ("succeeded", "processed")
+    );
     // stale claim 提交被拒（generation 不匹配）。
     let late = store.dream_submit_candidates(&scope, &job.id, gen, "dream_policy_v1", &[]);
     assert!(matches!(late, Err(StoreError::StaleClaim)));
@@ -158,13 +199,18 @@ fn dream_recover_expired_and_provider_wait() {
     // doc6/10 §5：provider_wait 保留 assigned；崩溃恢复过期 running 回 queued。
     let (mut store, scope, origin) = setup("recover");
     let _ = ingest_user(&mut store, &scope, &origin, 1, "我住在杭州");
-    let job = store.dream_trigger(&scope, "manual", "k1", None, None, None).unwrap().unwrap();
+    let job = store
+        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .unwrap()
+        .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
     let now = crate::now_rfc3339_pub().unwrap();
     let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
     let gen = claimed.claim_generation;
     // provider 故障 → provider_wait；账本保持 assigned（不伪装 defer）。
-    assert!(store.dream_provider_wait(&scope, &job.id, gen, "MODEL_TIMEOUT", None).unwrap());
+    assert!(store
+        .dream_provider_wait(&scope, &job.id, gen, "MODEL_TIMEOUT", None)
+        .unwrap());
     let estatus: String = store
         .conn()
         .query_row(
@@ -186,7 +232,10 @@ fn dream_recover_expired_and_provider_wait() {
     let recovered = store.dream_get(&scope, &job.id).unwrap().unwrap();
     assert_eq!(recovered.status, "queued", "过期 running 回 queued");
     assert_eq!(
-        store.dream_input_evidence_ids(&scope, &job.id).unwrap().len(),
+        store
+            .dream_input_evidence_ids(&scope, &job.id)
+            .unwrap()
+            .len(),
         1,
         "恢复后冻结输入不变"
     );
@@ -200,7 +249,10 @@ fn dream_extract_parser_strict() {
     assert_eq!(parse_dream_extract_v1(ok).unwrap().len(), 1);
     let fenced = format!("```json\n{ok}\n```");
     assert_eq!(parse_dream_extract_v1(&fenced).unwrap().len(), 1);
-    assert!(parse_dream_extract_v1("not json").is_err(), "坏 JSON 确定性失败");
+    assert!(
+        parse_dream_extract_v1("not json").is_err(),
+        "坏 JSON 确定性失败"
+    );
     assert!(parse_dream_extract_v1(
         r#"{"candidates":[{"evidence_id":"e1","kind":"secret","quote":"x","claim":"y"}]}"#
     )
@@ -211,14 +263,14 @@ fn dream_extract_parser_strict() {
     .is_err());
     // >20 候选拒绝。
     let many: Vec<String> = (0..21)
-        .map(|i| {
-            format!(r#"{{"evidence_id":"e{i}","kind":"fact","quote":"q","claim":"c"}}"#)
-        })
+        .map(|i| format!(r#"{{"evidence_id":"e{i}","kind":"fact","quote":"q","claim":"c"}}"#))
         .collect();
     let many_json = format!(r#"{{"candidates":[{}]}}"#, many.join(","));
     assert!(parse_dream_extract_v1(&many_json).is_err());
     // locate_quote_span：非 char_boundary 不 panic。
     let content = "你好世界";
     assert!(locate_quote_span(content, "好世").is_some());
-    assert!(locate_quote_span(content, "好界").is_none() || locate_quote_span("abc", "bc").is_some());
+    assert!(
+        locate_quote_span(content, "好界").is_none() || locate_quote_span("abc", "bc").is_some()
+    );
 }

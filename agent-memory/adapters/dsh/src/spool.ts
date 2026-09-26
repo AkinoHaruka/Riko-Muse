@@ -24,7 +24,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-export type SpoolOpKind = "event" | "flush";
+export type SpoolOpKind = "event" | "flush" | "dream";
 
 export interface SpooledOp {
   /** 操作唯一键 = <host>/<session>/<seq 或 flush:through>；内核幂等键来源不变。 */
@@ -37,7 +37,7 @@ export interface SpooledOp {
 export interface Receipt {
   opId: string;
   kind: SpoolOpKind;
-  /** 仅来自内核 200/201 响应；旧 acked.jsonl 行没有。 */
+  /** 仅来自内核响应；旧 acked.jsonl 行没有。 */
   evidenceId?: string;
   at: string;
 }

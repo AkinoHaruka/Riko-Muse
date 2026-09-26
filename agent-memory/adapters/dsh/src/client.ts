@@ -84,6 +84,38 @@ export class MemoryClient {
     return this.post("/v1/extraction/flush", request, this.cfg.writeTimeoutMs);
   }
 
+  dreamTrigger(request: Record<string, unknown>): Promise<ApiResult> {
+    return this.post("/v1/dream/triggers", request, this.cfg.writeTimeoutMs);
+  }
+
+  dreamRunnerHeartbeat(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post("/v1/dream/runner/heartbeat", request, this.cfg.writeTimeoutMs, signal);
+  }
+
+  dreamRunnerClaim(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post("/v1/dream/runner/claim", request, this.cfg.writeTimeoutMs, signal);
+  }
+
+  dreamRunnerLease(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post("/v1/dream/runner/lease", request, this.cfg.writeTimeoutMs, signal);
+  }
+
+  dreamSubmitCandidates(jobId: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post(`/v1/dream/jobs/${encodeURIComponent(jobId)}/candidates`, request, this.cfg.writeTimeoutMs, signal);
+  }
+
+  dreamSubmitAdjudication(jobId: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post(`/v1/dream/adjudications/${encodeURIComponent(jobId)}/submit`, request, this.cfg.writeTimeoutMs, signal);
+  }
+
+  dreamSubmitConsolidation(jobId: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post(`/v1/consolidation/jobs/${encodeURIComponent(jobId)}/publish`, request, this.cfg.writeTimeoutMs, signal);
+  }
+
+  dreamRunnerFailure(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post("/v1/dream/runner/failure", request, this.cfg.writeTimeoutMs, signal);
+  }
+
   compose(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
     return this.post("/v1/context/compose", request, this.cfg.composeTimeoutMs, signal);
   }

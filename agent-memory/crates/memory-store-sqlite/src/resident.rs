@@ -116,7 +116,13 @@ impl Store {
                     "INSERT INTO resident_pins
                        (tenant_id, user_id, memory_id, enabled, position, pinned_at, version)
                      VALUES (?1, ?2, ?3, 1, ?4, ?5, 1)",
-                    params![scope.tenant_id, scope.user_id, memory_id, INSERT_TEMP_POSITION, now],
+                    params![
+                        scope.tenant_id,
+                        scope.user_id,
+                        memory_id,
+                        INSERT_TEMP_POSITION,
+                        now
+                    ],
                 )?;
                 reposition_in_tx(&tx, scope, memory_id, position)?;
                 if let Some((key, hash)) = receipt {
@@ -132,7 +138,10 @@ impl Store {
                 }
                 tx.commit()?;
                 let pos = self.pin_position_of(scope, memory_id)?.unwrap_or_default();
-                Ok(PinOutcome::Pinned { version: 1, position: pos })
+                Ok(PinOutcome::Pinned {
+                    version: 1,
+                    position: pos,
+                })
             }
             Some((enabled, current_position, current_version)) => {
                 if let Some(expected) = expected_pin_version {
@@ -156,7 +165,12 @@ impl Store {
                     tx.execute(
                         "UPDATE resident_pins SET enabled=1, position=?4
                          WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
-                        params![scope.tenant_id, scope.user_id, memory_id, INSERT_TEMP_POSITION],
+                        params![
+                            scope.tenant_id,
+                            scope.user_id,
+                            memory_id,
+                            INSERT_TEMP_POSITION
+                        ],
                     )?;
                     reposition_in_tx(&tx, scope, memory_id, position)?;
                 }
@@ -178,7 +192,10 @@ impl Store {
                 }
                 tx.commit()?;
                 let pos = self.pin_position_of(scope, memory_id)?.unwrap_or_default();
-                Ok(PinOutcome::Pinned { version: new_version, position: pos })
+                Ok(PinOutcome::Pinned {
+                    version: new_version,
+                    position: pos,
+                })
             }
         }
     }
@@ -228,7 +245,10 @@ impl Store {
                         r#"{"status":"already_disabled","pin_version":0}"#,
                     )?;
                 }
-                return Ok(UnpinOutcome { version: 0, already_disabled: true });
+                return Ok(UnpinOutcome {
+                    version: 0,
+                    already_disabled: true,
+                });
             }
         };
         if !enabled {
@@ -242,7 +262,10 @@ impl Store {
                     &format!(r#"{{"status":"already_disabled","pin_version":{version}}}"#),
                 )?;
             }
-            return Ok(UnpinOutcome { version, already_disabled: true });
+            return Ok(UnpinOutcome {
+                version,
+                already_disabled: true,
+            });
         }
         if let Some(expected) = expected_pin_version {
             if expected != version {
@@ -267,7 +290,10 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(UnpinOutcome { version: version + 1, already_disabled: false })
+        Ok(UnpinOutcome {
+            version: version + 1,
+            already_disabled: false,
+        })
     }
 
     /// 重排：把一条 enabled pin 移到新下标（越界钳制到末尾），其余 enabled 行
@@ -398,7 +424,11 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    fn pin_position_of(&self, scope: &ScopeKey, memory_id: &str) -> Result<Option<i64>, StoreError> {
+    fn pin_position_of(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
         let pos = self
             .conn()
             .query_row(
@@ -426,15 +456,19 @@ fn reposition_in_tx(
             "SELECT memory_id FROM resident_pins
              WHERE tenant_id=?1 AND user_id=?2 AND enabled=1 ORDER BY position, memory_id",
         )?;
-        let rows =
-            stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+            r.get::<_, String>(0)
+        })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     if !current.iter().any(|id| id == memory_id) {
         return Err(StoreError::MemoryNotFound);
     }
-    let mut ordered: Vec<String> =
-        current.iter().filter(|id| id.as_str() != memory_id).cloned().collect();
+    let mut ordered: Vec<String> = current
+        .iter()
+        .filter(|id| id.as_str() != memory_id)
+        .cloned()
+        .collect();
     let target_index = match desired {
         None => ordered.len(),
         Some(p) => p.clamp(0, ordered.len() as i64) as usize,
@@ -576,7 +610,9 @@ impl Store {
                  WHERE pp.tenant_id=?1 AND pp.user_id=?2 AND pp.enabled=1
                  ORDER BY pp.position, pp.page_id",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                r.get::<_, String>(0)
+            })?;
             let pinned_page_ids: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
             for page_id in pinned_page_ids {
                 match self.get_page(scope, &page_id, now)? {
@@ -675,7 +711,10 @@ impl Store {
                 .into_iter()
                 .map(|(id, _, _)| id)
                 .collect();
-            let entry = ResidentItem { evidence_ids, ..item };
+            let entry = ResidentItem {
+                evidence_ids,
+                ..item
+            };
             let entry_chars = render_entry(&entry).chars().count();
             if used_chars > 0 && used_chars + entry_chars + 1 > max_chars {
                 // 字符超预算：跳过该条，继续看后续更短条（doc6/03 §3）。
@@ -685,8 +724,12 @@ impl Store {
             used_chars += entry_chars + if selection.items.is_empty() { 0 } else { 1 };
             selection.items.push(entry);
         }
-        selection.text =
-            selection.items.iter().map(render_entry).collect::<Vec<_>>().join("\n");
+        selection.text = selection
+            .items
+            .iter()
+            .map(render_entry)
+            .collect::<Vec<_>>()
+            .join("\n");
         selection.truncated = !selection.omitted.is_empty();
         Ok(selection)
     }
@@ -730,7 +773,13 @@ impl Store {
                 .into_iter()
                 .map(|(id, _, _)| id)
                 .collect();
-            out.push(SuggestionRow { memory_id, kind, claim, updated_at, evidence_ids });
+            out.push(SuggestionRow {
+                memory_id,
+                kind,
+                claim,
+                updated_at,
+                evidence_ids,
+            });
         }
         Ok(out)
     }
@@ -756,7 +805,11 @@ mod tests {
         store.principal_add("t", "u", &dir.join("u.token")).unwrap();
         let token = std::fs::read_to_string(dir.join("u.token")).unwrap();
         let scope = store.verify_token(token.trim()).unwrap().unwrap();
-        let origin = Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s".into() };
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "a".into(),
+            session_id: "s".into(),
+        };
         (store, scope, origin)
     }
 
@@ -775,7 +828,10 @@ mod tests {
             IngestOutcome::Recorded(id) => id,
             IngestOutcome::AlreadyRecorded(id) => id,
         };
-        match store.remember(scope, origin, &ev, claim, MemoryKind::Fact).unwrap() {
+        match store
+            .remember(scope, origin, &ev, claim, MemoryKind::Fact)
+            .unwrap()
+        {
             crate::RememberOutcome::Created { memory_id, .. } => memory_id,
             crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
         }
@@ -787,12 +843,18 @@ mod tests {
         let (mut store, scope, origin) = setup("flow");
         let m1 = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州");
         match store.resident_pin(&scope, &m1, None, None, None).unwrap() {
-            PinOutcome::Pinned { version: 1, position: 0 } => {}
+            PinOutcome::Pinned {
+                version: 1,
+                position: 0,
+            } => {}
             other => panic!("首次 pin 应为 v1/pos0：{other:?}"),
         }
         // 重复 pin 同位置：幂等不增版本。
         match store.resident_pin(&scope, &m1, None, None, None).unwrap() {
-            PinOutcome::Unchanged { version: 1, position: 0 } => {}
+            PinOutcome::Unchanged {
+                version: 1,
+                position: 0,
+            } => {}
             other => panic!("重复 pin 应幂等：{other:?}"),
         }
         // CAS 冲突。
@@ -801,18 +863,30 @@ mod tests {
             Err(StoreError::VersionConflict)
         ));
         // unpin：版本 2、行保留；回执同事务落行。
-        let un = store.resident_unpin(&scope, &m1, Some(1), Some(("key-unpin", "hash-unpin"))).unwrap();
+        let un = store
+            .resident_unpin(&scope, &m1, Some(1), Some(("key-unpin", "hash-unpin")))
+            .unwrap();
         assert_eq!(un.version, 2);
         assert!(!un.already_disabled);
-        let receipt = store.fetch_mutation_receipt(&scope, "resident_unpin", "key-unpin").unwrap().unwrap();
+        let receipt = store
+            .fetch_mutation_receipt(&scope, "resident_unpin", "key-unpin")
+            .unwrap()
+            .unwrap();
         assert_eq!(receipt.result_status, "unpinned");
-        assert_eq!(store.resident_pins(&scope).unwrap().len(), 0, "enabled=0 不出现在 pin 列表");
+        assert_eq!(
+            store.resident_pins(&scope).unwrap().len(),
+            0,
+            "enabled=0 不出现在 pin 列表"
+        );
         // 重复 unpin（带或不带 CAS）：幂等。
         let un2 = store.resident_unpin(&scope, &m1, Some(2), None).unwrap();
         assert!(un2.already_disabled && un2.version == 2);
         // 重新 pin：沿原行版本 3。
         match store.resident_pin(&scope, &m1, None, None, None).unwrap() {
-            PinOutcome::Pinned { version: 3, position: 0 } => {}
+            PinOutcome::Pinned {
+                version: 3,
+                position: 0,
+            } => {}
             other => panic!("重 pin 应为 v3：{other:?}"),
         }
         // 首次 pin 不接受 expected_pin_version。
@@ -831,7 +905,9 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("am-res-test-{}-iso-u2", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+            store
+                .principal_add("t", "u2", &dir.join("u2.token"))
+                .unwrap();
             let token = std::fs::read_to_string(dir.join("u2.token")).unwrap();
             store.verify_token(token.trim()).unwrap().unwrap()
         };
@@ -862,8 +938,12 @@ mod tests {
         let (mut store, scope, origin) = setup("visibility");
         let m_keep = remember_one(&mut store, &scope, &origin, 1, "长期有效的事实");
         let m_gone = remember_one(&mut store, &scope, &origin, 2, "将被遗忘的事实");
-        store.resident_pin(&scope, &m_keep, None, None, None).unwrap();
-        store.resident_pin(&scope, &m_gone, None, None, None).unwrap();
+        store
+            .resident_pin(&scope, &m_keep, None, None, None)
+            .unwrap();
+        store
+            .resident_pin(&scope, &m_gone, None, None, None)
+            .unwrap();
         store
             .conn()
             .execute(
@@ -879,7 +959,10 @@ mod tests {
             )
             .unwrap();
         let now = now_rfc3339().unwrap();
-        assert!(store.resident_visible_pins(&scope, &now).unwrap().is_empty());
+        assert!(store
+            .resident_visible_pins(&scope, &now)
+            .unwrap()
+            .is_empty());
         // CLI list 给出不可见原因；pin 行保留作历史。
         let rows = store.resident_pins_with_status(&scope, &now).unwrap();
         assert_eq!(rows.len(), 2);
@@ -909,8 +992,14 @@ mod tests {
         store.resident_pin(&scope, &m1, None, None, None).unwrap();
         store.resident_pin(&scope, &m2, None, None, None).unwrap();
         store.resident_pin(&scope, &m3, None, None, None).unwrap();
-        let order =
-            |store: &Store| -> Vec<String> { store.resident_pins(&scope).unwrap().into_iter().map(|p| p.memory_id).collect() };
+        let order = |store: &Store| -> Vec<String> {
+            store
+                .resident_pins(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.memory_id)
+                .collect()
+        };
         assert_eq!(order(&store), vec![m1.clone(), m2.clone(), m3.clone()]);
         // m3 移到首位：版本 +1，顺序 [m3,m1,m2]。
         let v = store.resident_move(&scope, &m3, 0, Some(1)).unwrap();
@@ -920,8 +1009,12 @@ mod tests {
         store.resident_move(&scope, &m3, 99, Some(2)).unwrap();
         assert_eq!(order(&store), vec![m1.clone(), m2.clone(), m3.clone()]);
         // 位置归一化 0..n-1，无临时偏移残留。
-        let positions: Vec<i64> =
-            store.resident_pins(&scope).unwrap().into_iter().map(|p| p.position).collect();
+        let positions: Vec<i64> = store
+            .resident_pins(&scope)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.position)
+            .collect();
         assert_eq!(positions, vec![0, 1, 2]);
         // 错误 CAS 拒绝且顺序不变。
         assert!(matches!(
@@ -937,13 +1030,23 @@ mod tests {
         ));
         // 重新 pin 到占用位置（显式 position 0）：通过临时偏移路径，不冲突。
         // 版本链：pin v1 → move v2 → move v3 → unpin v4 → 重激活 v5。
-        match store.resident_pin(&scope, &m3, Some(0), None, None).unwrap() {
-            PinOutcome::Pinned { version: 5, position: 0 } => {}
+        match store
+            .resident_pin(&scope, &m3, Some(0), None, None)
+            .unwrap()
+        {
+            PinOutcome::Pinned {
+                version: 5,
+                position: 0,
+            } => {}
             other => panic!("重激活应 v5/pos0：{other:?}"),
         }
         assert_eq!(order(&store), vec![m3.clone(), m1.clone(), m2.clone()]);
-        let positions2: Vec<i64> =
-            store.resident_pins(&scope).unwrap().into_iter().map(|p| p.position).collect();
+        let positions2: Vec<i64> = store
+            .resident_pins(&scope)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.position)
+            .collect();
         assert_eq!(positions2, vec![0, 1, 2]);
     }
 
@@ -975,10 +1078,38 @@ mod tests {
     fn select_resident_pinned_first_instructions_auto_facts_not() {
         // doc6/03 §3：pinned 优先；未 pin instruction 自动；未 pin fact/episode 不常驻。
         let (mut store, scope, origin) = setup("select");
-        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
-        let ep = remember_kind(&mut store, &scope, &origin, 2, "用户上周去了西湖", MemoryKind::Episode);
-        let i1 = remember_kind(&mut store, &scope, &origin, 3, "以后回答先给结论", MemoryKind::Instruction);
-        let i2 = remember_kind(&mut store, &scope, &origin, 4, "以后回答用中文", MemoryKind::Instruction);
+        let f1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            1,
+            "用户住在杭州",
+            MemoryKind::Fact,
+        );
+        let ep = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            2,
+            "用户上周去了西湖",
+            MemoryKind::Episode,
+        );
+        let i1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            3,
+            "以后回答先给结论",
+            MemoryKind::Instruction,
+        );
+        let i2 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            4,
+            "以后回答用中文",
+            MemoryKind::Instruction,
+        );
         store.resident_pin(&scope, &f1, None, None, None).unwrap();
         let now = now_rfc3339().unwrap();
         let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
@@ -1003,20 +1134,47 @@ mod tests {
         // doc6/03 §3：条数满 → ITEM_LIMIT；字符超 → CHAR_LIMIT 且后续短条可进；
         // 不截断半句（items 内均为完整条目）。
         let (mut store, scope, origin) = setup("budget");
-        let f1 = remember_kind(&mut store, &scope, &origin, 1, "第一条比较长的偏好内容用于占预算", MemoryKind::Fact);
-        let f2 = remember_kind(&mut store, &scope, &origin, 2, "第二条也很长的偏好内容继续占位", MemoryKind::Preference);
-        let i1 = remember_kind(&mut store, &scope, &origin, 3, "以后回答简短", MemoryKind::Instruction);
+        let f1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            1,
+            "第一条比较长的偏好内容用于占预算",
+            MemoryKind::Fact,
+        );
+        let f2 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            2,
+            "第二条也很长的偏好内容继续占位",
+            MemoryKind::Preference,
+        );
+        let i1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            3,
+            "以后回答简短",
+            MemoryKind::Instruction,
+        );
         store.resident_pin(&scope, &f1, None, None, None).unwrap();
         store.resident_pin(&scope, &f2, None, None, None).unwrap();
         let now = now_rfc3339().unwrap();
         // 条数限制：2 条 pin 后 instruction 被 ITEM_LIMIT。
         let sel = store.select_resident(&scope, &now, 2, 10000).unwrap();
         assert_eq!(sel.items.len(), 2);
-        assert!(sel.omitted.iter().any(|(id, r)| id == &i1 && *r == "ITEM_LIMIT"));
+        assert!(sel
+            .omitted
+            .iter()
+            .any(|(id, r)| id == &i1 && *r == "ITEM_LIMIT"));
         assert!(sel.truncated);
         // 字符限制：预算极小 → 长条 CHAR_LIMIT；正文仍为完整条目（非半句）。
         let sel2 = store.select_resident(&scope, &now, 24, 40).unwrap();
-        assert!(sel2.items.iter().all(|i| render_entry(i).chars().count() <= 40 || sel2.items.len() == 1));
+        assert!(sel2
+            .items
+            .iter()
+            .all(|i| render_entry(i).chars().count() <= 40 || sel2.items.len() == 1));
         assert!(sel2.omitted.iter().any(|(_, r)| *r == "CHAR_LIMIT"));
     }
 
@@ -1024,8 +1182,22 @@ mod tests {
     fn select_resident_conflicts_exit_body_not_omitted() {
         // doc6/03 §3：已知 contradicts 且两端均为候选 → conflict_ids，两条都不进正文。
         let (mut store, scope, origin) = setup("conflict");
-        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
-        let f2 = remember_kind(&mut store, &scope, &origin, 2, "用户住在上海", MemoryKind::Fact);
+        let f1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            1,
+            "用户住在杭州",
+            MemoryKind::Fact,
+        );
+        let f2 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            2,
+            "用户住在上海",
+            MemoryKind::Fact,
+        );
         store.resident_pin(&scope, &f1, None, None, None).unwrap();
         store.resident_pin(&scope, &f2, None, None, None).unwrap();
         store
@@ -1048,7 +1220,14 @@ mod tests {
     fn select_resident_needs_review_on_forgotten_pin() {
         // doc6/03 §4：correct/forget 后旧 pin 不自动迁移也不可注入 → needs_review。
         let (mut store, scope, origin) = setup("review");
-        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+        let f1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            1,
+            "用户住在杭州",
+            MemoryKind::Fact,
+        );
         store.resident_pin(&scope, &f1, None, None, None).unwrap();
         store
             .conn()
@@ -1067,10 +1246,38 @@ mod tests {
     fn suggestions_list_active_facts_excluding_pinned() {
         // doc6/03 §3：建议= active fact/preference（未 pin），episode/instruction 不在建议。
         let (mut store, scope, origin) = setup("suggest");
-        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
-        let p2 = remember_kind(&mut store, &scope, &origin, 2, "用户偏好简短回答", MemoryKind::Preference);
-        let _ep = remember_kind(&mut store, &scope, &origin, 3, "用户上周去了西湖", MemoryKind::Episode);
-        let _i4 = remember_kind(&mut store, &scope, &origin, 4, "以后回答先给结论", MemoryKind::Instruction);
+        let f1 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            1,
+            "用户住在杭州",
+            MemoryKind::Fact,
+        );
+        let p2 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            2,
+            "用户偏好简短回答",
+            MemoryKind::Preference,
+        );
+        let _ep = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            3,
+            "用户上周去了西湖",
+            MemoryKind::Episode,
+        );
+        let _i4 = remember_kind(
+            &mut store,
+            &scope,
+            &origin,
+            4,
+            "以后回答先给结论",
+            MemoryKind::Instruction,
+        );
         store.resident_pin(&scope, &f1, None, None, None).unwrap();
         let now = now_rfc3339().unwrap();
         let rows = store.resident_suggestions(&scope, &now, 20).unwrap();

@@ -307,12 +307,7 @@ async fn process_dream_extract<M: ExtractModel>(
         }
         Err(FreezeError::StaleInput) => {
             let mut g = state.store.lock().unwrap();
-            let _ = g.dream_stale_input(
-                scope,
-                &job.id,
-                job.claim_generation,
-                "DREAM_SOURCE_STALE",
-            );
+            let _ = g.dream_stale_input(scope, &job.id, job.claim_generation, "DREAM_SOURCE_STALE");
         }
         Err(FreezeError::Store(e)) => {
             eprintln!("[dream] job {} 裁决冻结失败: {e}", job.id);
@@ -328,10 +323,86 @@ async fn process_dream_extract<M: ExtractModel>(
     eprintln!("[dream] job {} extract 完成：候选 {accepted}", job.id);
 }
 
-enum FreezeError {
+pub enum FreezeError {
     EmbeddingUnavailable,
     StaleInput,
     Store(StoreError),
+}
+
+pub async fn prepare_runner_redecision(
+    state: &AppState,
+    scope: &ScopeKey,
+    job: &DreamJobRow,
+) -> Result<(), FreezeError> {
+    freeze_manual_redecision(state, scope, job).await
+}
+
+pub async fn prepare_runner_adjudication(
+    state: &AppState,
+    scope: &ScopeKey,
+    job: &DreamJobRow,
+) -> Result<(), FreezeError> {
+    freeze_adjudication(state, scope, job).await
+}
+
+pub async fn runner_submit_candidates(
+    state: &AppState,
+    scope: &ScopeKey,
+    job: &DreamJobRow,
+    proposals: &[DreamProposal],
+) -> Result<(usize, usize), FreezeError> {
+    let (accepted, rejected) = {
+        let mut g = state.store.lock().unwrap();
+        g.dream_submit_candidates(
+            scope,
+            &job.id,
+            job.claim_generation,
+            DREAM_POLICY_V1,
+            proposals,
+        )
+        .map_err(FreezeError::Store)?
+    };
+    if accepted == 0 {
+        let mut g = state.store.lock().unwrap();
+        g.dream_succeed(scope, &job.id, job.claim_generation, None, None, None)
+            .map_err(FreezeError::Store)?;
+    } else {
+        match freeze_adjudication(state, scope, job).await {
+            Ok(()) => {}
+            Err(error) => {
+                let mut g = state.store.lock().unwrap();
+                match &error {
+                    FreezeError::EmbeddingUnavailable => {
+                        let _ = g.dream_provider_wait(
+                            scope,
+                            &job.id,
+                            job.claim_generation,
+                            "EMBEDDING_UNAVAILABLE",
+                            Some(5),
+                        );
+                    }
+                    FreezeError::StaleInput => {
+                        let _ = g.dream_stale_input(
+                            scope,
+                            &job.id,
+                            job.claim_generation,
+                            "DREAM_SOURCE_STALE",
+                        );
+                    }
+                    FreezeError::Store(_) => {
+                        let _ = g.dream_dead(
+                            scope,
+                            &job.id,
+                            job.claim_generation,
+                            "ADJUDICATION_FREEZE_FAILED",
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok((accepted, rejected))
 }
 
 /// 显式重裁只消费 trigger 时冻结的 Held ID 与证据 span；不重新抽取、不创建
@@ -417,9 +488,13 @@ async fn freeze_manual_redecision(
                 }));
             }
             if let Some(vector) = vectors.get(index) {
-                if let Ok((hits, _)) = g.semantic_scan(scope, "memory", embedding.model_id(), vector, k) {
+                if let Ok((hits, _)) =
+                    g.semantic_scan(scope, "memory", embedding.model_id(), vector, k)
+                {
                     for (id, _) in hits {
-                        if let Some(memory) = g.get_memory(scope, &id).map_err(FreezeError::Store)? {
+                        if let Some(memory) =
+                            g.get_memory(scope, &id).map_err(FreezeError::Store)?
+                        {
                             recalls.push(AdjudicationRecall {
                                 candidate_id: candidate.candidate_id.clone(),
                                 target_memory_id: id,
@@ -477,8 +552,7 @@ async fn freeze_adjudication(
         (
             g.dream_accepted_candidates(scope, &dream_job.id)
                 .map_err(FreezeError::Store)?,
-            g.dream_held_candidates(scope)
-                .map_err(FreezeError::Store)?,
+            g.dream_held_candidates(scope).map_err(FreezeError::Store)?,
         )
     };
     if accepted.is_empty() {
@@ -525,16 +599,16 @@ async fn freeze_adjudication(
         for (held_index, (held_candidate, held_spans)) in held.iter().enumerate() {
             let mut include_held = false;
             for (fresh_index, (_fresh_candidate, fresh_spans)) in accepted.iter().enumerate() {
-                let related = cosine_similarity(
-                    &vectors[fresh_index],
-                    &vectors[fresh_count + held_index],
-                )
-                .is_some_and(|score| score >= memory_contract::HELD_REDECISION_MIN_COSINE);
+                let related =
+                    cosine_similarity(&vectors[fresh_index], &vectors[fresh_count + held_index])
+                        .is_some_and(|score| score >= memory_contract::HELD_REDECISION_MIN_COSINE);
                 if !related {
                     continue;
                 }
                 for (evidence_id, _, _) in fresh_spans {
-                    if !linked_pairs.insert((held_candidate.candidate_id.clone(), evidence_id.clone())) {
+                    if !linked_pairs
+                        .insert((held_candidate.candidate_id.clone(), evidence_id.clone()))
+                    {
                         continue;
                     }
                     let already_seen = {
@@ -627,9 +701,7 @@ async fn freeze_adjudication(
                 }
             }
             if let Some(qv) = query_vecs.get(i) {
-                if let Ok((vhits, _n)) =
-                    g.semantic_scan(scope, "memory", emb.model_id(), qv, k)
-                {
+                if let Ok((vhits, _n)) = g.semantic_scan(scope, "memory", emb.model_id(), qv, k) {
                     for (mid, _sim) in vhits {
                         if let Some(v) = g.get_memory(scope, &mid).map_err(FreezeError::Store)? {
                             recalls.push(AdjudicationRecall {

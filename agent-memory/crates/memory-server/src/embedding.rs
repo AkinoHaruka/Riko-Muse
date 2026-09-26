@@ -26,7 +26,10 @@ pub enum EmbeddingError {
     Timeout,
     RateLimited,
     /// 提供方返回维度与配置不符。
-    DimensionMismatch { expected: usize, actual: usize },
+    DimensionMismatch {
+        expected: usize,
+        actual: usize,
+    },
     /// 向量含非有限值或空。
     BadVector,
     Transport(String),
@@ -70,7 +73,11 @@ impl EmbeddingClient {
             .map_err(|e| format!("embedding_endpoint 不是合法 URL: {e}"))?;
         match url.scheme() {
             "http" | "https" => {}
-            other => return Err(format!("embedding_endpoint scheme 必须是 http/https，实际 {other}")),
+            other => {
+                return Err(format!(
+                    "embedding_endpoint scheme 必须是 http/https，实际 {other}"
+                ))
+            }
         }
         if url.host_str().is_none() || url.path().len() <= 1 {
             return Err("embedding_endpoint 必须包含主机与具体路径（完整 embeddings URL）".into());
@@ -140,7 +147,10 @@ impl EmbeddingClient {
         let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         for item in parsed.data {
             if item.index >= texts.len() {
-                return Err(EmbeddingError::BadJson(format!("index {} 越界", item.index)));
+                return Err(EmbeddingError::BadJson(format!(
+                    "index {} 越界",
+                    item.index
+                )));
             }
             let mut v = Vec::with_capacity(item.embedding.len());
             for x in item.embedding {
@@ -196,7 +206,11 @@ impl RerankClient {
             .map_err(|e| format!("rerank_endpoint 不是合法 URL: {e}"))?;
         match url.scheme() {
             "http" | "https" => {}
-            other => return Err(format!("rerank_endpoint scheme 必须是 http/https，实际 {other}")),
+            other => {
+                return Err(format!(
+                    "rerank_endpoint scheme 必须是 http/https，实际 {other}"
+                ))
+            }
         }
         if url.host_str().is_none() || url.path().len() <= 1 {
             return Err("rerank_endpoint 必须包含主机与具体路径（完整 rerank URL）".into());
@@ -238,7 +252,10 @@ impl RerankClient {
         if !status.is_success() {
             return Err(format!("rerank 端点返回 {status}"));
         }
-        let raw = resp.bytes().await.map_err(|e| format!("读取 rerank 响应失败: {e}"))?;
+        let raw = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("读取 rerank 响应失败: {e}"))?;
         if raw.len() > MAX_RESPONSE_BYTES {
             return Err(format!("rerank 响应超过 {MAX_RESPONSE_BYTES} 字节上限"));
         }

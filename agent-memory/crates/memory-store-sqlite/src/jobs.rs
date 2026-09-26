@@ -16,9 +16,17 @@ use crate::{now_rfc3339, Store, StoreError};
 #[derive(Debug)]
 pub enum FlushOutcome {
     /// 新范围内没有任何可提取内容：只生成/返回零模型调用 checkpoint。
-    NothingToExtract { job_id: String },
-    Created { job_id: String, status: String },
-    Existing { job_id: String, status: String },
+    NothingToExtract {
+        job_id: String,
+    },
+    Created {
+        job_id: String,
+        status: String,
+    },
+    Existing {
+        job_id: String,
+        status: String,
+    },
 }
 
 pub enum FailOutcome {
@@ -88,7 +96,13 @@ impl Store {
                 "SELECT id, status FROM extraction_jobs
                  WHERE tenant_id=?1 AND user_id=?2 AND host_id=?3 AND session_id=?4
                    AND through_event_seq=?5",
-                params![scope.tenant_id, scope.user_id, host_id, session_id, through_event_seq],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    host_id,
+                    session_id,
+                    through_event_seq
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -127,7 +141,14 @@ impl Store {
         )?;
         let events: Vec<(i64, memory_extract::WindowEvent)> = stmt
             .query_map(
-                params![scope.tenant_id, scope.user_id, host_id, session_id, last, through_event_seq],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    host_id,
+                    session_id,
+                    last,
+                    through_event_seq
+                ],
                 |r| {
                     Ok((
                         r.get::<_, i64>(5)?,
@@ -156,9 +177,17 @@ impl Store {
             if size > memory_contract::EXTRACTION_INPUT_MAX_BYTES {
                 // 单事件超限：先封闭已有组，再插入该 seq 的 dead/WINDOW_TOO_LARGE 作业。
                 if let Some(s) = cur_last_seq.take() {
-                    pending.push(PendingWindow { through: s, oversized: false, has_user: cur_has_user });
+                    pending.push(PendingWindow {
+                        through: s,
+                        oversized: false,
+                        has_user: cur_has_user,
+                    });
                 }
-                pending.push(PendingWindow { through: *seq, oversized: true, has_user: false });
+                pending.push(PendingWindow {
+                    through: *seq,
+                    oversized: true,
+                    has_user: false,
+                });
                 cur_count = 0;
                 cur_bytes = 0;
                 cur_has_user = false;
@@ -166,7 +195,11 @@ impl Store {
                 || cur_bytes + size > memory_contract::EXTRACTION_INPUT_MAX_BYTES
             {
                 let s = cur_last_seq.take().expect("组非空才会触发分窗");
-                pending.push(PendingWindow { through: s, oversized: false, has_user: cur_has_user });
+                pending.push(PendingWindow {
+                    through: s,
+                    oversized: false,
+                    has_user: cur_has_user,
+                });
                 cur_count = 1;
                 cur_bytes = size;
                 cur_last_seq = Some(*seq);
@@ -180,14 +213,18 @@ impl Store {
         }
         // 末组非空且尚无 requested_through 的作业：封闭末组，through=requested_through。
         if cur_last_seq.is_some() {
-            pending.push(PendingWindow { through: through_event_seq, oversized: false, has_user: cur_has_user });
+            pending.push(PendingWindow {
+                through: through_event_seq,
+                oversized: false,
+                has_user: cur_has_user,
+            });
         }
 
         let now = now_rfc3339()?;
         let insert_job = |tx: &rusqlite::Transaction<'_>,
-                              through: i64,
-                              status: &str,
-                              error_code: Option<&str>|
+                          through: i64,
+                          status: &str,
+                          error_code: Option<&str>|
          -> Result<String, StoreError> {
             let job_id = Uuid::now_v7().to_string();
             tx.execute(
@@ -197,10 +234,20 @@ impl Store {
                   admission_version, error_code)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13,?14)",
                 params![
-                    job_id, scope.tenant_id, scope.user_id, host_id, session_id,
-                    format!("v1:{through}"), through, status, now, now, now,
+                    job_id,
+                    scope.tenant_id,
+                    scope.user_id,
+                    host_id,
+                    session_id,
+                    format!("v1:{through}"),
+                    through,
+                    status,
+                    now,
+                    now,
+                    now,
                     memory_contract::EXTRACT_PROMPT_VERSION,
-                    memory_contract::ADMISSION_VERSION, error_code
+                    memory_contract::ADMISSION_VERSION,
+                    error_code
                 ],
             )?;
             Ok(job_id)
@@ -244,7 +291,10 @@ impl Store {
         if !actionable {
             return Ok(FlushOutcome::NothingToExtract { job_id: last_id });
         }
-        Ok(FlushOutcome::Created { job_id: last_id, status: last_status })
+        Ok(FlushOutcome::Created {
+            job_id: last_id,
+            status: last_status,
+        })
     }
 
     /// 本窗口下界：同 scope/host/session 中 `through_event_seq` 小于当前窗口、且
@@ -269,7 +319,13 @@ impl Store {
                      WHERE s.tenant_id=extraction_jobs.tenant_id
                        AND s.user_id=extraction_jobs.user_id
                        AND s.job_id=extraction_jobs.id))",
-                params![scope.tenant_id, scope.user_id, host_id, session_id, through_event_seq],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    host_id,
+                    session_id,
+                    through_event_seq
+                ],
                 |r| r.get::<_, Option<i64>>(0),
             )
             .optional()?
@@ -321,7 +377,7 @@ impl Store {
             .map_err(|e| StoreError::Time(e.to_string()))?
             .with_timezone(&chrono::Utc)
             + chrono::Duration::seconds(memory_contract::JOB_LEASE_SECS as i64))
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let n = tx.execute(
             "UPDATE extraction_jobs SET status='running', lease_until=?1, updated_at=?2,
                claim_generation=claim_generation+1
@@ -354,7 +410,11 @@ impl Store {
                  WHERE status='running' AND (lease_until IS NULL OR lease_until<=?1)",
             )?;
             let rows = stmt.query_map(params![now], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i32>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i32>(2)?,
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -412,7 +472,14 @@ impl Store {
              ORDER BY event_seq",
         )?;
         let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, job.host_id, job.session_id, lower_bound, job.through_event_seq],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job.host_id,
+                job.session_id,
+                lower_bound,
+                job.through_event_seq
+            ],
             |r| {
                 Ok(WindowEvent {
                     id: r.get(0)?,
@@ -430,7 +497,10 @@ impl Store {
         if events.len() > memory_contract::EXTRACTION_WINDOW_MAX_EVENTS {
             return Err(StoreError::WindowTooLarge);
         }
-        let total: usize = events.iter().map(memory_extract::serialized_event_size).sum();
+        let total: usize = events
+            .iter()
+            .map(memory_extract::serialized_event_size)
+            .sum();
         if total > memory_contract::EXTRACTION_INPUT_MAX_BYTES {
             return Err(StoreError::WindowTooLarge);
         }
@@ -454,7 +524,11 @@ impl Store {
     }
 
     /// 快查：作业是否仍处于指定代际的 running（只读；事务内校验由 save_candidate 承担）。
-    pub fn job_generation_current(&self, job_id: &str, generation: i64) -> Result<bool, StoreError> {
+    pub fn job_generation_current(
+        &self,
+        job_id: &str,
+        generation: i64,
+    ) -> Result<bool, StoreError> {
         let ok: bool = self
             .conn()
             .query_row(
@@ -484,7 +558,15 @@ impl Store {
             "UPDATE extraction_jobs SET status='succeeded', attempts=?1, model_name=?2,
              input_tokens=?3, output_tokens=?4, lease_until=NULL, updated_at=?5
              WHERE id=?6 AND status='running' AND claim_generation=?7",
-            params![attempts, model_name, input_tokens, output_tokens, now, job_id, generation],
+            params![
+                attempts,
+                model_name,
+                input_tokens,
+                output_tokens,
+                now,
+                job_id,
+                generation
+            ],
         )?;
         if n == 0 {
             return Err(StoreError::StaleClaim);
@@ -645,7 +727,11 @@ impl Store {
     }
 
     /// 诊断：统计指定 reason 的候选数（不返回正文）。
-    pub fn count_candidates_by_reason(&self, scope: &ScopeKey, reason: &str) -> Result<i64, StoreError> {
+    pub fn count_candidates_by_reason(
+        &self,
+        scope: &ScopeKey,
+        reason: &str,
+    ) -> Result<i64, StoreError> {
         let n = self.conn().query_row(
             "SELECT count(*) FROM memory_candidates
              WHERE tenant_id=?1 AND user_id=?2 AND reason_code=?3",
@@ -682,11 +768,17 @@ impl Store {
             .get_evidence(scope, &c.source_event_id)?
             .ok_or(StoreError::EvidenceNotFound)?;
         if ev_role != "user" || ev_source != "user" {
-            return Ok(CandidateOutcome::Rejected { reason: "BAD_SOURCE" });
+            return Ok(CandidateOutcome::Rejected {
+                reason: "BAD_SOURCE",
+            });
         }
         let (start, end) = match memory_domain::find_quote_span(&ev_content, &c.quote) {
             Some(v) => v,
-            None => return Ok(CandidateOutcome::Rejected { reason: "QUOTE_MISMATCH" }),
+            None => {
+                return Ok(CandidateOutcome::Rejected {
+                    reason: "QUOTE_MISMATCH",
+                })
+            }
         };
         let _ = (ev_host, ev_session);
 
@@ -702,13 +794,22 @@ impl Store {
                 "SELECT 1 FROM memory_candidates
                  WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3 AND primary_evidence_id=?4
                    AND kind=?5 AND quote_sha256=?6 LIMIT 1",
-                params![scope.tenant_id, scope.user_id, job.id, c.source_event_id, kind.as_str(), quote_hash],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    job.id,
+                    c.source_event_id,
+                    kind.as_str(),
+                    quote_hash
+                ],
                 |_| Ok(true),
             )
             .optional()?
             .unwrap_or(false);
         if dup {
-            return Ok(CandidateOutcome::Rejected { reason: "DUPLICATE_CANDIDATE" });
+            return Ok(CandidateOutcome::Rejected {
+                reason: "DUPLICATE_CANDIDATE",
+            });
         }
         let tx = self.conn_mut().transaction()?;
         // 事务内核对作业仍为当前代际的 running（doc4/02 §5）——仅函数入口检查不够；
@@ -755,7 +856,9 @@ impl Store {
         // Held 准入的行已是 held；返回标签同样如实标 Held（此前误标 Rejected，仅诊断输出受影响）。
         let mut outcome = match admission {
             Admission::Held(r) => CandidateOutcome::Held { reason: r },
-            _ => CandidateOutcome::Rejected { reason: reason_code.unwrap_or("REJECTED") },
+            _ => CandidateOutcome::Rejected {
+                reason: reason_code.unwrap_or("REJECTED"),
+            },
         };
         if admission == Admission::Active {
             let claim_hash = claim_sha256(kind, &quote);
@@ -774,7 +877,9 @@ impl Store {
                      VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, memory_id, c.source_event_id, start as i64, end as i64],
                 )?;
-                outcome = CandidateOutcome::Rejected { reason: "DUPLICATE_ACTIVE" };
+                outcome = CandidateOutcome::Rejected {
+                    reason: "DUPLICATE_ACTIVE",
+                };
             } else {
                 // 规则 8b：同旧证据+hash 的 forgotten → 抑制源，不复活。
                 let suppressed: bool = tx
@@ -787,7 +892,9 @@ impl Store {
                     .optional()?
                     .unwrap_or(false);
                 if suppressed {
-                    outcome = CandidateOutcome::Rejected { reason: "SUPPRESSED_SOURCE" };
+                    outcome = CandidateOutcome::Rejected {
+                        reason: "SUPPRESSED_SOURCE",
+                    };
                 } else {
                     // 规则 9：属性键相同而值不同的 active → held:POSSIBLE_CONFLICT。
                     if let Some(conflict_id) = Self::attribute_conflict(&tx, scope, kind, &quote)? {
@@ -796,7 +903,9 @@ impl Store {
                             "UPDATE memory_candidates SET status='held', reason_code='POSSIBLE_CONFLICT' WHERE id=?1",
                             params![candidate_id],
                         )?;
-                        outcome = CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" };
+                        outcome = CandidateOutcome::Held {
+                            reason: "POSSIBLE_CONFLICT",
+                        };
                     } else {
                         // 通过：建 active memory（与 remember 同一事务模式）。
                         let memory_id = Uuid::now_v7().to_string();
@@ -949,7 +1058,9 @@ mod tests {
     use memory_domain::{Origin, ScopeKey};
 
     fn migrations_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
     }
 
     /// 以某 RFC3339 时刻为基准加秒（全部时间断言均相对已落库时间戳推导，保证确定性）。
@@ -972,12 +1083,19 @@ mod tests {
 
     fn scope_of(store: &Store, tenant: &str, user: &str) -> ScopeKey {
         let _ = store;
-        ScopeKey { tenant_id: tenant.into(), user_id: user.into() }
+        ScopeKey {
+            tenant_id: tenant.into(),
+            user_id: user.into(),
+        }
     }
 
     fn ingest(store: &mut Store, scope: &ScopeKey, session: &str, seq: i64, content: &str) {
         let t = chrono::Utc::now();
-        let origin = Origin { host_id: "dsh".into(), agent_id: "agent-a".into(), session_id: session.into() };
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "agent-a".into(),
+            session_id: session.into(),
+        };
         store
             .record_evidence(scope, &origin, seq, "user", "user", &t, content)
             .unwrap();
@@ -1024,22 +1142,32 @@ mod tests {
         let job_id = flush(&mut store, &scope, "s1", 1);
         let run_after0 = job_field(&store, &job_id, "run_after");
         // 真实领取后失败落 retryable（fail 仅在 running + generation 匹配时生效）。
-        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after0, 1)).unwrap().unwrap();
+        let claimed = store
+            .claim_next_ordered_job(&plus_secs(&run_after0, 1))
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.claim_generation, 1);
         assert!(matches!(
-            store.fail_job(&job_id, claimed.claim_generation, 1, "MODEL_TIMEOUT").unwrap(),
+            store
+                .fail_job(&job_id, claimed.claim_generation, 1, "MODEL_TIMEOUT")
+                .unwrap(),
             FailOutcome::Retryable { .. }
         ));
         let run_after = job_field(&store, &job_id, "run_after");
 
         // 退避未到：不可领取，状态不变、无 lease。
-        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after, -1)).unwrap();
+        let claimed = store
+            .claim_next_ordered_job(&plus_secs(&run_after, -1))
+            .unwrap();
         assert!(claimed.is_none(), "退避期内不得领取");
         assert_eq!(job_field(&store, &job_id, "status"), "retryable_failed");
         assert_eq!(job_field(&store, &job_id, "lease_until"), "<NULL>");
 
         // 到期：可领取，running + generation 1→2。
-        let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        let job = store
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
         assert_eq!(job.id, job_id);
         assert_eq!(job.status, "running");
         assert_eq!(job.claim_generation, 2);
@@ -1059,34 +1187,62 @@ mod tests {
         // 第 1 次执行：claim 后 lease 过期 → 恢复为 retryable，attempts 0→1，generation +1。
         let job = store.claim_next_ordered_job(&t0).unwrap().unwrap();
         assert_eq!(job.claim_generation, 1);
-        assert!(store.claim_next_ordered_job(&plus_secs(&t0, 91)).unwrap().is_none());
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&t0, 91))
+            .unwrap()
+            .is_none());
         assert_eq!(job_field(&store, &job_id, "status"), "retryable_failed");
-        assert_eq!(job_field(&store, &job_id, "error_code"), "WORKER_LEASE_EXPIRED");
-        let (gen, attempts): (i64, i32) = store.conn().query_row(
-            "SELECT claim_generation, attempts FROM extraction_jobs WHERE id=?1",
-            params![job_id], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        assert_eq!(
+            job_field(&store, &job_id, "error_code"),
+            "WORKER_LEASE_EXPIRED"
+        );
+        let (gen, attempts): (i64, i32) = store
+            .conn()
+            .query_row(
+                "SELECT claim_generation, attempts FROM extraction_jobs WHERE id=?1",
+                params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!((gen, attempts), (2, 1));
 
         // 第 2 次执行 → 过期恢复：attempts 2。
         let t1 = plus_secs(&job_field(&store, &job_id, "run_after"), 1);
         assert!(store.claim_next_ordered_job(&t1).unwrap().is_some());
-        assert!(store.claim_next_ordered_job(&plus_secs(&t1, 91)).unwrap().is_none());
-        let (gen, attempts): (i64, i32) = store.conn().query_row(
-            "SELECT claim_generation, attempts FROM extraction_jobs WHERE id=?1",
-            params![job_id], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&t1, 91))
+            .unwrap()
+            .is_none());
+        let (gen, attempts): (i64, i32) = store
+            .conn()
+            .query_row(
+                "SELECT claim_generation, attempts FROM extraction_jobs WHERE id=?1",
+                params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!((gen, attempts), (4, 2));
 
         // 第 3 次执行 → 过期恢复：达上限，dead。
         let t2 = plus_secs(&job_field(&store, &job_id, "run_after"), 1);
         assert!(store.claim_next_ordered_job(&t2).unwrap().is_some());
-        assert!(store.claim_next_ordered_job(&plus_secs(&t2, 91)).unwrap().is_none());
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&t2, 91))
+            .unwrap()
+            .is_none());
         assert_eq!(job_field(&store, &job_id, "status"), "dead");
-        assert_eq!(job_field(&store, &job_id, "error_code"), "WORKER_LEASE_EXPIRED");
-        let attempts: i32 = store.conn().query_row(
-            "SELECT attempts FROM extraction_jobs WHERE id=?1", params![job_id], |r| r.get(0),
-        ).unwrap();
+        assert_eq!(
+            job_field(&store, &job_id, "error_code"),
+            "WORKER_LEASE_EXPIRED"
+        );
+        let attempts: i32 = store
+            .conn()
+            .query_row(
+                "SELECT attempts FROM extraction_jobs WHERE id=?1",
+                params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(attempts, 3);
     }
 
@@ -1107,12 +1263,18 @@ mod tests {
         let first = store.claim_next_ordered_job(&now).unwrap().unwrap();
         assert_eq!(first.through_event_seq, 5);
         // 前窗 running 未完成：后窗不可领，返回 None（不是还原占位循环）。
-        assert!(store.claim_next_ordered_job(&plus_secs(&now, 1)).unwrap().is_none());
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&now, 1))
+            .unwrap()
+            .is_none());
         // 前窗成功后后窗可领。
         store
             .complete_job(&job_a, first.claim_generation, 1, "mock", None, None)
             .unwrap();
-        let second = store.claim_next_ordered_job(&plus_secs(&now, 2)).unwrap().unwrap();
+        let second = store
+            .claim_next_ordered_job(&plus_secs(&now, 2))
+            .unwrap()
+            .unwrap();
         assert_eq!(second.through_event_seq, 10);
     }
 
@@ -1131,13 +1293,19 @@ mod tests {
 
         let now = plus_secs(&job_field(&store, &other_job, "run_after"), 1);
         let claimed = store.claim_next_ordered_job(&now).unwrap().unwrap();
-        assert_eq!(claimed.session_id, "s2", "受阻 session 被跳过，其他 session 前进");
+        assert_eq!(
+            claimed.session_id, "s2",
+            "受阻 session 被跳过，其他 session 前进"
+        );
         store
             .complete_job(&other_job, claimed.claim_generation, 1, "mock", None, None)
             .unwrap();
 
         // 只剩受阻作业：返回 None 且不反复取出、不写 lease。
-        assert!(store.claim_next_ordered_job(&plus_secs(&now, 2)).unwrap().is_none());
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&now, 2))
+            .unwrap()
+            .is_none());
         assert_eq!(job_field(&store, &blocked_job, "status"), "queued");
         assert_eq!(job_field(&store, &blocked_job, "lease_until"), "<NULL>");
     }
@@ -1149,7 +1317,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("am-jobs-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+        store
+            .principal_add("t", "u2", &dir.join("u2.token"))
+            .unwrap();
 
         let scope1 = scope_of(&store, "t", "u");
         let scope2 = scope_of(&store, "t", "u2");
@@ -1173,10 +1343,16 @@ mod tests {
             ingest(&mut store, &scope, "s1", seq, &format!("事件{seq}"));
         }
         let job_99 = flush(&mut store, &scope, "s1", 99);
-        assert_eq!(store.window_lower_bound(&scope, "dsh", "s1", 99).unwrap(), -1);
+        assert_eq!(
+            store.window_lower_bound(&scope, "dsh", "s1", 99).unwrap(),
+            -1
+        );
         // 真实领取并成功，使 through 99 成为已越过前窗。
         let run_after = job_field(&store, &job_99, "run_after");
-        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        let claimed = store
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.id, job_99);
         store
             .complete_job(&job_99, claimed.claim_generation, 1, "mock", None, None)
@@ -1218,20 +1394,27 @@ mod tests {
             }
             other => panic!("应 Created，实际 {other:?}"),
         };
-        let (jobs, max_events): (i64, i64) = store.conn().query_row(
-            "SELECT count(*), MAX(through_event_seq) FROM extraction_jobs
+        let (jobs, max_events): (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT count(*), MAX(through_event_seq) FROM extraction_jobs
              WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert!(jobs >= 2, "101 事件至少两个窗口，实际 {jobs}");
         assert_eq!(max_events, 101, "最后窗口 through = 请求 through");
         // 逐窗按序领取、加载（真实流程：前窗成功后下界推进），事件数 ≤ 100。
         let rows: Vec<(String, i64)> = {
-            let mut stmt = store.conn().prepare(
-                "SELECT id, through_event_seq FROM extraction_jobs
+            let mut stmt = store
+                .conn()
+                .prepare(
+                    "SELECT id, through_event_seq FROM extraction_jobs
                  WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'
                  ORDER BY through_event_seq",
-            ).unwrap();
+                )
+                .unwrap();
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap()
                 .collect::<Result<_, _>>()
@@ -1241,7 +1424,9 @@ mod tests {
             let now = plus_secs(&now_rfc3339().unwrap(), *through + 1);
             let claimed = store.claim_next_ordered_job(&now).unwrap().unwrap();
             assert_eq!(claimed.id, *id, "窗口必须按 through 顺序领取");
-            let lower = store.window_lower_bound(&scope, "dsh", "s1", *through).unwrap();
+            let lower = store
+                .window_lower_bound(&scope, "dsh", "s1", *through)
+                .unwrap();
             let events = store.load_window_events(&scope, &claimed, lower).unwrap();
             assert!(
                 events.len() <= memory_contract::EXTRACTION_WINDOW_MAX_EVENTS,
@@ -1252,17 +1437,25 @@ mod tests {
                 .complete_job(id, claimed.claim_generation, 1, "mock", None, None)
                 .unwrap();
         }
-        assert_eq!(rows.last().unwrap().0, last_id, "最后作业 ID = 请求 through 对应作业");
+        assert_eq!(
+            rows.last().unwrap().0,
+            last_id,
+            "最后作业 ID = 请求 through 对应作业"
+        );
         // 重放：同 ID/状态返回，不新增窗口。
         match store.flush_window(&scope, "dsh", "s1", 101).unwrap() {
             FlushOutcome::Existing { job_id, .. } => assert_eq!(job_id, last_id),
             other => panic!("重放应 Existing，实际 {other:?}"),
         }
-        let jobs2: i64 = store.conn().query_row(
-            "SELECT count(*) FROM extraction_jobs
+        let jobs2: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM extraction_jobs
              WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'",
-            [], |r| r.get(0),
-        ).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(jobs2, jobs, "重放不得产生新窗口");
     }
 
@@ -1276,20 +1469,30 @@ mod tests {
         ingest(&mut store, &scope, "s1", 1, &quoted);
         ingest(&mut store, &scope, "s1", 2, &quoted);
         store.flush_window(&scope, "dsh", "s1", 2).unwrap();
-        let (jobs, statuses): (i64, String) = store.conn().query_row(
-            "SELECT count(*), group_concat(status) FROM extraction_jobs
+        let (jobs, statuses): (i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT count(*), group_concat(status) FROM extraction_jobs
              WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert_eq!(jobs, 2, "按序列化字节应分两窗（原始 content.len() 合计仅 20 KB）");
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            jobs, 2,
+            "按序列化字节应分两窗（原始 content.len() 合计仅 20 KB）"
+        );
         assert_eq!(statuses, "queued,queued");
         // 逐窗按序领取、加载：实际序列化输入不超 32 KiB，L0 原文完整。
         let rows: Vec<(String, i64)> = {
-            let mut stmt = store.conn().prepare(
-                "SELECT id, through_event_seq FROM extraction_jobs
+            let mut stmt = store
+                .conn()
+                .prepare(
+                    "SELECT id, through_event_seq FROM extraction_jobs
                  WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'
                  ORDER BY through_event_seq",
-            ).unwrap();
+                )
+                .unwrap();
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap()
                 .collect::<Result<_, _>>()
@@ -1299,11 +1502,20 @@ mod tests {
             let now = plus_secs(&now_rfc3339().unwrap(), *through + 1);
             let claimed = store.claim_next_ordered_job(&now).unwrap().unwrap();
             assert_eq!(claimed.id, *id);
-            let lower = store.window_lower_bound(&scope, "dsh", "s1", *through).unwrap();
+            let lower = store
+                .window_lower_bound(&scope, "dsh", "s1", *through)
+                .unwrap();
             let events = store.load_window_events(&scope, &claimed, lower).unwrap();
             let input = memory_extract::serialize_window_events(&events).unwrap();
-            assert!(input.len() <= memory_contract::EXTRACTION_INPUT_MAX_BYTES, "窗口 {through} 序列化 {} 超限", input.len());
-            assert!(events.iter().all(|e| e.content == quoted), "L0 原文不得截断");
+            assert!(
+                input.len() <= memory_contract::EXTRACTION_INPUT_MAX_BYTES,
+                "窗口 {through} 序列化 {} 超限",
+                input.len()
+            );
+            assert!(
+                events.iter().all(|e| e.content == quoted),
+                "L0 原文不得截断"
+            );
             store
                 .complete_job(id, claimed.claim_generation, 1, "mock", None, None)
                 .unwrap();
@@ -1322,19 +1534,27 @@ mod tests {
         ingest(&mut store, &scope, "s1", 3, "正常事件3");
         store.flush_window(&scope, "dsh", "s1", 3).unwrap();
         // L0 保留。
-        let ev1: String = store.conn().query_row(
-            "SELECT content FROM evidence_events WHERE tenant_id='t' AND user_id='u'
+        let ev1: String = store
+            .conn()
+            .query_row(
+                "SELECT content FROM evidence_events WHERE tenant_id='t' AND user_id='u'
              AND host_id='dsh' AND session_id='s1' AND event_seq=1",
-            [], |r| r.get(0),
-        ).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(ev1.len(), big.len(), "超限事件 L0 原文不删不改");
         // dead/WINDOW_TOO_LARGE 作业存在，attempts=0；后窗 queued。
-        let (dead_id, attempts): (String, i32) = store.conn().query_row(
-            "SELECT id, attempts FROM extraction_jobs
+        let (dead_id, attempts): (String, i32) = store
+            .conn()
+            .query_row(
+                "SELECT id, attempts FROM extraction_jobs
              WHERE tenant_id='t' AND user_id='u' AND host_id='dsh' AND session_id='s1'
                AND status='dead' AND error_code='WINDOW_TOO_LARGE'",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(attempts, 0);
         let queued: String = store.conn().query_row(
             "SELECT id FROM extraction_jobs
@@ -1342,7 +1562,10 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         // skip 前：后窗被 dead 前窗阻断。
-        assert!(store.claim_next_ordered_job(&plus_secs(&now_rfc3339().unwrap(), 1)).unwrap().is_none());
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&now_rfc3339().unwrap(), 1))
+            .unwrap()
+            .is_none());
         // 非 WINDOW_TOO_LARGE 的 dead 拒绝 skip；未变更任何行。
         ingest(&mut store, &scope, "s2", 1, "s2-事件1");
         let other = flush(&mut store, &scope, "s2", 1);
@@ -1357,22 +1580,33 @@ mod tests {
             "被拒 skip 不得改变状态"
         );
         // 正式 skip：后窗可领；重复 skip 幂等。
-        assert!(store.skip_dead_job(&scope, &dead_id, "运维确认单事件超限").unwrap());
-        assert!(!store.skip_dead_job(&scope, &dead_id, "重复请求").unwrap(), "重复 skip 幂等");
+        assert!(store
+            .skip_dead_job(&scope, &dead_id, "运维确认单事件超限")
+            .unwrap());
+        assert!(
+            !store.skip_dead_job(&scope, &dead_id, "重复请求").unwrap(),
+            "重复 skip 幂等"
+        );
         let claimed = store
             .claim_next_ordered_job(&plus_secs(&now_rfc3339().unwrap(), 2))
             .unwrap()
             .unwrap();
         assert_eq!(claimed.id, queued, "skip 后同 session 后窗可领");
         // 跨 scope skip：报 JobNotFound，不写行。
-        let scope2 = ScopeKey { tenant_id: "t".into(), user_id: "u2".into() };
+        let scope2 = ScopeKey {
+            tenant_id: "t".into(),
+            user_id: "u2".into(),
+        };
         assert!(matches!(
             store.skip_dead_job(&scope2, &dead_id, "越权"),
             Err(StoreError::JobNotFound)
         ));
-        let skips: i64 = store.conn().query_row(
-            "SELECT count(*) FROM extraction_job_skips", [], |r| r.get(0),
-        ).unwrap();
+        let skips: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM extraction_job_skips", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(skips, 1, "跨 scope 请求不得新增 skip 行");
     }
 
@@ -1385,19 +1619,30 @@ mod tests {
         ingest(&mut store, &scope, "s1", 1, "我叫洛溪");
         let job_id = flush(&mut store, &scope, "s1", 1);
         let run_after = job_field(&store, &job_id, "run_after");
-        let claimed = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        let claimed = store
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
         store
             .fail_job_deterministic(&job_id, claimed.claim_generation, 1, "WINDOW_TOO_LARGE")
             .unwrap();
         assert_eq!(job_field(&store, &job_id, "status"), "dead");
         assert_eq!(job_field(&store, &job_id, "error_code"), "WINDOW_TOO_LARGE");
-        let attempts: i32 = store.conn().query_row(
-            "SELECT attempts FROM extraction_jobs WHERE id=?1", params![job_id], |r| r.get(0),
-        ).unwrap();
+        let attempts: i32 = store
+            .conn()
+            .query_row(
+                "SELECT attempts FROM extraction_jobs WHERE id=?1",
+                params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(attempts, 1, "本次 attempt 只记一次");
         assert_eq!(job_field(&store, &job_id, "lease_until"), "<NULL>");
         // dead 后不因 run_after 重新可领取。
-        assert!(store.claim_next_ordered_job(&plus_secs(&run_after, 3600)).unwrap().is_none());
+        assert!(store
+            .claim_next_ordered_job(&plus_secs(&run_after, 3600))
+            .unwrap()
+            .is_none());
         // 旧代际的 deterministic 提交不生效。
         ingest(&mut store, &scope, "s2", 1, "s2-事件");
         let job2 = flush(&mut store, &scope, "s2", 1);
@@ -1407,10 +1652,19 @@ mod tests {
             .unwrap();
         assert_eq!(claimed2.id, job2);
         assert!(matches!(
-            store.fail_job_deterministic(&job2, claimed2.claim_generation + 5, 1, "WINDOW_TOO_LARGE"),
+            store.fail_job_deterministic(
+                &job2,
+                claimed2.claim_generation + 5,
+                1,
+                "WINDOW_TOO_LARGE"
+            ),
             Err(StoreError::StaleClaim)
         ));
-        assert_eq!(job_field(&store, &job2, "status"), "running", "旧代际写入不得生效");
+        assert_eq!(
+            job_field(&store, &job2, "status"),
+            "running",
+            "旧代际写入不得生效"
+        );
     }
 
     #[test]
@@ -1425,19 +1679,29 @@ mod tests {
             "SELECT id FROM extraction_jobs WHERE status='dead' AND error_code='WINDOW_TOO_LARGE'",
             [], |r| r.get(0),
         ).unwrap();
-        assert!(store.skip_dead_job(&scope, &dead_id, "运维确认超限").unwrap());
-        let (actor_kind, actor_id, action): (String, String, String) = store.conn().query_row(
-            "SELECT actor_kind, actor_id, action FROM audit_events WHERE action='job_skip'",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        assert!(store
+            .skip_dead_job(&scope, &dead_id, "运维确认超限")
+            .unwrap());
+        let (actor_kind, actor_id, action): (String, String, String) = store
+            .conn()
+            .query_row(
+                "SELECT actor_kind, actor_id, action FROM audit_events WHERE action='job_skip'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(actor_kind, "admin_cli");
         assert_eq!(actor_id, "local_admin");
         let _ = action;
         // skip 表内 actor_kind 同口径。
-        let skip_actor: String = store.conn().query_row(
-            "SELECT actor_kind FROM extraction_job_skips WHERE job_id=?1",
-            params![dead_id], |r| r.get(0),
-        ).unwrap();
+        let skip_actor: String = store
+            .conn()
+            .query_row(
+                "SELECT actor_kind FROM extraction_job_skips WHERE job_id=?1",
+                params![dead_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(skip_actor, "admin_cli");
     }
 
@@ -1447,11 +1711,24 @@ mod tests {
         // 不把老作业的结果标为新策略。
         let mut store = setup("revreason");
         let scope = scope_of(&store, "t", "u");
-        ingest(&mut store, &scope, "s1", 1, "我在杭州做后端开发。我主要写 Rust。");
+        ingest(
+            &mut store,
+            &scope,
+            "s1",
+            1,
+            "我在杭州做后端开发。我主要写 Rust。",
+        );
         let job_id = flush(&mut store, &scope, "s1", 1);
         let run_after = job_field(&store, &job_id, "run_after");
-        let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
-        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        let job = store
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "extract".into(),
+            session_id: "s1".into(),
+        };
         let c = memory_extract::ModelCandidate {
             source_event_id: /* 取窗口首事件 */ {
                 let lower = store.window_lower_bound(&scope, "dsh", "s1", job.through_event_seq).unwrap();
@@ -1488,15 +1765,26 @@ mod tests {
         // 同 scope 同键不同值 → held:POSSIBLE_CONFLICT，不自动覆盖。
         let mut store = setup("attrconf");
         let scope = scope_of(&store, "t", "u");
-        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "extract".into(),
+            session_id: "s1".into(),
+        };
         let run_active = |store: &mut Store, session: &str, seq: i64, quote: &str, kind: &str| {
             ingest(store, &scope, session, seq, quote);
             let job_id = flush(store, &scope, session, seq);
             let run_after = job_field(store, &job_id, "run_after");
-            let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+            let job = store
+                .claim_next_ordered_job(&plus_secs(&run_after, 1))
+                .unwrap()
+                .unwrap();
             let ev_id = {
-                let lower = store.window_lower_bound(&scope, "dsh", session, job.through_event_seq).unwrap();
-                store.load_window_events(&scope, &job, lower).unwrap()[0].id.clone()
+                let lower = store
+                    .window_lower_bound(&scope, "dsh", session, job.through_event_seq)
+                    .unwrap();
+                store.load_window_events(&scope, &job, lower).unwrap()[0]
+                    .id
+                    .clone()
             };
             let c = memory_extract::ModelCandidate {
                 source_event_id: ev_id,
@@ -1506,24 +1794,43 @@ mod tests {
                 valid_until: None,
                 confidence: None,
             };
-            store.save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active).unwrap()
+            store
+                .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
+                .unwrap()
         };
         // 第一条职业 active（新句式）。
         let out1 = run_active(&mut store, "s1", 1, "我在杭州做后端开发", "fact");
         assert!(matches!(out1, CandidateOutcome::Active { .. }));
         // A26：另一职业句式（老形状）→ occupation 键冲突。
         let out2 = run_active(&mut store, "s2", 1, "我在腾讯工作", "fact");
-        assert_eq!(out2, CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" }, "A26");
+        assert_eq!(
+            out2,
+            CandidateOutcome::Held {
+                reason: "POSSIBLE_CONFLICT"
+            },
+            "A26"
+        );
         // A02 主要实践：无冲突 → active；同键不同值 → 冲突。
         let out3 = run_active(&mut store, "s3", 1, "我主要写 Rust", "fact");
         assert!(matches!(out3, CandidateOutcome::Active { .. }));
         let out4 = run_active(&mut store, "s4", 1, "我平时主要写 Go", "fact");
-        assert_eq!(out4, CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" });
+        assert_eq!(
+            out4,
+            CandidateOutcome::Held {
+                reason: "POSSIBLE_CONFLICT"
+            }
+        );
         // A25：residence 冲突沿既有键。
         let out5 = run_active(&mut store, "s5", 1, "我住在杭州", "fact");
         assert!(matches!(out5, CandidateOutcome::Active { .. }));
         let out6 = run_active(&mut store, "s6", 1, "我住在成都", "fact");
-        assert_eq!(out6, CandidateOutcome::Held { reason: "POSSIBLE_CONFLICT" }, "A25");
+        assert_eq!(
+            out6,
+            CandidateOutcome::Held {
+                reason: "POSSIBLE_CONFLICT"
+            },
+            "A25"
+        );
     }
 
     #[test]
@@ -1531,14 +1838,25 @@ mod tests {
         // 样本 A23 / doc5/07 C：forget 后同一旧证据+同 hash 的候选重放 → SUPPRESSED_SOURCE。
         let mut store = setup("suppress2");
         let scope = scope_of(&store, "t", "u");
-        let origin = Origin { host_id: "dsh".into(), agent_id: "extract".into(), session_id: "s1".into() };
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "extract".into(),
+            session_id: "s1".into(),
+        };
         ingest(&mut store, &scope, "s1", 1, "我喜欢Rust");
         let job_id = flush(&mut store, &scope, "s1", 1);
         let run_after = job_field(&store, &job_id, "run_after");
-        let job = store.claim_next_ordered_job(&plus_secs(&run_after, 1)).unwrap().unwrap();
+        let job = store
+            .claim_next_ordered_job(&plus_secs(&run_after, 1))
+            .unwrap()
+            .unwrap();
         let ev_id = {
-            let lower = store.window_lower_bound(&scope, "dsh", "s1", job.through_event_seq).unwrap();
-            store.load_window_events(&scope, &job, lower).unwrap()[0].id.clone()
+            let lower = store
+                .window_lower_bound(&scope, "dsh", "s1", job.through_event_seq)
+                .unwrap();
+            store.load_window_events(&scope, &job, lower).unwrap()[0]
+                .id
+                .clone()
         };
         let c = memory_extract::ModelCandidate {
             source_event_id: ev_id.clone(),
@@ -1548,12 +1866,16 @@ mod tests {
             valid_until: None,
             confidence: None,
         };
-        let out1 = store.save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active).unwrap();
+        let out1 = store
+            .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
+            .unwrap();
         let memory_id = match out1 {
             CandidateOutcome::Active { memory_id } => memory_id,
             other => panic!("应 active：{other:?}"),
         };
-        store.complete_job(&job_id, job.claim_generation, 1, "mock", None, None).unwrap();
+        store
+            .complete_job(&job_id, job.claim_generation, 1, "mock", None, None)
+            .unwrap();
         // 用户遗忘。
         let t = chrono::Utc::now();
         let forget_evid = match store
@@ -1578,11 +1900,26 @@ mod tests {
         // 同一旧证据的新作业重放同 quote → SUPPRESSED_SOURCE，不复活。
         let job2 = flush(&mut store, &scope, "s1", 2);
         let run_after2 = job_field(&store, &job2, "run_after");
-        let claimed2 = store.claim_next_ordered_job(&plus_secs(&run_after2, 1)).unwrap().unwrap();
-        let out2 = store
-            .save_candidate(&scope, &claimed2, &origin, &c, memory_extract::Admission::Active)
+        let claimed2 = store
+            .claim_next_ordered_job(&plus_secs(&run_after2, 1))
+            .unwrap()
             .unwrap();
-        assert_eq!(out2, CandidateOutcome::Rejected { reason: "SUPPRESSED_SOURCE" }, "A23");
+        let out2 = store
+            .save_candidate(
+                &scope,
+                &claimed2,
+                &origin,
+                &c,
+                memory_extract::Admission::Active,
+            )
+            .unwrap();
+        assert_eq!(
+            out2,
+            CandidateOutcome::Rejected {
+                reason: "SUPPRESSED_SOURCE"
+            },
+            "A23"
+        );
         let (hits, _) = store.search_memories(&scope, "Rust", 5, false).unwrap();
         assert!(hits.is_empty(), "遗忘后不得复活");
     }
@@ -1611,7 +1948,11 @@ mod tests {
         }
         // 无 user/user 事件的范围：checkpoint，不排队。
         let t = chrono::Utc::now();
-        let o = Origin { host_id: "dsh".into(), agent_id: "agent-a".into(), session_id: "s2".into() };
+        let o = Origin {
+            host_id: "dsh".into(),
+            agent_id: "agent-a".into(),
+            session_id: "s2".into(),
+        };
         store
             .record_evidence(&scope, &o, 1, "assistant", "assistant", &t, "助手消息不算")
             .unwrap();

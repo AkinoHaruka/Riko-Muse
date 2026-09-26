@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn latin_tokens_split_on_punctuation() {
-        assert_eq!(latin_tokens("My Name is Alice!"), vec!["my", "name", "is", "alice"]);
+        assert_eq!(
+            latin_tokens("My Name is Alice!"),
+            vec!["my", "name", "is", "alice"]
+        );
         assert_eq!(latin_tokens("中文 english"), vec!["english"]);
     }
 

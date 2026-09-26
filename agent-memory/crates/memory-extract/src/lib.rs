@@ -8,7 +8,8 @@ use unicode_normalization::UnicodeNormalization;
 
 /// extract_v1 原始系统提示词（doc/13 §4）。仅供按作业行版本处理历史作业
 /// （doc2/05 §3：保留老版本）；对真实推理模型有缺 Schema 的已知缺陷，勿用于新作业。
-pub const EXTRACT_SYSTEM_PROMPT_V1: &str = "从给定对话提取可能对未来 Agent 有持续用途的用户事实、偏好、长期指令和事件。
+pub const EXTRACT_SYSTEM_PROMPT_V1: &str =
+    "从给定对话提取可能对未来 Agent 有持续用途的用户事实、偏好、长期指令和事件。
 只引用 role=user 且 source_kind=user 的 event_id。
 quote 必须逐字复制同一条用户消息中的连续原文；不要改写、补充或拼接多条消息。
 临时请求、假设、引用他人的话、助手推断不要提取。没有合格内容时输出空数组。
@@ -314,8 +315,14 @@ fn explicit_enough(quote: &str) -> bool {
     }
     // 稳定自我陈述：以任一前缀开始。
     const SELF_ZH: [&str; 5] = ["我叫", "我是", "我住在", "我喜欢", "我不喜欢"];
-    const SELF_EN: [&str; 6] =
-        ["my name is", "i am a", "i am an", "i live", "i like", "i dislike"];
+    const SELF_EN: [&str; 6] = [
+        "my name is",
+        "i am a",
+        "i am an",
+        "i live",
+        "i like",
+        "i dislike",
+    ];
     if SELF_ZH.iter().any(|p| q.starts_with(p)) {
         return true;
     }
@@ -381,7 +388,9 @@ fn sensitive(quote: &str) -> bool {
         }
     }
     // 字面词。
-    ["身份证", "银行卡", "诊断", "病历"].iter().any(|w| quote.contains(w))
+    ["身份证", "银行卡", "诊断", "病历"]
+        .iter()
+        .any(|w| quote.contains(w))
 }
 
 /// 从 pos 起：跳空白 → 若遇 : = ： 则再跳其后的空白 → 数连续非空白字符数（无分隔符则 None）。
@@ -456,9 +465,19 @@ fn has_first_person_subject(q_trim_lower: &str) -> bool {
 /// 第三人标记（doc5/03 §7 有限词表，字面包含）。只用于保守拦截；
 /// 「我们家小孩」不能算第一人称用户事实。
 fn has_third_person_marker(quote: &str) -> bool {
-    ["我姐", "我哥", "我妈", "我爸", "我们家小孩", "小孩", "孩子", "家人", "同事"]
-        .iter()
-        .any(|w| quote.contains(w))
+    [
+        "我姐",
+        "我哥",
+        "我妈",
+        "我爸",
+        "我们家小孩",
+        "小孩",
+        "孩子",
+        "家人",
+        "同事",
+    ]
+    .iter()
+    .any(|w| quote.contains(w))
 }
 
 /// 缺明确归属主体（doc5/03 §7）：fact/preference 片段既无第一人称主语也无第三人
@@ -472,16 +491,36 @@ fn unclear_subject(quote: &str) -> bool {
 /// 未来节点/短期状态/一次性语境词（doc5/03 §7）。命中即 held:TEMPORAL（CONTEXT_UNCERTAIN
 /// 已先在 admit_v2 规则 4 处理「如果/假如/比如/这次/本次/今天先」）。
 fn temporal_marker(quote: &str) -> bool {
-    ["今年", "明年", "下周", "下个月", "即将", "准备", "今天", "最近", "暂时", "坏了"]
-        .iter()
-        .any(|w| quote.contains(w))
+    [
+        "今年",
+        "明年",
+        "下周",
+        "下个月",
+        "即将",
+        "准备",
+        "今天",
+        "最近",
+        "暂时",
+        "坏了",
+    ]
+    .iter()
+    .any(|w| quote.contains(w))
 }
 
 /// 健康敏感词（doc5/03 §7 有限词表）。命中即 held:SENSITIVE；不声称覆盖所有健康表达。
 fn sensitive_health(quote: &str) -> bool {
-    ["过敏", "诊断", "病历", "疾病", "吃药", "服药", "身份证", "银行卡"]
-        .iter()
-        .any(|w| quote.contains(w))
+    [
+        "过敏",
+        "诊断",
+        "病历",
+        "疾病",
+        "吃药",
+        "服药",
+        "身份证",
+        "银行卡",
+    ]
+    .iter()
+    .any(|w| quote.contains(w))
 }
 
 /// 凭据内容（doc5/03 §7）：继承 v1 sensitive() 的密码/token/API key/sk- 值形态，
@@ -568,11 +607,20 @@ impl ExplicitShape {
 /// 职业/角色尾词（doc5/03 §6）：`我在X做Y` 的 Y 必须以其一结尾；`我是X` 仅当 X
 /// 以其一结尾才可自动 active。集中一处，不跨层复制。
 const OCCUPATION_TAILS: [&str; 8] = [
-    "开发", "工程师", "设计师", "教师", "老师", "研究员", "产品经理", "数据分析",
+    "开发",
+    "工程师",
+    "设计师",
+    "教师",
+    "老师",
+    "研究员",
+    "产品经理",
+    "数据分析",
 ];
 
 /// 句末一个标点（doc5/03 §6：每项在去除句末一个标点后匹配）。
-const TRAILING_PUNCT: [char; 12] = ['。', '，', '；', '！', '？', '.', ',', ';', '!', '?', '~', '～'];
+const TRAILING_PUNCT: [char; 12] = [
+    '。', '，', '；', '！', '？', '.', ',', ';', '!', '?', '~', '～',
+];
 
 /// X 的受限片段校验：非空、1—64 Unicode 标量、不含会引入第二命题/新句的标点。
 fn bounded_fragment(x: &str) -> bool {
@@ -580,7 +628,10 @@ fn bounded_fragment(x: &str) -> bool {
     n > 0
         && n <= 64
         && !x.chars().any(|c| {
-            matches!(c, '，' | ',' | '；' | ';' | '。' | '.' | '!' | '？' | '?' | '！' | '\n' | '\r')
+            matches!(
+                c,
+                '，' | ',' | '；' | ';' | '。' | '.' | '!' | '？' | '?' | '！' | '\n' | '\r'
+            )
         })
 }
 
@@ -603,7 +654,16 @@ fn normalize_shape_input(quote: &str) -> String {
 pub fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
     let s = normalize_shape_input(quote);
     // 长期指令：以固定指令词起始，后面必须有非空要求（doc5/03 §6）。
-    for p in ["以后", "从现在起", "请总是", "请记住", "记住", "always", "from now on", "remember"] {
+    for p in [
+        "以后",
+        "从现在起",
+        "请总是",
+        "请记住",
+        "记住",
+        "always",
+        "from now on",
+        "remember",
+    ] {
         if let Some(rest) = s.strip_prefix(p) {
             if bounded_fragment(rest) {
                 return Some(ExplicitShape::Instruction);
@@ -706,8 +766,14 @@ mod tests {
         c.source_event_id = "nope".into();
         assert_eq!(admit_v1(&c, &events), Admission::Rejected("BAD_SOURCE"));
 
-        let c2 = ModelCandidate { quote: "我喜欢咖啡".into(), ..cand("x") };
-        assert_eq!(admit_v1(&c2, &events), Admission::Rejected("QUOTE_MISMATCH"));
+        let c2 = ModelCandidate {
+            quote: "我喜欢咖啡".into(),
+            ..cand("x")
+        };
+        assert_eq!(
+            admit_v1(&c2, &events),
+            Admission::Rejected("QUOTE_MISMATCH")
+        );
     }
 
     #[test]
@@ -719,53 +785,83 @@ mod tests {
             occurred_at: "2026-09-24T12:00:00Z".into(),
             content: "用户应该喜欢中文".into(),
         }];
-        assert_eq!(admit_v1(&cand("用户应该喜欢中文"), &events), Admission::Rejected("BAD_SOURCE"));
+        assert_eq!(
+            admit_v1(&cand("用户应该喜欢中文"), &events),
+            Admission::Rejected("BAD_SOURCE")
+        );
     }
 
     #[test]
     fn one_shot_request_held() {
         let events = vec![ev("这次翻译成英文")];
-        let c = ModelCandidate { kind: "episode".into(), ..cand("这次翻译成英文") };
+        let c = ModelCandidate {
+            kind: "episode".into(),
+            ..cand("这次翻译成英文")
+        };
         assert_eq!(admit_v1(&c, &events), Admission::Held("CONTEXT_UNCERTAIN"));
     }
 
     #[test]
     fn not_explicit_held() {
         let events = vec![ev("昨天挺累的")];
-        let c = ModelCandidate { kind: "episode".into(), ..cand("昨天挺累的") };
+        let c = ModelCandidate {
+            kind: "episode".into(),
+            ..cand("昨天挺累的")
+        };
         assert_eq!(admit_v1(&c, &events), Admission::Held("NOT_EXPLICIT"));
     }
 
     #[test]
     fn explicit_instruction_and_self_statement_active() {
         let events = vec![ev("以后回答我用中文")];
-        assert_eq!(admit_v1(&cand("以后回答我用中文"), &events), Admission::Active);
+        assert_eq!(
+            admit_v1(&cand("以后回答我用中文"), &events),
+            Admission::Active
+        );
         let events2 = vec![ev("我叫洛溪")];
-        let c = ModelCandidate { kind: "fact".into(), ..cand("我叫洛溪") };
+        let c = ModelCandidate {
+            kind: "fact".into(),
+            ..cand("我叫洛溪")
+        };
         assert_eq!(admit_v1(&c, &events2), Admission::Active);
         let events3 = vec![ev("I live in Wuhan")];
-        let c3 = ModelCandidate { kind: "fact".into(), ..cand("I live in Wuhan") };
+        let c3 = ModelCandidate {
+            kind: "fact".into(),
+            ..cand("I live in Wuhan")
+        };
         assert_eq!(admit_v1(&c3, &events3), Admission::Active);
     }
 
     #[test]
     fn occupation_rule() {
         let events = vec![ev("我在腾讯工作三年了")];
-        let c = ModelCandidate { kind: "fact".into(), ..cand("我在腾讯工作三年了") };
+        let c = ModelCandidate {
+            kind: "fact".into(),
+            ..cand("我在腾讯工作三年了")
+        };
         assert_eq!(admit_v1(&c, &events), Admission::Active);
         let events2 = vec![ev("我在家里休息")];
-        let c2 = ModelCandidate { kind: "episode".into(), ..cand("我在家里休息") };
+        let c2 = ModelCandidate {
+            kind: "episode".into(),
+            ..cand("我在家里休息")
+        };
         assert_eq!(admit_v1(&c2, &events2), Admission::Held("NOT_EXPLICIT"));
     }
 
     #[test]
     fn sensitive_held() {
         let events = vec![ev("记住我的密码：abc12345")];
-        let c = ModelCandidate { kind: "instruction".into(), ..cand("记住我的密码：abc12345") };
+        let c = ModelCandidate {
+            kind: "instruction".into(),
+            ..cand("记住我的密码：abc12345")
+        };
         assert_eq!(admit_v1(&c, &events), Admission::Held("SENSITIVE"));
         // 单独谈论「密码」一词不被阻断。
         let events2 = vec![ev("我不喜欢密码学课")];
-        let c2 = ModelCandidate { kind: "preference".into(), ..cand("我不喜欢密码学课") };
+        let c2 = ModelCandidate {
+            kind: "preference".into(),
+            ..cand("我不喜欢密码学课")
+        };
         assert_eq!(admit_v1(&c2, &events2), Admission::Active);
     }
 
@@ -790,7 +886,8 @@ mod tests {
         // 干净 JSON 原样通过。
         assert!(parse_extraction("{\"candidates\":[]}").is_ok());
         // 围栏剥除后仍严格校验：自造字段拒绝。
-        let fenced_bad = "```json\n{\"candidates\":[{\"source_event_id\":\"e1\",\"fact\":\"改写\"}]}\n```";
+        let fenced_bad =
+            "```json\n{\"candidates\":[{\"source_event_id\":\"e1\",\"fact\":\"改写\"}]}\n```";
         assert!(parse_extraction(fenced_bad).is_err());
         // 纯垃圾仍失败。
         assert!(parse_extraction("不是 JSON").is_err());
@@ -799,9 +896,15 @@ mod tests {
     #[test]
     fn v3_prompt_dispatched_by_version_and_v1_v2_frozen() {
         // doc5/02 §1：v1/v2 字符串原样保留；v3 按作业行版本分派。
-        assert_eq!(system_prompt_for("extract_v1"), Some(EXTRACT_SYSTEM_PROMPT_V1));
+        assert_eq!(
+            system_prompt_for("extract_v1"),
+            Some(EXTRACT_SYSTEM_PROMPT_V1)
+        );
         assert_eq!(system_prompt_for("extract_v2"), Some(EXTRACT_SYSTEM_PROMPT));
-        assert_eq!(system_prompt_for("extract_v3"), Some(EXTRACT_SYSTEM_PROMPT_V3));
+        assert_eq!(
+            system_prompt_for("extract_v3"),
+            Some(EXTRACT_SYSTEM_PROMPT_V3)
+        );
         assert_eq!(system_prompt_for("extract_v0"), None);
         // v3 契约要点写进提示词：一候选一命题、逐字连续、不改写主语、空数组合法。
         assert!(EXTRACT_SYSTEM_PROMPT_V3.contains("一个可独立纠错、遗忘或过期的用户命题"));
@@ -869,28 +972,79 @@ mod tests {
     #[test]
     fn explicit_shapes_minimal_supported_set() {
         // doc5/03 §6 最小受支持集合（正例）。
-        assert_eq!(explicit_shape("以后回答请用中文"), Some(ExplicitShape::Instruction));
-        assert_eq!(explicit_shape("请记住每天备份"), Some(ExplicitShape::Instruction));
-        assert_eq!(explicit_shape("我喜欢用暗色主题写代码"), Some(ExplicitShape::Preference));
-        assert_eq!(explicit_shape("I like Rust"), Some(ExplicitShape::Preference));
+        assert_eq!(
+            explicit_shape("以后回答请用中文"),
+            Some(ExplicitShape::Instruction)
+        );
+        assert_eq!(
+            explicit_shape("请记住每天备份"),
+            Some(ExplicitShape::Instruction)
+        );
+        assert_eq!(
+            explicit_shape("我喜欢用暗色主题写代码"),
+            Some(ExplicitShape::Preference)
+        );
+        assert_eq!(
+            explicit_shape("I like Rust"),
+            Some(ExplicitShape::Preference)
+        );
         assert_eq!(explicit_shape("我叫洛溪"), Some(ExplicitShape::FactName));
-        assert_eq!(explicit_shape("My name is 洛溪。"), Some(ExplicitShape::FactName));
-        assert_eq!(explicit_shape("我住在杭州"), Some(ExplicitShape::FactResidence));
-        assert_eq!(explicit_shape("I live in Hangzhou."), Some(ExplicitShape::FactResidence));
-        assert_eq!(explicit_shape("我在杭州做后端开发"), Some(ExplicitShape::FactOccupation));
-        assert_eq!(explicit_shape("我是软件工程师"), Some(ExplicitShape::FactOccupation));
-        assert_eq!(explicit_shape("I am a software engineer"), Some(ExplicitShape::FactOccupation));
-        assert_eq!(explicit_shape("我在腾讯工作三年了"), Some(ExplicitShape::FactOccupation));
-        assert_eq!(explicit_shape("我主要写 Rust"), Some(ExplicitShape::FactPrimaryPractice));
-        assert_eq!(explicit_shape("我平时主要写 Rust"), Some(ExplicitShape::FactPrimaryPractice));
+        assert_eq!(
+            explicit_shape("My name is 洛溪。"),
+            Some(ExplicitShape::FactName)
+        );
+        assert_eq!(
+            explicit_shape("我住在杭州"),
+            Some(ExplicitShape::FactResidence)
+        );
+        assert_eq!(
+            explicit_shape("I live in Hangzhou."),
+            Some(ExplicitShape::FactResidence)
+        );
+        assert_eq!(
+            explicit_shape("我在杭州做后端开发"),
+            Some(ExplicitShape::FactOccupation)
+        );
+        assert_eq!(
+            explicit_shape("我是软件工程师"),
+            Some(ExplicitShape::FactOccupation)
+        );
+        assert_eq!(
+            explicit_shape("I am a software engineer"),
+            Some(ExplicitShape::FactOccupation)
+        );
+        assert_eq!(
+            explicit_shape("我在腾讯工作三年了"),
+            Some(ExplicitShape::FactOccupation)
+        );
+        assert_eq!(
+            explicit_shape("我主要写 Rust"),
+            Some(ExplicitShape::FactPrimaryPractice)
+        );
+        assert_eq!(
+            explicit_shape("我平时主要写 Rust"),
+            Some(ExplicitShape::FactPrimaryPractice)
+        );
         // 反例（doc5/03 §6 边界）。
         assert_eq!(explicit_shape("我在家做饭"), None, "做饭不是职业尾词");
-        assert_eq!(explicit_shape("我是刚吃完饭"), None, "我是X 过宽，非职业尾词不放行");
-        assert_eq!(explicit_shape("平时主要写 Rust"), None, "缺主语片段不是 explicit 形状");
+        assert_eq!(
+            explicit_shape("我是刚吃完饭"),
+            None,
+            "我是X 过宽，非职业尾词不放行"
+        );
+        assert_eq!(
+            explicit_shape("平时主要写 Rust"),
+            None,
+            "缺主语片段不是 explicit 形状"
+        );
         assert_eq!(explicit_shape("昨天挺累的"), None);
         // X 受限：空、超长、含第二命题标点。
         assert_eq!(explicit_shape("我喜欢"), None);
-        assert_eq!(explicit_shape("我喜欢 Rust，也喜欢 Go"), None, "X 含第二命题标点不放行");
+        assert_eq!(
+            explicit_shape("我喜欢 Rust，也喜欢 Go"),
+            None,
+            "X 含第二命题标点不放行"
+        );
         let long_x = format!("我喜欢{}", "好".repeat(65));
         assert_eq!(explicit_shape(&long_x), None, "X 超 64 字符不放行");
     }
@@ -898,8 +1052,14 @@ mod tests {
     #[test]
     fn shape_normalization_folds_case_and_trailing_punct_only() {
         // doc5/03 §6：匹配用 trim/NFKC/大小写折叠 + 去句末一个标点；不删中间词或否定词。
-        assert_eq!(explicit_shape("I Like Rust."), Some(ExplicitShape::Preference));
-        assert_eq!(explicit_shape("  我不喜欢加班  "), Some(ExplicitShape::Preference));
+        assert_eq!(
+            explicit_shape("I Like Rust."),
+            Some(ExplicitShape::Preference)
+        );
+        assert_eq!(
+            explicit_shape("  我不喜欢加班  "),
+            Some(ExplicitShape::Preference)
+        );
         // 否定词是形状的一部分：剥掉就反义，绝不匹配正向形状。
         assert_eq!(normalize_shape_input("我不喜欢加班"), "我不喜欢加班");
     }
@@ -909,7 +1069,10 @@ mod tests {
         // doc5/07 A 组自动提取样本（纯函数级；A20—A26 查库规则在 store 层测试）。
         let f = |quote: &str, kind: &str| {
             let events = vec![ev(quote)];
-            let c = ModelCandidate { kind: kind.into(), ..cand(quote) };
+            let c = ModelCandidate {
+                kind: kind.into(),
+                ..cand(quote)
+            };
             admit_v2(&c, &events)
         };
         use Admission::{Active, Held};
@@ -929,7 +1092,11 @@ mod tests {
         );
         assert_eq!(f("我在杭州做后端开发", "fact"), Active, "A07（同 A01）");
         assert_eq!(f("我喜欢用暗色主题写代码", "preference"), Active, "A08");
-        assert_eq!(f("今天先用暗色主题", "preference"), Held("CONTEXT_UNCERTAIN"), "A09");
+        assert_eq!(
+            f("今天先用暗色主题", "preference"),
+            Held("CONTEXT_UNCERTAIN"),
+            "A09"
+        );
         assert_eq!(f("以后回答请用中文", "instruction"), Active, "A10");
         assert_eq!(
             f("我们家小孩今年九月上小学一年级", "fact"),
@@ -938,17 +1105,28 @@ mod tests {
         );
         assert_eq!(f("我对花生过敏", "fact"), Held("SENSITIVE"), "A12");
         assert_eq!(f("我姐在成都教书", "fact"), Held("THIRD_PARTY"), "A13");
-        assert_eq!(f("老笔记本电池坏了", "fact"), Held("UNCLEAR_SUBJECT"), "A14");
+        assert_eq!(
+            f("老笔记本电池坏了", "fact"),
+            Held("UNCLEAR_SUBJECT"),
+            "A14"
+        );
         assert_eq!(f("我在家做饭", "fact"), Held("NOT_EXPLICIT"), "A15");
         assert_eq!(f("我今年九月开始新工作", "fact"), Held("TEMPORAL"), "A16");
         assert_eq!(f("我叫洛溪", "fact"), Active, "A17");
-        assert_eq!(f("如果我住在成都就好了", "fact"), Held("CONTEXT_UNCERTAIN"), "A18");
-        assert_eq!(f("我的 API key：sk-0123456789abcdef", "fact"), Held("SECRET"), "A19");
+        assert_eq!(
+            f("如果我住在成都就好了", "fact"),
+            Held("CONTEXT_UNCERTAIN"),
+            "A18"
+        );
+        assert_eq!(
+            f("我的 API key：sk-0123456789abcdef", "fact"),
+            Held("SECRET"),
+            "A19"
+        );
         assert_eq!(f("我喜欢暗色主题", "fact"), Held("KIND_MISMATCH"), "A27");
         // 我以后... 不因内部含「以后」被当作指令（doc5/03 §6 instruction 边界）。
         assert_eq!(f("我以后都回答中文", "instruction"), Held("NOT_EXPLICIT"));
     }
-
 
     #[test]
     fn admit_v2_source_and_quote_gates() {
@@ -957,7 +1135,11 @@ mod tests {
         let mut c = cand("我在杭州做后端开发");
         c.kind = "fact".into();
         c.source_event_id = "e2".into();
-        assert_eq!(admit_v2(&c, &events), Admission::Rejected("BAD_SOURCE"), "A20");
+        assert_eq!(
+            admit_v2(&c, &events),
+            Admission::Rejected("BAD_SOURCE"),
+            "A20"
+        );
         let c2 = ModelCandidate {
             quote: "我在杭州担任后端工程师".into(),
             ..cand("x")
@@ -970,8 +1152,14 @@ mod tests {
         // 长度上限：quote 须先满足逐字（规则 2），再判 512 上限（规则 3）。
         let long_content = "长".repeat(513);
         let events_long = vec![ev(&long_content)];
-        let c3 = ModelCandidate { quote: long_content.clone(), ..cand("x") };
-        assert_eq!(admit_v2(&c3, &events_long), Admission::Rejected("INVALID_QUOTE"));
+        let c3 = ModelCandidate {
+            quote: long_content.clone(),
+            ..cand("x")
+        };
+        assert_eq!(
+            admit_v2(&c3, &events_long),
+            Admission::Rejected("INVALID_QUOTE")
+        );
     }
 
     fn ev2_assistant() -> WindowEvent {
@@ -989,14 +1177,23 @@ mod tests {
         // doc5/03 §5：旧作业保持旧判定、新作业用新规则——同一候选两版结果不同。
         // v1 无职业尾词/主要实践形状：A01/A02 在 admit_v1 下 held:NOT_EXPLICIT。
         let events = vec![ev("我在杭州做后端开发。我主要写 Rust。")];
-        let c1 = ModelCandidate { kind: "fact".into(), ..cand("我在杭州做后端开发") };
+        let c1 = ModelCandidate {
+            kind: "fact".into(),
+            ..cand("我在杭州做后端开发")
+        };
         assert_eq!(admit_v1(&c1, &events), Admission::Held("NOT_EXPLICIT"));
         assert_eq!(admit_v2(&c1, &events), Admission::Active);
-        let c2 = ModelCandidate { kind: "fact".into(), ..cand("我主要写 Rust") };
+        let c2 = ModelCandidate {
+            kind: "fact".into(),
+            ..cand("我主要写 Rust")
+        };
         assert_eq!(admit_v1(&c2, &events), Admission::Held("NOT_EXPLICIT"));
         assert_eq!(admit_v2(&c2, &events), Admission::Active);
         // 分派：未知版本 None（worker 确定性 dead）。
-        assert_eq!(admit_for("admit_v1", &c1, &events), Some(Admission::Held("NOT_EXPLICIT")));
+        assert_eq!(
+            admit_for("admit_v1", &c1, &events),
+            Some(Admission::Held("NOT_EXPLICIT"))
+        );
         assert_eq!(admit_for("admit_v2", &c1, &events), Some(Admission::Active));
         assert_eq!(admit_for("admit_v0", &c1, &events), None);
     }

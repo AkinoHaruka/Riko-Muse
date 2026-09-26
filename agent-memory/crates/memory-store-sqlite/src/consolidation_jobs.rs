@@ -5,7 +5,7 @@
 //! 状态机，固定响应验证在单元测试完成。
 
 use memory_domain::ScopeKey;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::{now_rfc3339, Store, StoreError};
@@ -47,73 +47,74 @@ impl Store {
         inputs: &[JobInput],
         run_after: &str,
     ) -> Result<ConsolidationJobRow, StoreError> {
-        if inputs.is_empty() {
-            return Err(StoreError::InvalidPageField);
-        }
         let now = now_rfc3339()?;
-        // 来源再核（防调用方传漂移输入）：任一不符 → 作业不入队（doc6/05 §2）。
-        for (mid, ver, sha) in inputs {
-            let row: Option<(i64, String)> = self
-                .conn()
-                .query_row(
-                    "SELECT version, claim_sha256 FROM memories
-                     WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'
-                       AND (valid_until IS NULL OR valid_until > ?4)",
-                    params![scope.tenant_id, scope.user_id, mid, now],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            match row {
-                Some((v, s)) if v == *ver && s == *sha => {}
-                _ => return Err(StoreError::StaleInput),
-            }
-        }
-        let tx = self.conn_mut().transaction()?;
-        // 幂等：查既有未终态 job（同 scope/kind/key/fingerprint/generator）。
-        let existing: Option<ConsolidationJobRow> = tx
-            .query_row(
-                &format!(
-                    "SELECT id, document_kind, document_key, question_version, input_fingerprint,
-                            generator_version, status, attempts, run_after, lease_until,
-                            claim_generation, error_code, created_at, updated_at
-                     FROM consolidation_jobs
-                     WHERE tenant_id=?1 AND user_id=?2 AND document_kind=?3 AND document_key=?4
-                       AND input_fingerprint=?5 AND generator_version=?6
-                       AND status NOT IN ('dead','stale_input')
-                       AND (?7 IS NULL OR question_version=?7) LIMIT 1"
-                ),
-                params![scope.tenant_id, scope.user_id, document_kind, document_key,
-                        input_fingerprint, generator_version, question_version],
-                map_job_row,
-            )
-            .optional()?;
-        if let Some(job) = existing {
-            tx.commit()?;
-            return Ok(job);
-        }
-        let id = Uuid::now_v7().to_string();
-        tx.execute(
-            "INSERT INTO consolidation_jobs
-               (id, tenant_id, user_id, document_kind, document_key, question_version,
-                input_fingerprint, generator_version, status, attempts, run_after,
-                claim_generation, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9, 0, ?10, ?10)",
-            params![id, scope.tenant_id, scope.user_id, document_kind, document_key,
-                    question_version, input_fingerprint, generator_version, run_after, now],
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = enqueue_job_tx(
+            &tx,
+            scope,
+            document_kind,
+            document_key,
+            question_version,
+            generator_version,
+            input_fingerprint,
+            inputs,
+            run_after,
+            &now,
         )?;
-        for (order, (mid, ver, sha)) in inputs.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO consolidation_job_inputs
-                   (tenant_id, user_id, job_id, input_order, memory_id, memory_version, claim_sha256)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![scope.tenant_id, scope.user_id, id, order as i64, mid, ver, sha],
-            )?;
-        }
+        tx.commit()?;
+        self.consolidation_get(scope, &id)?
+            .ok_or(StoreError::JobNotFound)
+    }
+
+    /// Create/reuse a manual consolidation job and its persisted Dream trigger
+    /// in one transaction. A crash cannot leave a queued model job without the
+    /// Dream association that is required for runner dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consolidation_enqueue_manual_dream(
+        &mut self,
+        scope: &ScopeKey,
+        document_kind: &str,
+        document_key: &str,
+        question_version: Option<i64>,
+        generator_version: &str,
+        input_fingerprint: &str,
+        inputs: &[JobInput],
+        run_after: &str,
+    ) -> Result<(ConsolidationJobRow, crate::dream_jobs::DreamJobRow), StoreError> {
+        let now = now_rfc3339()?;
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let job_id = enqueue_job_tx(
+            &tx,
+            scope,
+            document_kind,
+            document_key,
+            question_version,
+            generator_version,
+            input_fingerprint,
+            inputs,
+            run_after,
+            &now,
+        )?;
+        let trigger_key = format!("manual-consolidation-{job_id}");
+        let dream_id = crate::dream_jobs::link_manual_consolidation_tx(
+            &tx,
+            scope,
+            &job_id,
+            &trigger_key,
+            &now,
+        )?;
         tx.commit()?;
         let job = self
-            .consolidation_get(scope, &id)?
+            .consolidation_get(scope, &job_id)?
             .ok_or(StoreError::JobNotFound)?;
-        Ok(job)
+        let dream = self
+            .dream_get(scope, &dream_id)?
+            .ok_or(StoreError::JobNotFound)?;
+        Ok((job, dream))
     }
 
     /// 领取（doc4 契约）：queued 且 run_after<=now → running + lease + generation+1。
@@ -144,7 +145,14 @@ impl Store {
             "UPDATE consolidation_jobs SET status='running', lease_until=?4, claim_generation=?5,
                     attempts=attempts+1, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='queued'",
-            params![scope.tenant_id, scope.user_id, id, lease_until, generation + 1, now_rfc3339()?],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                id,
+                lease_until,
+                generation + 1,
+                now_rfc3339()?
+            ],
         )?;
         Ok(self.consolidation_get(scope, &id)?)
     }
@@ -163,7 +171,14 @@ impl Store {
             "UPDATE consolidation_jobs SET lease_until=?5, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status='running' AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation, lease, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                lease,
+                now
+            ],
         )?;
         Ok(n > 0)
     }
@@ -229,7 +244,14 @@ impl Store {
             "UPDATE consolidation_jobs SET status='dead', error_code=?5, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
                AND status='running' AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, now_rfc3339()?],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                expected_generation,
+                error_code,
+                now_rfc3339()?
+            ],
         )?;
         Ok(n > 0)
     }
@@ -261,18 +283,66 @@ impl Store {
         Ok(n as i64)
     }
 
-    /// 显式重试（CLI；仅 dead/stale_input）：回 queued，冻结输入不变。
+    /// 显式重试（CLI；仅 dead/stale_input）：原子重排队已关联的 Dream 父作业与
+    /// consolidation 子作业，冻结输入不变；没有持久 Dream 关联的旧作业不能绕过触发契约。
     pub fn consolidation_requeue(
         &mut self,
         scope: &ScopeKey,
         job_id: &str,
         run_after: &str,
     ) -> Result<bool, StoreError> {
-        let n = self.conn_mut().execute(
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dream: Option<(String, String)> = tx
+            .query_row(
+                "SELECT d.id,d.status FROM dream_jobs d
+                 JOIN dream_consolidation_links l
+                   ON l.tenant_id=d.tenant_id AND l.user_id=d.user_id AND l.dream_job_id=d.id
+                 WHERE l.tenant_id=?1 AND l.user_id=?2 AND l.consolidation_job_id=?3",
+                params![scope.tenant_id, scope.user_id, job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((dream_id, dream_status)) = dream else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if !matches!(
+            dream_status.as_str(),
+            "queued" | "provider_wait" | "retryable_failed" | "succeeded" | "dead" | "stale_input"
+        ) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let n = tx.execute(
             "UPDATE consolidation_jobs SET status='queued', run_after=?4, error_code=NULL, updated_at=?5
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status IN ('dead','stale_input')",
             params![scope.tenant_id, scope.user_id, job_id, run_after, now_rfc3339()?],
         )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let dream_updated = tx.execute(
+            "UPDATE dream_jobs SET status='queued',run_after=?4,lease_until=NULL,runner_id=NULL,
+                    error_code=NULL,updated_at=?5
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+               AND status IN ('queued','provider_wait','retryable_failed','succeeded','dead','stale_input')",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                dream_id,
+                run_after,
+                now_rfc3339()?
+            ],
+        )?;
+        if dream_updated == 0 {
+            return Err(StoreError::StateConflict);
+        }
+        // The consolidation job must remain linked to an executable Dream
+        // parent. Both state transitions commit together or neither does.
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -334,6 +404,100 @@ impl Store {
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_job_tx(
+    tx: &Transaction<'_>,
+    scope: &ScopeKey,
+    document_kind: &str,
+    document_key: &str,
+    question_version: Option<i64>,
+    generator_version: &str,
+    input_fingerprint: &str,
+    inputs: &[JobInput],
+    run_after: &str,
+    now: &str,
+) -> Result<String, StoreError> {
+    if inputs.is_empty() {
+        return Err(StoreError::InvalidPageField);
+    }
+    // Validate frozen sources while holding the same immediate transaction
+    // used for both job rows and their association.
+    for (memory_id, version, claim_sha) in inputs {
+        let current: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT version,claim_sha256 FROM memories
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'
+                   AND (valid_until IS NULL OR valid_until>?4)",
+                params![scope.tenant_id, scope.user_id, memory_id, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match current {
+            Some((current_version, current_sha))
+                if current_version == *version && current_sha == *claim_sha => {}
+            _ => return Err(StoreError::StaleInput),
+        }
+    }
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT id FROM consolidation_jobs
+             WHERE tenant_id=?1 AND user_id=?2 AND document_kind=?3 AND document_key=?4
+               AND input_fingerprint=?5 AND generator_version=?6
+               AND status NOT IN ('dead','stale_input','succeeded')
+               AND (?7 IS NULL OR question_version=?7) LIMIT 1",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                document_kind,
+                document_key,
+                input_fingerprint,
+                generator_version,
+                question_version
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(job_id) = existing {
+        return Ok(job_id);
+    }
+    let id = Uuid::now_v7().to_string();
+    tx.execute(
+        "INSERT INTO consolidation_jobs
+           (id,tenant_id,user_id,document_kind,document_key,question_version,input_fingerprint,
+            generator_version,status,attempts,run_after,claim_generation,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',0,?9,0,?10,?10)",
+        params![
+            id,
+            scope.tenant_id,
+            scope.user_id,
+            document_kind,
+            document_key,
+            question_version,
+            input_fingerprint,
+            generator_version,
+            run_after,
+            now
+        ],
+    )?;
+    for (order, (memory_id, version, claim_sha)) in inputs.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO consolidation_job_inputs
+               (tenant_id,user_id,job_id,input_order,memory_id,memory_version,claim_sha256)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                id,
+                order as i64,
+                memory_id,
+                version,
+                claim_sha
+            ],
+        )?;
+    }
+    Ok(id)
 }
 
 fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConsolidationJobRow> {

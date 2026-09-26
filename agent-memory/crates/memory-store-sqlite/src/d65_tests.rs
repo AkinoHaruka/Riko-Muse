@@ -19,7 +19,11 @@ fn setup(tag: &str) -> (Store, ScopeKey, Origin) {
     store.principal_add("t", "u", &dir.join("u.token")).unwrap();
     let token = std::fs::read_to_string(dir.join("u.token")).unwrap();
     let scope = store.verify_token(token.trim()).unwrap().unwrap();
-    let origin = Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s".into() };
+    let origin = Origin {
+        host_id: "dsh".into(),
+        agent_id: "a".into(),
+        session_id: "s".into(),
+    };
     (store, scope, origin)
 }
 
@@ -33,7 +37,10 @@ fn remember_one(
 ) -> String {
     use crate::IngestOutcome;
     let t = chrono::Utc::now();
-    let ev = match store.record_evidence(scope, origin, seq, "user", "user", &t, claim).unwrap() {
+    let ev = match store
+        .record_evidence(scope, origin, seq, "user", "user", &t, claim)
+        .unwrap()
+    {
         crate::IngestOutcome::Recorded(id) => id,
         crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
@@ -60,13 +67,23 @@ fn source_of(store: &Store, scope: &ScopeKey, memory_id: &str) -> (String, i64, 
 fn question_catalog_empty_by_default_and_add_gate_publishing() {
     // doc6/02 §3 / doc6/05 §2：问题目录默认空；登记后才能驱动画像。
     let (mut store, scope, origin) = setup("catalog");
-    assert!(store.question_list(&scope, None).unwrap().is_empty(), "首版问题目录默认空");
+    assert!(
+        store.question_list(&scope, None).unwrap().is_empty(),
+        "首版问题目录默认空"
+    );
     // 坏键拒绝。
     assert!(matches!(
         store.question_add(&scope, "Bad-Key!", "x", "user_cli"),
         Err(StoreError::InvalidQuestionKey)
     ));
-    let v = store.question_add(&scope, "preferred_work_style", "用户长期偏好的工作方式", "user_cli").unwrap();
+    let v = store
+        .question_add(
+            &scope,
+            "preferred_work_style",
+            "用户长期偏好的工作方式",
+            "user_cli",
+        )
+        .unwrap();
     assert_eq!(v, 1);
     // 重复 add 拒绝（key 已存在）。
     assert!(matches!(
@@ -83,8 +100,22 @@ fn question_catalog_empty_by_default_and_add_gate_publishing() {
 fn publish_page_and_read_path_source_validation() {
     // doc6/05 §4：发布固化来源；读路径复核当前 active/同版/哈希。
     let (mut store, scope, origin) = setup("publish");
-    let m1 = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
-    let m2 = remember_one(&mut store, &scope, &origin, 2, "用户偏好简短回答", MemoryKind::Preference);
+    let m1 = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "用户住在杭州",
+        MemoryKind::Fact,
+    );
+    let m2 = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        2,
+        "用户偏好简短回答",
+        MemoryKind::Preference,
+    );
     let s1 = source_of(&store, &scope, &m1);
     let s2 = source_of(&store, &scope, &m2);
     let req = pages::PublishRequest {
@@ -106,7 +137,10 @@ fn publish_page_and_read_path_source_validation() {
     let page = store.get_page(&scope, &page_id, &now).unwrap().unwrap();
     assert_eq!(page.status, "published");
     assert_eq!(page.sources.len(), 2);
-    // CAS 版本替换：同 key 再发布 → version+1，旧版留 revisions。
+    // HTTP 重放专用发布入口在相同冻结输入下返回原 receipt，不造新版本。
+    let replay = store.publish_page_idempotent(&req).unwrap();
+    assert_eq!(replay, (page_id.clone(), v1));
+    // 普通手工发布保留 CAS 语义：同 key 再发布 → version+1，旧版留 revisions。
     let (_, v2) = store.publish_page(&req).unwrap();
     assert_eq!(v2, 2);
     let rev_count: i64 = store
@@ -144,15 +178,32 @@ fn publish_page_and_read_path_source_validation() {
         sources: &[stale_source],
         actor_kind: "system",
     };
-    assert!(matches!(store.publish_page(&bad), Err(StoreError::StaleInput)));
+    assert!(matches!(
+        store.publish_page(&bad),
+        Err(StoreError::StaleInput)
+    ));
 }
 
 #[test]
 fn source_invalidation_on_forget_and_correct() {
     // doc6/05 §4/§5：forget/correct 后引用页立即 stale 且不可见。
     let (mut store, scope, origin) = setup("invalidate");
-    let m1 = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
-    let m2 = remember_one(&mut store, &scope, &origin, 2, "用户偏好简短回答", MemoryKind::Preference);
+    let m1 = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "用户住在杭州",
+        MemoryKind::Fact,
+    );
+    let m2 = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        2,
+        "用户偏好简短回答",
+        MemoryKind::Preference,
+    );
     let req = pages::PublishRequest {
         scope: &scope,
         document_kind: "topic_page",
@@ -163,7 +214,10 @@ fn source_invalidation_on_forget_and_correct() {
         body_md: "摘要。",
         generator_version: pages::GENERATE_CONSOLIDATE_V1,
         input_fingerprint: "fp-1",
-        sources: &[source_of(&store, &scope, &m1), source_of(&store, &scope, &m2)],
+        sources: &[
+            source_of(&store, &scope, &m1),
+            source_of(&store, &scope, &m2),
+        ],
         actor_kind: "system",
     };
     let (page_id, _) = store.publish_page(&req).unwrap();
@@ -185,7 +239,11 @@ fn source_invalidation_on_forget_and_correct() {
     // FTS 索引同步移除。
     let fts: i64 = store
         .conn()
-        .query_row("SELECT count(*) FROM page_fts WHERE page_id=?1", rusqlite::params![page_id], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM page_fts WHERE page_id=?1",
+            rusqlite::params![page_id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(fts, 0, "失效页索引已移除");
 }
@@ -197,7 +255,9 @@ fn question_version_change_and_archive_invalidate_pages() {
     let (mut store, scope, origin) = setup("qversion");
     let m1 = remember_one(&mut store, &scope, &origin, 1, "事实一", MemoryKind::Fact);
     let m2 = remember_one(&mut store, &scope, &origin, 2, "事实二", MemoryKind::Fact);
-    let v = store.question_add(&scope, "work_style", "用户长期偏好的工作方式", "user_cli").unwrap();
+    let v = store
+        .question_add(&scope, "work_style", "用户长期偏好的工作方式", "user_cli")
+        .unwrap();
     store
         .conn()
         .execute(
@@ -235,11 +295,18 @@ fn question_version_change_and_archive_invalidate_pages() {
         .question_update(&scope, "work_style", "新定义", v, "user_cli")
         .unwrap();
     assert_eq!(v2, 2);
-    assert!(store.get_page(&scope, "pg1", &now).unwrap().is_none(), "旧定义画像立即失效");
+    assert!(
+        store.get_page(&scope, "pg1", &now).unwrap().is_none(),
+        "旧定义画像立即失效"
+    );
     // 归档 → 同样即时失效；重复归档幂等。
-    let v3 = store.question_archive(&scope, "work_style", v2, "user_cli").unwrap();
+    let v3 = store
+        .question_archive(&scope, "work_style", v2, "user_cli")
+        .unwrap();
     assert!(store.get_page(&scope, "pg1", &now).unwrap().is_none());
-    let v3b = store.question_archive(&scope, "work_style", v3, "user_cli").unwrap();
+    let v3b = store
+        .question_archive(&scope, "work_style", v3, "user_cli")
+        .unwrap();
     assert_eq!(v3b, v3, "重复归档幂等");
     // CAS 冲突。
     assert!(matches!(
@@ -255,25 +322,43 @@ fn consolidation_job_lifecycle_and_idempotency() {
     let (mut store, scope, origin) = setup("jobs");
     let m1 = remember_one(&mut store, &scope, &origin, 1, "事实一", MemoryKind::Fact);
     let m2 = remember_one(&mut store, &scope, &origin, 2, "事实二", MemoryKind::Fact);
-    let inputs = vec![source_of(&store, &scope, &m1), source_of(&store, &scope, &m2)];
+    let inputs = vec![
+        source_of(&store, &scope, &m1),
+        source_of(&store, &scope, &m2),
+    ];
     let now = crate::now_rfc3339_pub().unwrap();
     let job = store
         .consolidation_enqueue(
-            &scope, "topic_page", "work-stack", None, pages::GENERATE_CONSOLIDATE_V1,
-            "fp-1", &inputs, &now,
+            &scope,
+            "topic_page",
+            "work-stack",
+            None,
+            pages::GENERATE_CONSOLIDATE_V1,
+            "fp-1",
+            &inputs,
+            &now,
         )
         .unwrap();
     assert_eq!(job.status, "queued");
     // 同 key 幂等：返回既有 job。
     let again = store
         .consolidation_enqueue(
-            &scope, "topic_page", "work-stack", None, pages::GENERATE_CONSOLIDATE_V1,
-            "fp-1", &inputs, &now,
+            &scope,
+            "topic_page",
+            "work-stack",
+            None,
+            pages::GENERATE_CONSOLIDATE_V1,
+            "fp-1",
+            &inputs,
+            &now,
         )
         .unwrap();
     assert_eq!(again.id, job.id, "同指纹返回原 job");
     // claim → running，generation+1；坏 JSON → 确定性 dead。
-    let claimed = store.consolidation_claim(&scope, &now, 90).unwrap().unwrap();
+    let claimed = store
+        .consolidation_claim(&scope, &now, 90)
+        .unwrap()
+        .unwrap();
     assert_eq!(claimed.id, job.id);
     assert_eq!(claimed.status, "running");
     assert_eq!(claimed.claim_generation, 1);
@@ -281,17 +366,35 @@ fn consolidation_job_lifecycle_and_idempotency() {
     let frozen = store.consolidation_inputs(&scope, &job.id).unwrap();
     assert_eq!(frozen.len(), 2);
     let gen = claimed.claim_generation;
-    assert!(store.consolidation_dead(&scope, &job.id, gen, "BAD_JSON").unwrap());
-    assert_eq!(store.consolidation_get(&scope, &job.id).unwrap().unwrap().status, "dead");
+    assert!(store
+        .consolidation_dead(&scope, &job.id, gen, "BAD_JSON")
+        .unwrap());
+    assert_eq!(
+        store
+            .consolidation_get(&scope, &job.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "dead"
+    );
     // 崩溃恢复：过期 running 回 queued（另一个 job）。
     let job2 = store
         .consolidation_enqueue(
-            &scope, "topic_page", "other-stack", None, pages::GENERATE_CONSOLIDATE_V1,
-            "fp-2", &inputs, &now,
+            &scope,
+            "topic_page",
+            "other-stack",
+            None,
+            pages::GENERATE_CONSOLIDATE_V1,
+            "fp-2",
+            &inputs,
+            &now,
         )
         .unwrap();
     let now2 = crate::now_rfc3339_pub().unwrap();
-    let c2 = store.consolidation_claim(&scope, &now2, 90).unwrap().unwrap();
+    let c2 = store
+        .consolidation_claim(&scope, &now2, 90)
+        .unwrap()
+        .unwrap();
     assert_eq!(c2.id, job2.id);
     // 模拟 lease 过期：直接把 lease_until 置为过去。
     store
@@ -303,9 +406,18 @@ fn consolidation_job_lifecycle_and_idempotency() {
         .unwrap();
     let recovered = store.consolidation_recover_expired(&now2).unwrap();
     assert_eq!(recovered, 1);
-    assert_eq!(store.consolidation_get(&scope, &job2.id).unwrap().unwrap().status, "queued");
+    assert_eq!(
+        store
+            .consolidation_get(&scope, &job2.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "queued"
+    );
     // 心跳续租对非 running 无效。
-    assert!(!store.consolidation_heartbeat(&scope, &job2.id, 1, 90).unwrap());
+    assert!(!store
+        .consolidation_heartbeat(&scope, &job2.id, 1, 90)
+        .unwrap());
 }
 
 #[test]
@@ -313,10 +425,20 @@ fn prompt_output_parsers_strict() {
     // doc6/05 §3：严格 JSON（可剥围栏）、字段集固定、范围校验、坏 JSON 确定性失败。
     use pages::{parse_consolidate_output, parse_mental_model_output};
     let mm = r#"{"question_key":"work_style","answer_md":"先结论","source_memory_ids":["m1"]}"#;
-    assert_eq!(parse_mental_model_output(mm, "work_style").unwrap().answer_md, "先结论");
+    assert_eq!(
+        parse_mental_model_output(mm, "work_style")
+            .unwrap()
+            .answer_md,
+        "先结论"
+    );
     // 围栏可剥。
     let fenced = format!("```json\n{mm}\n```");
-    assert_eq!(parse_mental_model_output(&fenced, "work_style").unwrap().answer_md, "先结论");
+    assert_eq!(
+        parse_mental_model_output(&fenced, "work_style")
+            .unwrap()
+            .answer_md,
+        "先结论"
+    );
     // question_key 不匹配 → 拒绝。
     assert!(parse_mental_model_output(mm, "other").is_err());
     // 坏 JSON / 额外字段 / 空来源 → 拒绝。
@@ -360,8 +482,22 @@ fn publish_two_source_page(
     tag: &str,
     seq_base: i64,
 ) -> String {
-    let m1 = remember_one(store, scope, origin, seq_base, &format!("{tag} 来源一"), MemoryKind::Fact);
-    let m2 = remember_one(store, scope, origin, seq_base + 1, &format!("{tag} 来源二"), MemoryKind::Fact);
+    let m1 = remember_one(
+        store,
+        scope,
+        origin,
+        seq_base,
+        &format!("{tag} 来源一"),
+        MemoryKind::Fact,
+    );
+    let m2 = remember_one(
+        store,
+        scope,
+        origin,
+        seq_base + 1,
+        &format!("{tag} 来源二"),
+        MemoryKind::Fact,
+    );
     let sources: Vec<(String, i64, String)> = [&m1, &m2]
         .iter()
         .map(|mid| {
@@ -400,7 +536,10 @@ fn page_pin_enters_resident_and_stale_source_omits() {
     store.page_pin(&scope, &page_id).unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
     let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
-    assert!(sel.items.iter().any(|i| i.memory_id == page_id && i.kind == "page"));
+    assert!(sel
+        .items
+        .iter()
+        .any(|i| i.memory_id == page_id && i.kind == "page"));
     assert!(sel.text.contains(&format!("[page: {page_id}]")));
     // 来源失效 → 立即省略 + STALE_SOURCE 原因。
     let m_forgotten: String = {
@@ -423,8 +562,14 @@ fn page_pin_enters_resident_and_stale_source_omits() {
     };
     store.stale_pages_for_memory(&scope, &m_forgotten).unwrap();
     let sel2 = store.select_resident(&scope, &now, 24, 3000).unwrap();
-    assert!(sel2.items.iter().all(|i| i.memory_id != page_id), "失效页不进正文");
-    assert!(sel2.stale_pages.contains(&page_id), "省略原因 STALE_SOURCE 可见");
+    assert!(
+        sel2.items.iter().all(|i| i.memory_id != page_id),
+        "失效页不进正文"
+    );
+    assert!(
+        sel2.stale_pages.contains(&page_id),
+        "省略原因 STALE_SOURCE 可见"
+    );
 }
 
 #[test]
@@ -434,7 +579,10 @@ fn page_archive_and_rebuild_index_no_revival() {
     let page_id = publish_two_source_page(&mut store, &scope, &origin, "arch", 201);
     let now = crate::now_rfc3339_pub().unwrap();
     // FTS 命中（published）。
-    assert!(store.page_fts_search(&scope, "摘要", 10).unwrap().contains(&page_id));
+    assert!(store
+        .page_fts_search(&scope, "摘要", 10)
+        .unwrap()
+        .contains(&page_id));
     // 归档（CAS）。
     let version: i64 = store
         .conn()
@@ -445,10 +593,19 @@ fn page_archive_and_rebuild_index_no_revival() {
         )
         .unwrap();
     assert!(store.page_archive(&scope, &page_id, version).unwrap());
-    assert!(store.page_fts_search(&scope, "摘要", 10).unwrap().is_empty(), "归档即移除索引");
+    assert!(
+        store
+            .page_fts_search(&scope, "摘要", 10)
+            .unwrap()
+            .is_empty(),
+        "归档即移除索引"
+    );
     // rebuild 只重建 published：归档页不复活。
     store.rebuild_page_index().unwrap();
-    assert!(store.page_fts_search(&scope, "摘要", 10).unwrap().is_empty());
+    assert!(store
+        .page_fts_search(&scope, "摘要", 10)
+        .unwrap()
+        .is_empty());
     // pin 一页 + forget 一条来源 → 页 stale；rebuild 不复活。
     let page2 = publish_two_source_page(&mut store, &scope, &origin, "arch2", 301);
     let mid: String = store
@@ -461,12 +618,18 @@ fn page_archive_and_rebuild_index_no_revival() {
         .unwrap();
     store
         .conn()
-        .execute("UPDATE memories SET status='forgotten' WHERE id=?1", rusqlite::params![mid])
+        .execute(
+            "UPDATE memories SET status='forgotten' WHERE id=?1",
+            rusqlite::params![mid],
+        )
         .unwrap();
     store.stale_pages_for_memory(&scope, &mid).unwrap();
     store.rebuild_page_index().unwrap();
     assert!(
-        !store.page_fts_search(&scope, "arch2", 10).unwrap().contains(&page2),
+        !store
+            .page_fts_search(&scope, "arch2", 10)
+            .unwrap()
+            .contains(&page2),
         "stale 页 rebuild 后不复活"
     );
 }
@@ -478,13 +641,18 @@ fn page_pin_cross_scope_404_and_unpin_idempotent() {
         let dir = std::env::temp_dir().join("am-d65-ppin-u2");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+        store
+            .principal_add("t", "u2", &dir.join("u2.token"))
+            .unwrap();
         let token = std::fs::read_to_string(dir.join("u2.token")).unwrap();
         store.verify_token(token.trim()).unwrap().unwrap()
     };
     let page_id = publish_two_source_page(&mut store, &scope, &origin, "iso", 401);
     // 跨 scope pin → 404 语义。
-    assert!(matches!(store.page_pin(&other, &page_id), Err(StoreError::PageNotFound)));
+    assert!(matches!(
+        store.page_pin(&other, &page_id),
+        Err(StoreError::PageNotFound)
+    ));
     // 正常 pin → unpin → unpin 幂等。
     assert_eq!(store.page_pin(&scope, &page_id).unwrap(), 1);
     assert_eq!(store.page_unpin(&scope, &page_id).unwrap(), 2);

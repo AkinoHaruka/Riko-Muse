@@ -22,7 +22,11 @@ fn setup(tag: &str) -> (Store, ScopeKey, Origin) {
     store.principal_add("t", "u", &dir.join("u.token")).unwrap();
     let token = std::fs::read_to_string(dir.join("u.token")).unwrap();
     let scope = store.verify_token(token.trim()).unwrap().unwrap();
-    let origin = Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s".into() };
+    let origin = Origin {
+        host_id: "dsh".into(),
+        agent_id: "a".into(),
+        session_id: "s".into(),
+    };
     (store, scope, origin)
 }
 
@@ -35,7 +39,10 @@ fn remember_one(
     kind: MemoryKind,
 ) -> String {
     let t = chrono::Utc::now();
-    let ev = match store.record_evidence(scope, origin, seq, "user", "user", &t, quote).unwrap() {
+    let ev = match store
+        .record_evidence(scope, origin, seq, "user", "user", &t, quote)
+        .unwrap()
+    {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
     match store.remember(scope, origin, &ev, quote, kind).unwrap() {
@@ -49,29 +56,84 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
     // doc6/02 §4 / doc6/04 §2：版本化缓存、model_id+dimensions 隔离、对象失效
     // 同事务 stale、扫描按余弦降序（按 memory ID 断言排名）。
     let (mut store, scope, origin) = setup("vec");
-    let m_near = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
-    let m_far = remember_one(&mut store, &scope, &origin, 2, "用户对芒果过敏", MemoryKind::Fact);
+    let m_near = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "用户住在杭州",
+        MemoryKind::Fact,
+    );
+    let m_far = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        2,
+        "用户对芒果过敏",
+        MemoryKind::Fact,
+    );
     // 入队：同对象重复入队幂等（返回同一作业）。
-    let j1 = store.semantic_enqueue(&scope, "memory", &m_near, "m1").unwrap().unwrap();
-    let j1b = store.semantic_enqueue(&scope, "memory", &m_near, "m1").unwrap().unwrap();
+    let j1 = store
+        .semantic_enqueue(&scope, "memory", &m_near, "m1")
+        .unwrap()
+        .unwrap();
+    let j1b = store
+        .semantic_enqueue(&scope, "memory", &m_near, "m1")
+        .unwrap()
+        .unwrap();
     assert_eq!(j1.id, j1b.id, "同对象同模型待处理作业幂等");
-    store.semantic_enqueue(&scope, "memory", &m_far, "m1").unwrap().unwrap();
+    store
+        .semantic_enqueue(&scope, "memory", &m_far, "m1")
+        .unwrap()
+        .unwrap();
     // claim 两个作业并写向量：m_near=[1,0]、m_far=[0,1]。
     for mid in [&m_near, &m_far] {
         let now_c = crate::now_rfc3339_pub().unwrap();
         let (scope_j, job) = store.semantic_job_claim(&now_c, 90).unwrap().unwrap();
         assert_eq!(job.model_id, "m1");
-        let v: Vec<f32> = if job.object_id == *mid { [1.0f32, 0.0].into() } else { [0.0f32, 1.0].into() };
-        store.semantic_vector_save(&scope_j, "memory", &job.object_id, "m1", job.source_version, &job.content_sha256, &v).unwrap();
-        store.semantic_job_finish(&scope_j, &job.id, job.claim_generation, "succeeded", None, None).unwrap();
+        let v: Vec<f32> = if job.object_id == *mid {
+            [1.0f32, 0.0].into()
+        } else {
+            [0.0f32, 1.0].into()
+        };
+        store
+            .semantic_vector_save(
+                &scope_j,
+                "memory",
+                &job.object_id,
+                "m1",
+                job.source_version,
+                &job.content_sha256,
+                &v,
+            )
+            .unwrap();
+        store
+            .semantic_job_finish(
+                &scope_j,
+                &job.id,
+                job.claim_generation,
+                "succeeded",
+                None,
+                None,
+            )
+            .unwrap();
     }
     // 扫描：query=[0.95,0.15] → m_near 余弦更高（按 memory ID 断言排名）。
-    let (hits, count) = store.semantic_scan(&scope, "memory", "m1", &[0.95, 0.15], 10).unwrap();
+    let (hits, count) = store
+        .semantic_scan(&scope, "memory", "m1", &[0.95, 0.15], 10)
+        .unwrap();
     assert_eq!((hits.len(), count), (2, 2));
     assert_eq!(hits[0].0, m_near, "余弦降序：近邻在前");
     assert_eq!(hits[1].0, m_far);
     // model_id 隔离：不同模型不混算。
-    assert_eq!(store.semantic_scan(&scope, "memory", "m2", &[1.0, 0.0], 10).unwrap().0.len(), 0);
+    assert_eq!(
+        store
+            .semantic_scan(&scope, "memory", "m2", &[1.0, 0.0], 10)
+            .unwrap()
+            .0
+            .len(),
+        0
+    );
     // dimensions 隔离：m3 下存 3 维向量（sha 用真实值），2 维 query 扫不到。
     let (_v, real_sha): (i64, String) = store
         .conn()
@@ -81,8 +143,25 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    store.semantic_vector_save(&scope, "memory", &m_near, "m3", _v, &real_sha, &[1.0, 0.0, 0.0]).unwrap();
-    assert_eq!(store.semantic_scan(&scope, "memory", "m3", &[1.0, 0.0], 10).unwrap().0.len(), 0);
+    store
+        .semantic_vector_save(
+            &scope,
+            "memory",
+            &m_near,
+            "m3",
+            _v,
+            &real_sha,
+            &[1.0, 0.0, 0.0],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .semantic_scan(&scope, "memory", "m3", &[1.0, 0.0], 10)
+            .unwrap()
+            .0
+            .len(),
+        0
+    );
     // 版本漂移：save 用旧版本 → StaleInput，不覆盖。
     let drift = store.semantic_vector_save(&scope, "memory", &m_near, "m1", 99, "old", &[0.5, 0.5]);
     assert!(matches!(drift, Err(StoreError::StaleInput)));
@@ -91,7 +170,15 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
     let ev = {
         let t = chrono::Utc::now();
         match store
-            .record_evidence(&scope, &origin, 3, "user", "user", &t, "用户住在杭州？不，我搬到上海了")
+            .record_evidence(
+                &scope,
+                &origin,
+                3,
+                "user",
+                "user",
+                &t,
+                "用户住在杭州？不，我搬到上海了",
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
@@ -105,16 +192,30 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
         replacement_quote: "我搬到上海了".into(),
     };
     store.correct_memory(&scope, &m_near, &req).unwrap();
-    let (hits2, _) = store.semantic_scan(&scope, "memory", "m1", &[1.0, 0.0], 10).unwrap();
-    assert!(hits2.iter().all(|(id, _)| *id != m_near), "correct 后旧向量立即 stale");
+    let (hits2, _) = store
+        .semantic_scan(&scope, "memory", "m1", &[1.0, 0.0], 10)
+        .unwrap();
+    assert!(
+        hits2.iter().all(|(id, _)| *id != m_near),
+        "correct 后旧向量立即 stale"
+    );
     // 跨 scope 隔离：另一用户扫描看不到。
     let dir2 = std::env::temp_dir().join(format!("am-d68-test-{}-vec2", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir2);
     std::fs::create_dir_all(&dir2).unwrap();
-    store.principal_add("t", "u2", &dir2.join("t.token")).unwrap();
+    store
+        .principal_add("t", "u2", &dir2.join("t.token"))
+        .unwrap();
     let tok2 = std::fs::read_to_string(dir2.join("t.token")).unwrap();
     let scope2 = store.verify_token(tok2.trim()).unwrap().unwrap();
-    assert_eq!(store.semantic_scan(&scope2, "memory", "m1", &[1.0, 0.0], 10).unwrap().0.len(), 0);
+    assert_eq!(
+        store
+            .semantic_scan(&scope2, "memory", "m1", &[1.0, 0.0], 10)
+            .unwrap()
+            .0
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -123,7 +224,14 @@ fn adjudication_apply_pairwise_fixed_set() {
     // not_memory 全动作 + 引用越权拒绝；false merge（keep_separate 两条都在）。
     let (mut store, scope, origin) = setup("adj");
     // 目标记忆（供 attach/update/conflict）。
-    let target = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+    let target = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "用户住在杭州",
+        MemoryKind::Fact,
+    );
     let (tver, thash): (i64, String) = store
         .conn()
         .query_row(
@@ -136,11 +244,17 @@ fn adjudication_apply_pairwise_fixed_set() {
     let content = "用户住在杭州，用户喜欢简短回答，用户下周去北京，用户养了一只猫，用户会拉小提琴，用户昨天打网球扭伤了脚，用户计划学日语，用户对花粉过敏。";
     let ev = {
         let t = chrono::Utc::now();
-        match store.record_evidence(&scope, &origin, 2, "user", "user", &t, content).unwrap() {
+        match store
+            .record_evidence(&scope, &origin, 2, "user", "user", &t, content)
+            .unwrap()
+        {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
         }
     };
-    let _job = store.dream_trigger(&scope, "manual", "k1", None, None, None).unwrap().unwrap();
+    let _job = store
+        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .unwrap()
+        .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
     let now = crate::now_rfc3339_pub().unwrap();
     let claimed = store.dream_claim(&scope, &now, 900).unwrap().unwrap();
@@ -166,21 +280,29 @@ fn adjudication_apply_pairwise_fixed_set() {
     // 8 个候选覆盖 pairwise 集：
     let (a_create, b_attach, c_update, d_keep, e_conflict, f_defer, g_notmem, h_foreign) = (
         mk("fact", "用户会拉小提琴", "用户会拉小提琴"),
-        mk("fact", "用户住在杭州", "用户住在杭州"),           // 与 target 精确复述
-        mk("fact", "用户搬到上海了", "用户下周去北京"),         // 同方面状态变化（借下一条 quote）
-        mk("fact", "用户养了一只猫", "用户养了一只猫"),         // 近义不同方面（keep）
-        mk("fact", "用户对花粉过敏", "用户对花粉过敏"),         // 与芒果过敏冲突候选
-        mk("fact", "用户计划学日语", "用户计划学日语"),         // 语境不足
-        mk("episode", "用户昨天打网球", "用户昨天打网球"),       // 非长期记忆
-        mk("fact", "用户喜欢简短回答", "用户喜欢简短回答"),       // 动作有效但目标越权
+        mk("fact", "用户住在杭州", "用户住在杭州"), // 与 target 精确复述
+        mk("fact", "用户搬到上海了", "用户下周去北京"), // 同方面状态变化（借下一条 quote）
+        mk("fact", "用户养了一只猫", "用户养了一只猫"), // 近义不同方面（keep）
+        mk("fact", "用户对花粉过敏", "用户对花粉过敏"), // 与芒果过敏冲突候选
+        mk("fact", "用户计划学日语", "用户计划学日语"), // 语境不足
+        mk("episode", "用户昨天打网球", "用户昨天打网球"), // 非长期记忆
+        mk("fact", "用户喜欢简短回答", "用户喜欢简短回答"), // 动作有效但目标越权
     );
-    let props = vec![a_create, b_attach, c_update, d_keep, e_conflict, f_defer, g_notmem, h_foreign];
+    let props = vec![
+        a_create, b_attach, c_update, d_keep, e_conflict, f_defer, g_notmem, h_foreign,
+    ];
     let (accepted, rejected) = store
-        .dream_submit_candidates(&scope, &claimed.id, gen, crate::dream_jobs::DREAM_POLICY_V1, &props)
+        .dream_submit_candidates(
+            &scope,
+            &claimed.id,
+            gen,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &props,
+        )
         .unwrap();
     assert_eq!((accepted, rejected), (8, 0));
     // 读取候选 ID（按 claim 对应）。
-            let cand_id = |claim: &str| -> String {
+    let cand_id = |claim: &str| -> String {
         store
             .conn()
             .query_row(
@@ -225,17 +347,27 @@ fn adjudication_apply_pairwise_fixed_set() {
     ];
     let adj = store
         .adjudication_create(
-            &scope, &claimed.id,
+            &scope,
+            &claimed.id,
             memory_contract::ADMISSION_VERSION_V3,
             crate::adjudication::ADJUDICATE_V1,
-            Some("m1"), &inputs, &recalls,
+            Some("m1"),
+            &inputs,
+            &recalls,
         )
         .unwrap()
         .unwrap();
     // 同指纹幂等。
     let adj2 = store
-        .adjudication_create(&scope, &claimed.id, memory_contract::ADMISSION_VERSION_V3,
-                             crate::adjudication::ADJUDICATE_V1, Some("m1"), &inputs, &recalls)
+        .adjudication_create(
+            &scope,
+            &claimed.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("m1"),
+            &inputs,
+            &recalls,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(adj.id, adj2.id);
@@ -244,27 +376,46 @@ fn adjudication_apply_pairwise_fixed_set() {
     let (_s, ajob) = store.adjudication_claim(&now2, 900).unwrap().unwrap();
     assert_eq!(ajob.id, adj.id);
     let agen = ajob.claim_generation;
-    let p = |cid: &str, durability: &str, action: &str, tgt: Option<&str>, ver: Option<i64>| AdjudicationProposal {
-        candidate_id: cid.into(),
-        durability: durability.into(),
-        action: action.into(),
-        reason_code: Some("test".into()),
-        target_memory_id: tgt.map(|s| s.into()),
-        expected_target_version: ver,
-        model_confidence: Some(0.9),
-        valid_until: None,
+    let p = |cid: &str, durability: &str, action: &str, tgt: Option<&str>, ver: Option<i64>| {
+        AdjudicationProposal {
+            candidate_id: cid.into(),
+            durability: durability.into(),
+            action: action.into(),
+            reason_code: Some("test".into()),
+            target_memory_id: tgt.map(|s| s.into()),
+            expected_target_version: ver,
+            model_confidence: Some(0.9),
+            valid_until: None,
+        }
     };
     let outcome = store
-        .adjudication_apply(&scope, &adj.id, agen, &[
-            p(&ids[0], "durable", "create", None, None),                       // a 新建
-            p(&ids[1], "durable", "attach_evidence", Some(&target), Some(tver)), // b 复述→补证据
-            p(&ids[2], "durable", "update", Some(&target), Some(tver)),        // c 状态更新
-            p(&ids[3], "durable", "keep_separate", None, None),                // d 近义不同方面
-            p(&ids[4], "uncertain", "conflict", None, None),                   // e 冲突 → held
-            p(&ids[5], "uncertain", "defer", None, None),                      // f 语境不足 → held
-            p(&ids[6], "not_memory", "not_memory", None, None),                // g 非记忆
-            p(&ids[7], "durable", "attach_evidence", Some(&target), Some(tver)), // h 目标不在其召回集
-        ])
+        .adjudication_apply(
+            &scope,
+            &adj.id,
+            agen,
+            &[
+                p(&ids[0], "durable", "create", None, None), // a 新建
+                p(
+                    &ids[1],
+                    "durable",
+                    "attach_evidence",
+                    Some(&target),
+                    Some(tver),
+                ), // b 复述→补证据
+                p(&ids[2], "durable", "update", Some(&target), Some(tver)), // c 状态更新
+                p(&ids[3], "durable", "keep_separate", None, None), // d 近义不同方面
+                p(&ids[4], "uncertain", "conflict", None, None), // e 冲突 → held
+                p(&ids[5], "uncertain", "defer", None, None), // f 语境不足 → held
+                p(&ids[6], "not_memory", "not_memory", None, None), // g 非记忆
+                p(
+                    &ids[7],
+                    "durable",
+                    "attach_evidence",
+                    Some(&target),
+                    Some(tver),
+                ), // h 目标不在其召回集
+            ],
+        )
         .unwrap();
     // 应用桶= create/attach/update/keep/not_memory 5 条 + rejected(h) 1 条 + held(e,f) 2 条。
     assert_eq!((outcome.applied, outcome.rejected, outcome.held), (5, 1, 2));
@@ -286,7 +437,11 @@ fn adjudication_apply_pairwise_fixed_set() {
     assert_eq!(status_of(&ids[4]), "applied");
     assert_eq!(status_of(&ids[5]), "applied");
     assert_eq!(status_of(&ids[6]), "applied");
-    assert_eq!(status_of(&ids[7]), "rejected", "引用越权（目标不在其冻结召回集）拒绝");
+    assert_eq!(
+        status_of(&ids[7]),
+        "rejected",
+        "引用越权（目标不在其冻结召回集）拒绝"
+    );
     // b 复述：target 证据追加，未产生重复 Active（false merge/duplicate 检查）。
     let n_ev: i64 = store
         .conn()
@@ -302,13 +457,19 @@ fn adjudication_apply_pairwise_fixed_set() {
         .conn()
         .query_row(
             "SELECT status FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-            rusqlite::params![scope.tenant_id, scope.user_id,
-                store.conn().query_row(
-                    "SELECT applied_result_memory_id FROM adjudication_results
+            rusqlite::params![
+                scope.tenant_id,
+                scope.user_id,
+                store
+                    .conn()
+                    .query_row(
+                        "SELECT applied_result_memory_id FROM adjudication_results
                      WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3 AND candidate_id=?4",
-                    rusqlite::params![scope.tenant_id, scope.user_id, adj.id, ids[2]],
-                    |r| r.get::<_, Option<String>>(0),
-                ).unwrap().unwrap()
+                        rusqlite::params![scope.tenant_id, scope.user_id, adj.id, ids[2]],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .unwrap()
+                    .unwrap()
             ],
             |r| r.get::<_, String>(0),
         )
@@ -362,18 +523,198 @@ fn adjudication_apply_pairwise_fixed_set() {
 }
 
 #[test]
+fn runner_adjudication_commit_and_processed_receipt_are_atomic() {
+    let (mut store, scope, origin) = setup("adj-atomic-complete");
+    let content = "我住在杭州";
+    let evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            content,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let dream = store
+        .dream_trigger(&scope, "manual", "atomic-complete", None, None, None)
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
+    assert_eq!(claimed.id, dream.id);
+    let (accepted, rejected) = store
+        .dream_submit_candidates(
+            &scope,
+            &claimed.id,
+            claimed.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[crate::dream_jobs::DreamProposal {
+                kind: "fact".into(),
+                claim: content.into(),
+                quote: content.into(),
+                evidence_id: evidence.clone(),
+                start_byte: 0,
+                end_byte: content.len() as i64,
+                status: "candidate".into(),
+                reason_code: None,
+                occurred_at: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!((accepted, rejected), (1, 0));
+    let candidate_id: String = store
+        .conn()
+        .query_row(
+            "SELECT id FROM dream_candidates WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, claimed.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let input = AdjudicationCandidate {
+        candidate_id: candidate_id.clone(),
+        kind: "fact".into(),
+        claim: content.into(),
+        quote: content.into(),
+        status: "candidate".into(),
+        evidence_id: evidence.clone(),
+        start_byte: 0,
+        end_byte: content.len() as i64,
+    };
+    let adjudication = store
+        .adjudication_create(
+            &scope,
+            &claimed.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            None,
+            &[input],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let (_, adj_claim) = store.adjudication_claim(&now, 90).unwrap().unwrap();
+    assert_eq!(adj_claim.id, adjudication.id);
+    let omitted = store.adjudication_apply_and_complete(
+        &scope,
+        &adj_claim.id,
+        adj_claim.claim_generation,
+        claimed.claim_generation,
+        &[],
+    );
+    assert!(matches!(
+        omitted,
+        Err(StoreError::InvalidAdjudicationCoverage)
+    ));
+    let statuses: (String, String, String) = store.conn().query_row(
+        "SELECT a.status,d.status,s.status FROM adjudication_jobs a
+         JOIN dream_jobs d ON d.tenant_id=a.tenant_id AND d.user_id=a.user_id AND d.id=a.dream_job_id
+         JOIN dream_evidence_state s ON s.tenant_id=d.tenant_id AND s.user_id=d.user_id
+         WHERE a.tenant_id=?1 AND a.user_id=?2 AND a.id=?3 AND s.evidence_id=?4",
+        rusqlite::params![scope.tenant_id, scope.user_id, adj_claim.id, evidence],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        statuses,
+        ("running".into(), "running".into(), "assigned".into()),
+        "漏候选不得提交部分裁决或消费证据"
+    );
+    let duplicate = AdjudicationProposal {
+        candidate_id: candidate_id.clone(),
+        durability: "durable".into(),
+        action: "create".into(),
+        reason_code: None,
+        target_memory_id: None,
+        expected_target_version: None,
+        model_confidence: None,
+        valid_until: None,
+    };
+    let duplicated = store.adjudication_apply_and_complete(
+        &scope,
+        &adj_claim.id,
+        adj_claim.claim_generation,
+        claimed.claim_generation,
+        &[duplicate.clone(), duplicate],
+    );
+    assert!(matches!(
+        duplicated,
+        Err(StoreError::InvalidAdjudicationCoverage)
+    ));
+    let outcome = store
+        .adjudication_apply_and_complete(
+            &scope,
+            &adj_claim.id,
+            adj_claim.claim_generation,
+            claimed.claim_generation,
+            &[AdjudicationProposal {
+                candidate_id,
+                durability: "durable".into(),
+                action: "create".into(),
+                reason_code: None,
+                target_memory_id: None,
+                expected_target_version: None,
+                model_confidence: None,
+                valid_until: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(outcome.applied, 1);
+    let adj_status: String = store
+        .conn()
+        .query_row(
+            "SELECT status FROM adjudication_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, adjudication.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let dream_status: String = store
+        .conn()
+        .query_row(
+            "SELECT status FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, dream.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let evidence_status: String = store.conn().query_row(
+        "SELECT status FROM dream_evidence_state WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+        rusqlite::params![scope.tenant_id, scope.user_id, evidence], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(adj_status, "succeeded");
+    assert_eq!(dream_status, "succeeded");
+    assert_eq!(evidence_status, "processed");
+}
+
+#[test]
 fn adjudication_stale_on_target_drift() {
     // doc6/09 §4.B.4：目标在模型运行中被并发修改/失效 → 整批 StaleInput 不部分提交。
     let (mut store, scope, origin) = setup("drift");
-    let target = remember_one(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+    let target = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "用户住在杭州",
+        MemoryKind::Fact,
+    );
     let content = "用户住在杭州，用户喜欢简短回答。";
     let ev = {
         let t = chrono::Utc::now();
-        match store.record_evidence(&scope, &origin, 2, "user", "user", &t, content).unwrap() {
+        match store
+            .record_evidence(&scope, &origin, 2, "user", "user", &t, content)
+            .unwrap()
+        {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
         }
     };
-    let _job = store.dream_trigger(&scope, "manual", "k1", None, None, None).unwrap().unwrap();
+    let _job = store
+        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .unwrap()
+        .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
     let now = crate::now_rfc3339_pub().unwrap();
     let claimed = store.dream_claim(&scope, &now, 900).unwrap().unwrap();
@@ -394,7 +735,13 @@ fn adjudication_stale_on_target_drift() {
         occurred_at: None,
     };
     let (accepted, _) = store
-        .dream_submit_candidates(&scope, &claimed.id, claimed.claim_generation, crate::dream_jobs::DREAM_POLICY_V1, &[proposal])
+        .dream_submit_candidates(
+            &scope,
+            &claimed.id,
+            claimed.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[proposal],
+        )
         .unwrap();
     assert_eq!(accepted, 1);
     let cid: String = store
@@ -422,8 +769,15 @@ fn adjudication_stale_on_target_drift() {
         channel: "exact".into(),
     }];
     let adj = store
-        .adjudication_create(&scope, &claimed.id, memory_contract::ADMISSION_VERSION_V3,
-                             crate::adjudication::ADJUDICATE_V1, Some("m1"), &inputs, &recalls)
+        .adjudication_create(
+            &scope,
+            &claimed.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("m1"),
+            &inputs,
+            &recalls,
+        )
         .unwrap()
         .unwrap();
     let now2 = crate::now_rfc3339_pub().unwrap();
@@ -434,7 +788,12 @@ fn adjudication_stale_on_target_drift() {
         .execute(
             "UPDATE memories SET status='superseded', version=version+1, updated_at=?4
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-            rusqlite::params![scope.tenant_id, scope.user_id, target, crate::now_rfc3339_pub().unwrap()],
+            rusqlite::params![
+                scope.tenant_id,
+                scope.user_id,
+                target,
+                crate::now_rfc3339_pub().unwrap()
+            ],
         )
         .unwrap();
     let proposal = AdjudicationProposal {
@@ -448,7 +807,10 @@ fn adjudication_stale_on_target_drift() {
         valid_until: None,
     };
     let r = store.adjudication_apply(&scope, &adj.id, ajob.claim_generation, &[proposal]);
-    assert!(matches!(r, Err(StoreError::StaleInput)), "目标版本漂移 → 整批 stale");
+    assert!(
+        matches!(r, Err(StoreError::StaleInput)),
+        "目标版本漂移 → 整批 stale"
+    );
     // 无部分提交：结果表无该候选行。
     let n: i64 = store
         .conn()
@@ -497,11 +859,17 @@ fn adjudication_claim_lifecycle_and_provider_wait_resume() {
     let content = "用户住在杭州。";
     let ev = {
         let t = chrono::Utc::now();
-        match store.record_evidence(&scope, &origin, 1, "user", "user", &t, content).unwrap() {
+        match store
+            .record_evidence(&scope, &origin, 1, "user", "user", &t, content)
+            .unwrap()
+        {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
         }
     };
-    let _job = store.dream_trigger(&scope, "manual", "k1", None, None, None).unwrap().unwrap();
+    let _job = store
+        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .unwrap()
+        .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
     let now = crate::now_rfc3339_pub().unwrap();
     let claimed = store.dream_claim(&scope, &now, 900).unwrap().unwrap();
@@ -522,7 +890,13 @@ fn adjudication_claim_lifecycle_and_provider_wait_resume() {
         occurred_at: None,
     };
     let (accepted, _) = store
-        .dream_submit_candidates(&scope, &claimed.id, claimed.claim_generation, crate::dream_jobs::DREAM_POLICY_V1, &[proposal])
+        .dream_submit_candidates(
+            &scope,
+            &claimed.id,
+            claimed.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[proposal],
+        )
         .unwrap();
     assert_eq!(accepted, 1);
     let cid: String = store
@@ -544,26 +918,53 @@ fn adjudication_claim_lifecycle_and_provider_wait_resume() {
         end_byte: eb,
     }];
     let adj = store
-        .adjudication_create(&scope, &claimed.id, memory_contract::ADMISSION_VERSION_V3,
-                             crate::adjudication::ADJUDICATE_V1, Some("m1"), &inputs, &[])
+        .adjudication_create(
+            &scope,
+            &claimed.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("m1"),
+            &inputs,
+            &[],
+        )
         .unwrap()
         .unwrap();
     let now2 = crate::now_rfc3339_pub().unwrap();
     let (_s, ajob) = store.adjudication_claim(&now2, 900).unwrap().unwrap();
     assert_eq!(ajob.id, adj.id);
     // provider_wait（带退避）→ evidence 保持 assigned → 到期续作。
-    assert!(store.adjudication_finish(&scope, &adj.id, ajob.claim_generation, "provider_wait", Some("MODEL_TIMEOUT"), None, None, None, Some(5)).unwrap());
+    assert!(store
+        .adjudication_finish(
+            &scope,
+            &adj.id,
+            ajob.claim_generation,
+            "provider_wait",
+            Some("MODEL_TIMEOUT"),
+            None,
+            None,
+            None,
+            Some(5)
+        )
+        .unwrap());
     // 同 fingerprint 重放：续作返回同一作业（重试不换输入）。
     let again = store
-        .adjudication_create(&scope, &claimed.id, memory_contract::ADMISSION_VERSION_V3,
-                             crate::adjudication::ADJUDICATE_V1, Some("m1"), &inputs, &[])
+        .adjudication_create(
+            &scope,
+            &claimed.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("m1"),
+            &inputs,
+            &[],
+        )
         .unwrap()
         .unwrap();
     assert_eq!(again.id, adj.id, "同指纹幂等（重试不换输入）");
     // 6 秒后可再领取（provider_wait 到期即端点恢复续作；run_after 为 finish 内部
     // 时钟 + 5s，晚于 now2，故再补 1 秒余量）。
-    let later = (chrono::DateTime::parse_from_rfc3339(&now2).unwrap() + chrono::Duration::seconds(10))
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let later = (chrono::DateTime::parse_from_rfc3339(&now2).unwrap()
+        + chrono::Duration::seconds(10))
+    .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let (_s2, resumed) = store.adjudication_claim(&later, 900).unwrap().unwrap();
     assert_eq!(resumed.id, adj.id, "provider_wait 到期续作");
     // Dream 账本证据保持 assigned（不被误标 processed）。

@@ -15,12 +15,18 @@ use sha2::{Digest, Sha256};
 pub enum StoreError {
     #[error("数据库打开失败: {0}")]
     Open(#[from] rusqlite::Error),
-    #[error("当前构建缺少 ENABLE_FTS5，无法创建 memory_fts；请调整 Rust 构建特性，不能静默退化为无索引")]
+    #[error(
+        "当前构建缺少 ENABLE_FTS5，无法创建 memory_fts；请调整 Rust 构建特性，不能静默退化为无索引"
+    )]
     Fts5Missing,
     #[error("迁移目录不可读: {0}")]
     MigrationsIo(String),
     #[error("迁移 {name} 内容已改变: 数据库记录 {recorded}，当前 {current}。禁止修改已发布的迁移")]
-    MigrationChecksum { name: String, recorded: String, current: String },
+    MigrationChecksum {
+        name: String,
+        recorded: String,
+        current: String,
+    },
     #[error("迁移文件版本跳跃或重复: {0}")]
     MigrationOrder(String),
     #[error("extraction_jobs 存在 (tenant,user,host,session,through) 重复作业，停止迁移 0003（未删行、未做任何 DDL）：{ids}")]
@@ -75,11 +81,14 @@ pub enum StoreError {
     PageNotFound,
     #[error("输入已失效（来源版本/状态变化），整批不发布")]
     StaleInput,
+    #[error("adjudication 输出必须对每个冻结候选恰好包含一项裁决")]
+    InvalidAdjudicationCoverage,
     #[error("时间溢出: {0}")]
     Time(String),
 }
 
-pub mod diagnostics;
+pub mod adjudication;
+pub mod consolidation_jobs;
 #[cfg(test)]
 mod d65_tests;
 #[cfg(test)]
@@ -88,24 +97,21 @@ mod d67_tests;
 mod d68_tests;
 #[cfg(test)]
 mod d69_tests;
-#[cfg(test)]
-mod probes;
-pub mod adjudication;
-pub mod consolidation_jobs;
+pub mod diagnostics;
 pub mod dream_jobs;
 pub mod evidence;
 pub mod jobs;
 pub mod lifecycle;
 pub mod memories;
 pub mod pages;
+#[cfg(test)]
+mod probes;
 pub mod purge;
 pub mod resident;
 pub mod semantic_index;
 pub mod soul;
 
-pub use diagnostics::{
-    CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem,
-};
+pub use diagnostics::{CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem};
 pub use evidence::IngestOutcome;
 pub use jobs::{CandidateOutcome, FailOutcome, FlushOutcome, JobRow};
 pub use memories::{
@@ -147,7 +153,8 @@ struct Migration {
 
 fn load_migrations(dir: &Path) -> Result<Vec<Migration>, StoreError> {
     let mut out = Vec::new();
-    let entries = fs::read_dir(dir).map_err(|e| StoreError::MigrationsIo(format!("{dir:?}: {e}")))?;
+    let entries =
+        fs::read_dir(dir).map_err(|e| StoreError::MigrationsIo(format!("{dir:?}: {e}")))?;
     for entry in entries {
         let entry = entry.map_err(|e| StoreError::MigrationsIo(e.to_string()))?;
         let path = entry.path();
@@ -168,7 +175,12 @@ fn load_migrations(dir: &Path) -> Result<Vec<Migration>, StoreError> {
         let sql = fs::read_to_string(&path)
             .map_err(|e| StoreError::MigrationsIo(format!("读取 {path:?} 失败: {e}")))?;
         let sha256 = hex::encode(Sha256::digest(sql.as_bytes()));
-        out.push(Migration { version, name: stem, sql, sha256 });
+        out.push(Migration {
+            version,
+            name: stem,
+            sql,
+            sha256,
+        });
     }
     out.sort_by_key(|m| m.version);
     // 版本号必须严格递增无重复
@@ -203,8 +215,7 @@ impl Store {
         migrations_dir: &Path,
     ) -> Result<Self, StoreError> {
         // 事务外先设 WAL；busy timeout 与 foreign_keys 随后常驻。
-        let journal: String =
-            conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        let journal: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         if !journal.eq_ignore_ascii_case("wal") && db_path != Path::new(":memory:") {
             // 内存库返回 memory，属正常；文件库必须 WAL。
             return Err(StoreError::Open(rusqlite::Error::SqliteFailure(
@@ -216,14 +227,19 @@ impl Store {
 
         // FTS5 是 D-03 的硬要求，缺失必须明确失败。
         let fts5: i32 =
-            conn.query_row("SELECT sqlite_compileoption_used('ENABLE_FTS5')", [], |r| r.get(0))?;
+            conn.query_row("SELECT sqlite_compileoption_used('ENABLE_FTS5')", [], |r| {
+                r.get(0)
+            })?;
         if fts5 != 1 {
             return Err(StoreError::Fts5Missing);
         }
 
         Self::migrate(&mut conn, migrations_dir)?;
 
-        Ok(Store { conn, path: db_path.to_path_buf() })
+        Ok(Store {
+            conn,
+            path: db_path.to_path_buf(),
+        })
     }
 
     fn migrate(conn: &mut Connection, migrations_dir: &Path) -> Result<(), StoreError> {
@@ -241,8 +257,10 @@ impl Store {
             if exists == 0 {
                 Vec::new()
             } else {
-                let mut stmt = conn.prepare("SELECT version, sha256 FROM schema_migrations ORDER BY version")?;
-                let rows = stmt.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
+                let mut stmt =
+                    conn.prepare("SELECT version, sha256 FROM schema_migrations ORDER BY version")?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             }
         };
@@ -306,10 +324,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
-        let token = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            bytes,
-        );
+        let token =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
         self.insert_principal(tenant_id, user_id, &token, token_out)
     }
 
@@ -337,10 +353,8 @@ impl Store {
         }
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
-        let token = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            bytes,
-        );
+        let token =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
         let hash = hex::encode(Sha256::digest(token.as_bytes()));
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -430,7 +444,8 @@ fn write_token_file(path: &Path, token: &str) -> Result<(), StoreError> {
     f.write_all(token.as_bytes())
         .and_then(|_| f.write_all(b"\n"))
         .map_err(|e| StoreError::TokenFileIo(format!("{}: {e}", path.display())))?;
-    f.flush().map_err(|e| StoreError::TokenFileIo(format!("{}: {e}", path.display())))?;
+    f.flush()
+        .map_err(|e| StoreError::TokenFileIo(format!("{}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -439,15 +454,14 @@ mod tests {
     use super::*;
 
     fn migrations_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("migrations")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
     }
 
     #[test]
     fn migrate_and_verify_principal() {
-        let dir = std::env::temp_dir().join(format!(
-            "am-store-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("am-store-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("test.db");
@@ -464,10 +478,15 @@ mod tests {
 
         // rotate 后旧令牌失效
         let token_file2 = dir.join("user_a_rotated.token");
-        store.principal_rotate_token("t1", "user-a", &token_file2).unwrap();
+        store
+            .principal_rotate_token("t1", "user-a", &token_file2)
+            .unwrap();
         assert!(store.verify_token(&token).unwrap().is_none());
         let token2 = fs::read_to_string(&token_file2).unwrap().trim().to_string();
-        assert_eq!(store.verify_token(&token2).unwrap().unwrap().user_id, "user-a");
+        assert_eq!(
+            store.verify_token(&token2).unwrap().unwrap().user_id,
+            "user-a"
+        );
 
         // 重复 add 拒绝
         let dup = dir.join("dup.token");
@@ -480,10 +499,7 @@ mod tests {
     fn migrate_v1_db_to_v2_prompt_version() {
         // doc2/05 §3：旧库有序升级到 schema 2，已有 v1 作业与候选仍可读，
         // prompt_version 由 DEFAULT 回填 'extract_v1'。
-        let dir = std::env::temp_dir().join(format!(
-            "am-store-v2-migrate-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("am-store-v2-migrate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("v1.db");
@@ -499,7 +515,8 @@ mod tests {
         conn.execute_batch(&format!(
             "INSERT INTO schema_migrations (version, name, sha256, applied_at)
              VALUES (1, '0001_init', '{v1_sha}', '2026-09-24T00:00:00Z');"
-        )).unwrap();
+        ))
+        .unwrap();
         // 旧 v1 数据：principal + 一条已 succeeded 的 v1 作业。
         conn.execute_batch(
             "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at)
@@ -509,25 +526,38 @@ mod tests {
                 status, attempts, run_after, created_at, updated_at)
              VALUES ('j1', 't1', 'u1', 'dsh', 's1', 'v1:5', 5, 'succeeded', 1,
                      '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z');",
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         // Store::open 依序应用 0002、0003、0004 升级（版本随迁移文件递增）。
         let mut store = Store::open(&db, &migrations).unwrap();
-        let schema_v: u32 = store.conn().query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let schema_v: u32 = store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
-        let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
+        let scope = ScopeKey {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+        };
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "succeeded");
-        assert_eq!(job.prompt_version, "extract_v1", "旧作业必须回填 extract_v1");
+        assert_eq!(
+            job.prompt_version, "extract_v1",
+            "旧作业必须回填 extract_v1"
+        );
         // 新 flush 写入当前版本（extract_v3/admit_v2）；0002 的列默认值保持 extract_v1、
         // 0004 默认保持 admit_v1（迁移已冻结，仅对不带该列插入的历史行生效，
         // flush 一律显式写当前常量）。
-        assert_eq!(job.admission_version, "admit_v1", "历史作业必须回填 admit_v1");
+        assert_eq!(
+            job.admission_version, "admit_v1",
+            "历史作业必须回填 admit_v1"
+        );
         assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v3");
         assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v2");
         let _ = token_file;
@@ -538,7 +568,10 @@ mod tests {
     fn build_v2_db(db: &Path) {
         let migrations = migrations_dir();
         let conn = Connection::open(db).unwrap();
-        for (name, file) in [("0001_init", "0001_init.sql"), ("0002_prompt_version", "0002_prompt_version.sql")] {
+        for (name, file) in [
+            ("0001_init", "0001_init.sql"),
+            ("0002_prompt_version", "0002_prompt_version.sql"),
+        ] {
             let sql = fs::read_to_string(migrations.join(file)).unwrap();
             let sha = hex::encode(Sha256::digest(sql.as_bytes()));
             conn.execute_batch(&sql).unwrap();
@@ -576,34 +609,51 @@ mod tests {
         }
 
         let store = Store::open(&db, &migrations_dir()).unwrap();
-        let (schema_v, applied): (u32, i64) = store.conn().query_row(
-            "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (schema_v, applied): (u32, i64) = store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
-        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64, "0001 起各迁移一条，无重放");
-        let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
+        assert_eq!(
+            applied,
+            memory_contract::SCHEMA_VERSION as i64,
+            "0001 起各迁移一条，无重放"
+        );
+        let scope = ScopeKey {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+        };
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "retryable_failed");
         assert_eq!(job.attempts, 2);
         assert_eq!(job.prompt_version, "extract_v1", "旧作业回填 extract_v1");
-        let gen: i32 = store.conn().query_row(
-            "SELECT claim_generation FROM extraction_jobs WHERE id='j1'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let gen: i32 = store
+            .conn()
+            .query_row(
+                "SELECT claim_generation FROM extraction_jobs WHERE id='j1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(gen, 0, "既有作业 claim_generation 回填 0");
         // skips 表存在且为空。
-        let skips: i64 = store.conn().query_row(
-            "SELECT count(*) FROM extraction_job_skips", [], |r| r.get(0),
-        ).unwrap();
+        let skips: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM extraction_job_skips", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(skips, 0);
         // 重复启动：迁移不重放。
         let store2 = Store::open(&db, &migrations_dir()).unwrap();
-        let applied2: i64 = store2.conn().query_row(
-            "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
-        ).unwrap();
+        let applied2: i64 = store2
+            .conn()
+            .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(applied2, memory_contract::SCHEMA_VERSION as i64);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -639,18 +689,27 @@ mod tests {
         };
         match err {
             StoreError::MigrationJobConflict { ids } => {
-                assert!(ids.contains("jA") && ids.contains("jB"), "应列出冲突 job ID：{ids}");
+                assert!(
+                    ids.contains("jA") && ids.contains("jB"),
+                    "应列出冲突 job ID：{ids}"
+                );
             }
             other => panic!("应为 MigrationJobConflict，实际 {other:?}"),
         }
         // 未丢行、未做部分 DDL（schema 仍为 2，新表/新列不存在）。
         {
             let conn = Connection::open(&db).unwrap();
-            let jobs: i64 = conn.query_row("SELECT count(*) FROM extraction_jobs", [], |r| r.get(0)).unwrap();
+            let jobs: i64 = conn
+                .query_row("SELECT count(*) FROM extraction_jobs", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(jobs, 2, "冲突不得删行");
-            let schema_v: u32 = conn.query_row(
-                "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0),
-            ).unwrap();
+            let schema_v: u32 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(schema_v, 2);
             let has_col: i64 = conn.query_row(
                 "SELECT count(*) FROM pragma_table_info('extraction_jobs') WHERE name='claim_generation'",
@@ -661,12 +720,18 @@ mod tests {
         // 排除冲突后同一库可升级。
         {
             let conn = Connection::open(&db).unwrap();
-            conn.execute_batch("DELETE FROM extraction_jobs WHERE id='jB';").unwrap();
+            conn.execute_batch("DELETE FROM extraction_jobs WHERE id='jB';")
+                .unwrap();
         }
         let store = Store::open(&db, &migrations_dir()).unwrap();
-        let schema_v: u32 = store.conn().query_row(
-            "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0),
-        ).unwrap();
+        let schema_v: u32 = store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -717,11 +782,14 @@ mod tests {
         }
 
         let store = Store::open(&db, &migrations_dir()).unwrap();
-        let (schema_v, applied): (u32, i64) = store.conn().query_row(
-            "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (schema_v, applied): (u32, i64) = store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         // 迁移器应用全部未执行迁移：当前 checkout 会一路升到 SCHEMA_VERSION（≥4）。
         assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
         assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64);
@@ -742,28 +810,49 @@ mod tests {
         assert_eq!(row.6, 0);
         // 重复打开：迁移不重放。
         let store2 = Store::open(&db, &migrations_dir()).unwrap();
-        let applied2: i64 = store2.conn().query_row(
-            "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
-        ).unwrap();
+        let applied2: i64 = store2
+            .conn()
+            .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(applied2, memory_contract::SCHEMA_VERSION as i64);
 
         // 新作业写当前默认版本：extract_v3/admit_v2（doc5/03 §3，D5-3 已切换）。
         let mut store3 = Store::open_in_memory(&migrations_dir()).unwrap();
         let tdir = dir.join("tok");
         fs::create_dir_all(&tdir).unwrap();
-        store3.principal_add("t", "u", &tdir.join("u.token")).unwrap();
-        let scope = ScopeKey { tenant_id: "t".into(), user_id: "u".into() };
+        store3
+            .principal_add("t", "u", &tdir.join("u.token"))
+            .unwrap();
+        let scope = ScopeKey {
+            tenant_id: "t".into(),
+            user_id: "u".into(),
+        };
         let t = chrono::Utc::now();
         store3
-            .record_evidence(&scope, &memory_domain::Origin { host_id: "dsh".into(), agent_id: "a".into(), session_id: "s1".into() }, 1, "user", "user", &t, "以后回答我用中文")
+            .record_evidence(
+                &scope,
+                &memory_domain::Origin {
+                    host_id: "dsh".into(),
+                    agent_id: "a".into(),
+                    session_id: "s1".into(),
+                },
+                1,
+                "user",
+                "user",
+                &t,
+                "以后回答我用中文",
+            )
             .unwrap();
         let _ = store3.flush_window(&scope, "dsh", "s1", 1).unwrap();
-        let (pv, av): (String, String) = store3.conn().query_row(
-            "SELECT prompt_version, admission_version FROM extraction_jobs
+        let (pv, av): (String, String) = store3
+            .conn()
+            .query_row(
+                "SELECT prompt_version, admission_version FROM extraction_jobs
              WHERE tenant_id='t' AND user_id='u'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(pv, "extract_v3");
         assert_eq!(av, "admit_v2", "D5-3 切换后新作业写 extract_v3/admit_v2");
         assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v3");
@@ -824,34 +913,61 @@ mod tests {
         }
 
         let store = Store::open(&db, &migrations_dir()).unwrap();
-        let (schema_v, applied): (u32, i64) = store.conn().query_row(
-            "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (schema_v, applied): (u32, i64) = store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
-        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64, "0001—0005 各一条，无重放");
+        assert_eq!(
+            applied,
+            memory_contract::SCHEMA_VERSION as i64,
+            "0001—0005 各一条，无重放"
+        );
         // 旧行逐字段不变。
-        let memory_row: (String, String, String, String, i64) = store.conn().query_row(
-            "SELECT kind, claim, normalized_claim, status, version FROM memories
+        let memory_row: (String, String, String, String, i64) = store
+            .conn()
+            .query_row(
+                "SELECT kind, claim, normalized_claim, status, version FROM memories
              WHERE tenant_id='t1' AND user_id='u1' AND id='m1'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        ).unwrap();
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
         assert_eq!(
             memory_row,
-            ("fact".into(), "用户住在杭州".into(), "用户住在杭州".into(), "active".into(), 1)
+            (
+                "fact".into(),
+                "用户住在杭州".into(),
+                "用户住在杭州".into(),
+                "active".into(),
+                1
+            )
         );
-        let evidence_count: i64 = store.conn().query_row(
-            "SELECT count(*) FROM evidence_events WHERE tenant_id='t1' AND user_id='u1'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let evidence_count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM evidence_events WHERE tenant_id='t1' AND user_id='u1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(evidence_count, 1);
         // 新表存在且为空。
-        for table in ["memory_audit", "soul_profiles", "soul_revisions", "resident_pins", "mutation_receipts"] {
-            let count: i64 = store.conn().query_row(
-                &format!("SELECT count(*) FROM {table}"), [], |r| r.get(0),
-            ).unwrap();
+        for table in [
+            "memory_audit",
+            "soul_profiles",
+            "soul_revisions",
+            "resident_pins",
+            "mutation_receipts",
+        ] {
+            let count: i64 = store
+                .conn()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "{table} 应存在且为空");
         }
         // 新表 scope 外键生效：无 principal 的 scope 无法写入 soul。
@@ -862,12 +978,16 @@ mod tests {
              VALUES ('t1', 'ghost', 'a', 'x', 1, 'h', '2026-09-26T00:00:00Z', '2026-09-26T00:00:00Z')",
             [],
         );
-        assert!(fk_blocked.is_err(), "soul_profiles 必须受 principals 外键约束");
+        assert!(
+            fk_blocked.is_err(),
+            "soul_profiles 必须受 principals 外键约束"
+        );
         // 重复打开：迁移不重放。
         let store2 = Store::open(&db, &migrations_dir()).unwrap();
-        let applied2: i64 = store2.conn().query_row(
-            "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
-        ).unwrap();
+        let applied2: i64 = store2
+            .conn()
+            .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(applied2, memory_contract::SCHEMA_VERSION as i64);
         let _ = fs::remove_dir_all(&dir);
     }
