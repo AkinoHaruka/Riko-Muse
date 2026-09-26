@@ -55,6 +55,14 @@ pub enum StoreError {
     VersionConflict,
     #[error("目标含糊：最近用户消息未明确指认该记忆")]
     AmbiguousTarget,
+    #[error("Soul 正文超过 2000 个 Unicode 标量字符，拒绝导入")]
+    SoulBodyTooLong,
+    #[error("agent_id 不合法（须为 1—256 字符）")]
+    InvalidAgentId,
+    #[error("同一幂等键曾以不同请求体使用（IDEMPOTENCY_CONFLICT）")]
+    IdempotencyConflict,
+    #[error("幂等键不合法（1—128 个 ASCII [A-Za-z0-9._-]）")]
+    InvalidIdempotencyKey,
     #[error("时间溢出: {0}")]
     Time(String),
 }
@@ -65,6 +73,8 @@ mod probes;
 pub mod evidence;
 pub mod jobs;
 pub mod memories;
+pub mod resident;
+pub mod soul;
 
 pub use diagnostics::{
     CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem,
@@ -540,7 +550,7 @@ mod tests {
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
         assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
-        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64, "0001—0004 各一条，无重放");
+        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64, "0001 起各迁移一条，无重放");
         let scope = ScopeKey { tenant_id: "t1".into(), user_id: "u1".into() };
         let job = store.get_job(&scope, "j1").unwrap().unwrap();
         assert_eq!(job.status, "retryable_failed");
@@ -680,8 +690,9 @@ mod tests {
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
-        assert_eq!(schema_v, 4);
-        assert_eq!(applied, 4);
+        // 迁移器应用全部未执行迁移：当前 checkout 会一路升到 SCHEMA_VERSION（≥4）。
+        assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
+        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64);
         // 历史作业：旧列逐字段不变，新列回填 admit_v1。
         let row: (String, String, i32, Option<String>, String, String, i64) = store.conn().query_row(
             "SELECT status, prompt_version, attempts, error_code, window_key, admission_version,
@@ -702,7 +713,7 @@ mod tests {
         let applied2: i64 = store2.conn().query_row(
             "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(applied2, 4);
+        assert_eq!(applied2, memory_contract::SCHEMA_VERSION as i64);
 
         // 新作业写当前默认版本：extract_v3/admit_v2（doc5/03 §3，D5-3 已切换）。
         let mut store3 = Store::open_in_memory(&migrations_dir()).unwrap();
@@ -725,6 +736,107 @@ mod tests {
         assert_eq!(av, "admit_v2", "D5-3 切换后新作业写 extract_v3/admit_v2");
         assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v3");
         assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 手工构造"仅到 0004"的旧库（模拟 schema 4 现场）：按迁移加载器同算法记录 checksum。
+    fn build_v4_db(db: &Path) {
+        let migrations = migrations_dir();
+        let conn = Connection::open(db).unwrap();
+        for (name, file, v) in [
+            ("0001_init", "0001_init.sql", 1),
+            ("0002_prompt_version", "0002_prompt_version.sql", 2),
+            ("0003_job_recovery", "0003_job_recovery.sql", 3),
+            ("0004_admission_version", "0004_admission_version.sql", 4),
+        ] {
+            let sql = fs::read_to_string(migrations.join(file)).unwrap();
+            let sha = hex::encode(Sha256::digest(sql.as_bytes()));
+            conn.execute_batch(&sql).unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO schema_migrations (version, name, sha256, applied_at)
+                 VALUES ({v}, '{name}', '{sha}', '2026-09-26T00:00:00Z');"
+            ))
+            .unwrap();
+        }
+        drop(conn);
+    }
+
+    #[test]
+    fn migrate_v4_db_to_v5_soul_resident_keeps_old_rows() {
+        // doc6 卡 D6-1（doc6/02 §2/§9）：0005 只新增表，不改 0001—0004；
+        // v4 文件副本旧行逐字段不变，新表存在且为空，重复打开不重放。
+        let dir = std::env::temp_dir().join(format!("am-store-v5-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v4.db");
+        build_v4_db(&db);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at)
+                 VALUES ('t1', 'u1', 'x', 'active', '2026-09-26T00:00:00Z');
+                 INSERT INTO evidence_events
+                   (id, tenant_id, user_id, host_id, agent_id, session_id, event_seq, role,
+                    source_kind, occurred_at, received_at, content, content_sha256)
+                 VALUES ('e1', 't1', 'u1', 'dsh', 'a', 's1', 1, 'user', 'user',
+                         '2026-09-26T00:00:00Z', '2026-09-26T00:00:00Z', '原话', 'h');
+                 INSERT INTO memories
+                   (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256,
+                    source_class, status, version, origin_host_id, origin_agent_id,
+                    created_at, updated_at)
+                 VALUES ('m1', 't1', 'u1', 'fact', '用户住在杭州', '用户住在杭州', 'h1',
+                         'user_explicit', 'active', 1, 'dsh', 'a',
+                         '2026-09-26T00:00:00Z', '2026-09-26T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db, &migrations_dir()).unwrap();
+        let (schema_v, applied): (u32, i64) = store.conn().query_row(
+            "SELECT COALESCE(MAX(version),0), count(*) FROM schema_migrations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(schema_v, memory_contract::SCHEMA_VERSION);
+        assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64, "0001—0005 各一条，无重放");
+        // 旧行逐字段不变。
+        let memory_row: (String, String, String, String, i64) = store.conn().query_row(
+            "SELECT kind, claim, normalized_claim, status, version FROM memories
+             WHERE tenant_id='t1' AND user_id='u1' AND id='m1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            memory_row,
+            ("fact".into(), "用户住在杭州".into(), "用户住在杭州".into(), "active".into(), 1)
+        );
+        let evidence_count: i64 = store.conn().query_row(
+            "SELECT count(*) FROM evidence_events WHERE tenant_id='t1' AND user_id='u1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(evidence_count, 1);
+        // 新表存在且为空。
+        for table in ["memory_audit", "soul_profiles", "soul_revisions", "resident_pins", "mutation_receipts"] {
+            let count: i64 = store.conn().query_row(
+                &format!("SELECT count(*) FROM {table}"), [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(count, 0, "{table} 应存在且为空");
+        }
+        // 新表 scope 外键生效：无 principal 的 scope 无法写入 soul。
+        let mut store_mut = store;
+        let fk_blocked = store_mut.conn_mut().execute(
+            "INSERT INTO soul_profiles
+               (tenant_id, user_id, agent_id, body_md, version, body_sha256, created_at, updated_at)
+             VALUES ('t1', 'ghost', 'a', 'x', 1, 'h', '2026-09-26T00:00:00Z', '2026-09-26T00:00:00Z')",
+            [],
+        );
+        assert!(fk_blocked.is_err(), "soul_profiles 必须受 principals 外键约束");
+        // 重复打开：迁移不重放。
+        let store2 = Store::open(&db, &migrations_dir()).unwrap();
+        let applied2: i64 = store2.conn().query_row(
+            "SELECT count(*) FROM schema_migrations", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(applied2, memory_contract::SCHEMA_VERSION as i64);
         let _ = fs::remove_dir_all(&dir);
     }
 }
