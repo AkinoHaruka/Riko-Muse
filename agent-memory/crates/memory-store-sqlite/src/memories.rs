@@ -368,6 +368,26 @@ impl Store {
         Ok(RememberOutcome::Created { memory_id, version: 1 })
     }
 
+    /// exact 召回（doc6/09 §4.B.1）：scope 内同 kind+claim hash 的 active 记忆。
+    pub fn memories_by_exact_hash(
+        &self,
+        scope: &ScopeKey,
+        kind: &str,
+        hash: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, version FROM memories
+             WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND claim_sha256=?4 AND status='active'
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, kind, hash, limit as i64],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// GET /v1/memories/{id}。普通读只返回 active；非 active 视为不存在（doc/12 §5）。
     pub fn get_memory(&self, scope: &ScopeKey, memory_id: &str) -> Result<Option<MemoryRow>, StoreError> {
         let row = self
@@ -786,6 +806,8 @@ impl Store {
                 format!("{{\"old_memory_id\":\"{memory_id}\",\"old_claim_hash\":\"{claim_hash}\"}}")
             ],
         )?;
+        // D6-8：旧记忆向量失效与业务变更同事务（doc6/02 §4）。
+        Self::stale_vectors_in_tx(&tx, scope, "memory", memory_id)?;
         Self::mark_index_dirty(&tx)?;
         tx.commit()?;
         // 索引事务：旧删新插。
@@ -868,6 +890,8 @@ impl Store {
              VALUES (?1,?2,?3,'user',?4,'memory_forget',?5,?6,'{\"raw_evidence_retained\":true}')",
             params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, req.user_evidence_id, memory_id, now],
         )?;
+        // D6-8：向量失效与业务变更同事务（doc6/02 §4）；索引队列同步作废。
+        Self::stale_vectors_in_tx(&tx, scope, "memory", memory_id)?;
         Self::mark_index_dirty(&tx)?;
         tx.commit()?;
         if let Err(e) = self.reindex_memory(scope, memory_id, &claim, false) {

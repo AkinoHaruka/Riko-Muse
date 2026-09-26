@@ -5,11 +5,12 @@ use serde::Serialize;
 
 /// 协议版本：HTTP v1 语义不变（doc/12）。DSH 适配器握手依据。
 pub const PROTOCOL_VERSION: u32 = 1;
-/// 数据库模式版本：随迁移文件递增（0001→1，…，0004→4，0005→5，0006→6）。worker 按作业行
+/// 数据库模式版本：随迁移文件递增（0001→1，…，0004→4，0005→5，0006→6，
+/// 0007→7 Dream，0008→8 语义索引，0009→9 语义裁决）。worker 按作业行
 /// prompt_version/admission_version 分别选提示词与准入规则。0005 起新增表
 /// （doc6/02）：0005 soul/resident/audit/receipts；0006 派生知识文档、问题目录、
 /// 整理作业与页面索引；历史迁移 0001—0004 冻结不改。
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
@@ -28,6 +29,10 @@ pub const EXTRACT_PROMPT_VERSION_V3: &str = "extract_v3";
 pub const ADMISSION_VERSION_V1: &str = "admit_v1";
 pub const ADMISSION_VERSION: &str = "admit_v2";
 pub const ADMISSION_VERSION_V2: &str = "admit_v2";
+
+/// D6-8（doc6/09 §3）：新 Dream 作业专用准入/裁决版本；admit_v1/v2 冻结不改。
+pub const ADMISSION_VERSION_V3: &str = "admit_v3";
+pub const ADJUDICATION_VERSION_V1: &str = "adjudicate_v1";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----
 /// 自动上下文默认最多 5 条原子记忆。
@@ -65,6 +70,21 @@ pub const SINGLE_CHAR_SCAN_LIMIT: usize = 500;
 pub const SEARCH_PER_CHANNEL_LIMIT: usize = 100;
 /// RRF 融合常数 k=60（doc/13 §6，取自 Hindsight 实现）。
 pub const RRF_K: f64 = 60.0;
+
+// ---- D6-8 语义支路与裁决（doc6/04 §2、doc6/09）----
+/// 查询向量支路单 scope 就绪向量扫描上限；超过报 limit_exceeded 只做词法。
+pub const SEMANTIC_SCAN_LIMIT: usize = 10000;
+/// 实时 query embedding 超时（doc6/04 §2）。
+pub const QUERY_EMBEDDING_TIMEOUT_MS: u64 = 800;
+/// 裁决候选召回的混合 top-K（doc6/09 §4.2 初值）。
+pub const ADJUDICATE_RECALL_TOP_K: usize = 20;
+/// recency 因子（doc6/04 §3.1 Hindsight 初值，仅 episode Retrieved 排序）。
+pub const RECENCY_MODE_DEFAULT: &str = "linear";
+pub const RECENCY_HALFLIFE_DAYS: f64 = 90.0;
+pub const RECENCY_FRESHNESS_MIN: f64 = 0.1;
+pub const RECENCY_SCALE: f64 = 0.2;
+/// episode recency 越级界限：base relevance 相差 ≥20% 时低分不得靠 recency 越级。
+pub const RECENCY_OVERRIDE_RATIO: f64 = 1.20;
 /// 宿主 ID 最大长度。
 pub const HOST_ID_MAX_CHARS: usize = 256;
 

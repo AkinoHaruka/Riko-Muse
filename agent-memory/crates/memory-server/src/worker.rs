@@ -97,7 +97,7 @@ mod tests {
     #[tokio::test]
     async fn flush_idempotent_and_worker_promotes_candidates() {
         let (store, scope) = setup("promote");
-        let state = AppState { store: store.clone() };
+        let state = AppState { store: store.clone(), embedding: None, rerank: None, recency_mode: "none" };
         {
             let mut g = store.lock().unwrap();
             ingest_user(&mut g, &scope, 1, "以后回答我用中文");
@@ -175,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn bad_json_fails_job_without_losing_l0() {
         let (store, scope) = setup("badjson");
-        let state = AppState { store: store.clone() };
+        let state = AppState { store: store.clone(), embedding: None, rerank: None, recency_mode: "none" };
         let ev = {
             let mut g = store.lock().unwrap();
             ingest_user(&mut g, &scope, 1, "以后回答我用中文")
@@ -538,7 +538,7 @@ mod tests {
         // doc2/05 §3：worker 按作业行 prompt_version 选提示词——老版本作业用老提示词，
         // 未知版本显式失败，不得用"最新规则"处理旧作业。
         let (store, scope) = setup("dispatch");
-        let state = AppState { store: store.clone() };
+        let state = AppState { store: store.clone(), embedding: None, rerank: None, recency_mode: "none" };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
         for (session, content) in [
             ("sv3", "以后回答我用中文"),
@@ -648,7 +648,7 @@ mod tests {
         // doc5/03 §5 + doc5/07 C：同一候选，旧作业（extract_v2/admit_v1）保持旧判定，
         // 新作业（extract_v3/admit_v2）用新规则；revision reason 表明实际策略版本。
         let (store, scope) = setup("admver");
-        let state = AppState { store: store.clone() };
+        let state = AppState { store: store.clone(), embedding: None, rerank: None, recency_mode: "none" };
         for session in ["s_old", "s_new"] {
             let t = chrono::Utc::now();
             let origin = memory_domain::Origin {

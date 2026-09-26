@@ -28,6 +28,8 @@ use memory_store_sqlite::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+mod dream_worker;
+mod embedding;
 mod worker;
 
 /// 构建标识：优先取编译期注入的 commit，否则 "dev"。
@@ -101,6 +103,12 @@ enum Commands {
     },
     /// 从 active 规范表重建 FTS/grams（不复活 forgotten）
     RebuildIndex {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// D6-8：为全部 active 记忆与 published 页面补建语义索引队列（embedding
+    /// 已配置时才有意义；按对象当前版本冻结，幂等）
+    ReindexSemantic {
         #[arg(long)]
         config: PathBuf,
     },
@@ -389,6 +397,22 @@ struct Config {
     model_timeout_secs: Option<u64>,
     /// 额外请求体字段（provider 专有开关，如 enable_thinking=false），顶层合并。
     model_extra_json: Option<toml::Value>,
+
+    // ---- D6-8 语义支路（doc6/04 §2：全部显式配置；未配置即 disabled）----
+    /// OpenAI 兼容 embeddings endpoint 完整 URL（不猜路径）。
+    embedding_endpoint: Option<String>,
+    embedding_model: Option<String>,
+    embedding_key_file: Option<PathBuf>,
+    /// 预期向量维度（配置给出；响应维度不符即失败）。
+    embedding_dimensions: Option<usize>,
+    /// embeddings 请求超时秒数（默认 30；实时 query embedding 另受 800ms 总预算约束）。
+    embedding_timeout_secs: Option<u64>,
+    /// 专用 rerank endpoint（Jina/Cohere 兼容形状）；不配 reranker 时保留 RRF 顺序。
+    rerank_endpoint: Option<String>,
+    rerank_model: Option<String>,
+    rerank_key_file: Option<PathBuf>,
+    /// episode Retrieved 排序的 recency 模式：linear|exponential|none（默认 linear）。
+    recency_mode: Option<String>,
 }
 
 impl Config {
@@ -418,6 +442,11 @@ impl Config {
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
+    /// D6-8：embedding/reranker 客户端（未配置为 None，语义支路降级）。
+    embedding: Option<Arc<embedding::EmbeddingClient>>,
+    rerank: Option<Arc<embedding::RerankClient>>,
+    /// recency 模式（doc6/04 §3.1：linear|exponential|none，默认 linear）。
+    recency_mode: &'static str,
 }
 
 #[tokio::main]
@@ -431,7 +460,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "[memoryd] 迁移完成：{}",
                 store.doctor_summary().unwrap_or_else(|e| format!("诊断失败: {e}"))
             );
-            let state = AppState { store: Arc::new(Mutex::new(store)) };
+            // D6-8：embedding/reranker 客户端（全部显式配置；未配置即 disabled）。
+            let embedding_client = match (&cfg.embedding_endpoint, &cfg.embedding_model, &cfg.embedding_key_file, cfg.embedding_dimensions) {
+                (Some(endpoint), Some(name), Some(key_file), Some(dims)) => {
+                    let api_key = std::fs::read_to_string(key_file)
+                        .map_err(|e| format!("读取 embedding 密钥文件失败 {}: {e}", key_file.display()))?
+                        .trim()
+                        .to_string();
+                    if api_key.is_empty() && !cfg.model_allow_empty_key.unwrap_or(false) {
+                        return Err("embedding 密钥文件为空；如确需无密钥端点请显式设置 model_allow_empty_key=true".into());
+                    }
+                    let client = embedding::EmbeddingClient::new(embedding::EmbeddingConfig {
+                        endpoint: endpoint.clone(),
+                        model: name.clone(),
+                        api_key,
+                        timeout: std::time::Duration::from_secs(cfg.embedding_timeout_secs.unwrap_or(30)),
+                        dimensions: dims,
+                    })
+                    .map_err(|e| format!("embedding 客户端初始化失败: {e}"))?;
+                    eprintln!("[memoryd] 语义支路启用：embedding model={name} dims={dims}");
+                    Some(Arc::new(client))
+                }
+                _ => {
+                    eprintln!("[memoryd] 语义支路未配置：semantic_status=disabled，只做词法");
+                    None
+                }
+            };
+            let rerank_client = match (&cfg.rerank_endpoint, &cfg.rerank_model, &cfg.rerank_key_file) {
+                (Some(endpoint), Some(name), Some(key_file)) => {
+                    let api_key = std::fs::read_to_string(key_file)
+                        .map_err(|e| format!("读取 rerank 密钥文件失败 {}: {e}", key_file.display()))?
+                        .trim()
+                        .to_string();
+                    if api_key.is_empty() && !cfg.model_allow_empty_key.unwrap_or(false) {
+                        return Err("rerank 密钥文件为空；如确需无密钥端点请显式设置 model_allow_empty_key=true".into());
+                    }
+                    let client = embedding::RerankClient::new(embedding::RerankConfig {
+                        endpoint: endpoint.clone(),
+                        model: name.clone(),
+                        api_key,
+                        timeout: std::time::Duration::from_secs(cfg.embedding_timeout_secs.unwrap_or(30)),
+                    })
+                    .map_err(|e| format!("reranker 客户端初始化失败: {e}"))?;
+                    eprintln!("[memoryd] 精排启用：reranker model={name}");
+                    Some(Arc::new(client))
+                }
+                _ => None,
+            };
+            let state = AppState {
+                store: Arc::new(Mutex::new(store)),
+                embedding: embedding_client.clone(),
+                rerank: rerank_client.clone(),
+                recency_mode: match cfg.recency_mode.as_deref() {
+                    Some("none") => "none",
+                    Some("exponential") => "exponential",
+                    _ => memory_contract::RECENCY_MODE_DEFAULT,
+                },
+            };
             // 提取 worker：模型配置齐全才启动；端点不可达时作业可见失败，不影响手工记忆（doc/09）。
             let model_cfg = match (&cfg.model_endpoint, &cfg.model_name, &cfg.model_key_file) {
                 (Some(endpoint), Some(name), Some(key_file)) => {
@@ -462,7 +547,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => None,
             };
+            // Dream 管线的 chat 配置独立 clone（worker::spawn_worker 内部会再构建客户端）。
+            let model_cfg_dream = model_cfg.clone();
             worker::spawn_worker(state.clone(), model_cfg);
+            // D6-8：Dream 管线 + 语义索引 worker（doc6/10 §8 受控 runner）。
+            // chat 模型复用提取端点配置；embedding 由语义支路配置决定。
+            dream_worker::spawn_dream_pipeline(
+                state.clone(),
+                model_cfg_dream,
+                embedding_client,
+            );
             // D6-7：Auto Dream scheduler（doc6/10 §4.2，默认启用；memoryd 内置受控
             // runner，doc6/10 §8 路径——由持久 trigger/jobs 驱动）。周期 15 分钟
             // tick；每 scope 24 小时一次 + 空闲 15 分钟 + ≥1 条新 user event 才入队。
@@ -676,6 +770,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
             store.backup_to(&out)?;
             println!("备份完成：{}", out.display());
+            Ok(())
+        }
+        Commands::ReindexSemantic { config } => {
+            let cfg = Config::load(&config)?;
+            if cfg.embedding_model.is_none() {
+                return Err("embedding 未配置：reindex-semantic 无意义（语义支路 disabled）".into());
+            }
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let n = store.semantic_reindex_all(cfg.embedding_model.as_deref().unwrap())?;
+            println!("reindex-semantic 完成：入队 {n} 个对象（worker 将按当前版本生成向量）");
             Ok(())
         }
     }
@@ -1397,27 +1501,33 @@ async fn remember_memory(
         guard.remember(&scope, &origin, &body.user_evidence_id, &body.quote, kind)
     };
     match outcome {
-        Ok(RememberOutcome::Created { memory_id, version }) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "request_id": req_id.0,
-                "memory_id": memory_id,
-                "version": version,
-                "status": "active"
-            })),
-        )
-            .into_response(),
-        Ok(RememberOutcome::Dedup { memory_id, version }) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "request_id": req_id.0,
-                "memory_id": memory_id,
-                "version": version,
-                "status": "active",
-                "deduplicated": true
-            })),
-        )
-            .into_response(),
+        Ok(RememberOutcome::Created { memory_id, version }) => {
+            enqueue_semantic_index(&state, &scope, "memory", &memory_id);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "request_id": req_id.0,
+                    "memory_id": memory_id,
+                    "version": version,
+                    "status": "active"
+                })),
+            )
+                .into_response()
+        }
+        Ok(RememberOutcome::Dedup { memory_id, version }) => {
+            enqueue_semantic_index(&state, &scope, "memory", &memory_id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "request_id": req_id.0,
+                    "memory_id": memory_id,
+                    "version": version,
+                    "status": "active",
+                    "deduplicated": true
+                })),
+            )
+                .into_response()
+        }
         Err(StoreError::QuoteMismatch) => err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::QuoteMismatch, "quote 不是该用户消息的连续原文子串"),
         Err(StoreError::StaleUserEvidence) | Err(StoreError::EvidenceNotFound) => {
             err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件或角色不符")
@@ -2223,6 +2333,82 @@ fn budget_check(
     Ok(v)
 }
 
+/// episode recency 因子（doc6/04 §3.1，Hindsight 可追溯初值；仅 Retrieved 排序
+/// 信号）：linear `clamp(1-age/365,0.1,1)`；exponential `0.5^(age/90)` 下限 0.4
+/// （保证乘数区间 ⊂ [0.92,1.10]，从而 20% base 差距不被 recency 越级）；none 恒 1。
+/// 无可用时间戳不加不减；未来时间按 0 处理（不额外奖励）。
+fn recency_factor(mode: &str, occurred_at: Option<&str>, updated_at: &str, now: &str) -> f64 {
+    if mode == "none" {
+        return 1.0;
+    }
+    let ts = occurred_at.filter(|s| !s.is_empty()).unwrap_or(updated_at);
+    let (Ok(t), Ok(n)) = (
+        chrono::DateTime::parse_from_rfc3339(ts),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) else {
+        return 1.0;
+    };
+    let age_days = ((n - t).num_minutes().max(0) as f64) / 1440.0;
+    let freshness = if mode == "exponential" {
+        0.5f64.powf(age_days / memory_contract::RECENCY_HALFLIFE_DAYS).clamp(0.4, 1.0)
+    } else {
+        (1.0 - age_days / 365.0).clamp(memory_contract::RECENCY_FRESHNESS_MIN, 1.0)
+    };
+    1.0 + memory_contract::RECENCY_SCALE * (freshness - 0.5)
+}
+
+#[cfg(test)]
+mod recency_tests {
+    use super::recency_factor;
+
+    const NOW: &str = "2026-09-26T00:00:00Z";
+
+    #[test]
+    fn recency_bounds_and_modes() {
+        // doc6/04 §3.1：乘数区间 [0.92,1.10]；新鲜 episode ≈1.1 上限；无时间戳不加不减。
+        let fresh = recency_factor("linear", Some("2026-09-26T00:00:00Z"), NOW, NOW);
+        let old = recency_factor("linear", Some("2020-01-01T00:00:00Z"), NOW, NOW);
+        assert!((fresh - 1.10).abs() < 1e-9, "新鲜=1.10 上限，实际 {fresh}");
+        assert!((old - 0.92).abs() < 1e-9, "极旧=0.92 下限，实际 {old}");
+        // 无可用时间戳（occurred_at 缺失且 updated_at 不可解析）→ freshness=0.5 不加不减。
+        assert!((recency_factor("linear", None, "bad-ts", NOW) - 1.0).abs() < 1e-9);
+        // none 恒 1；未来时间按 0 处理（钳制，不额外奖励）。
+        assert_eq!(recency_factor("none", Some("2026-09-26T00:00:00Z"), NOW, NOW), 1.0);
+        let future = recency_factor("linear", Some("2030-01-01T00:00:00Z"), NOW, NOW);
+        assert!(future <= 1.10, "未来时间不奖励");
+    }
+
+    #[test]
+    fn recency_cannot_override_20pct_base_gap() {
+        // 乘数区间 [0.92,1.10] ⇒ 最大越级比 1.10/0.92 < 1.20：
+        // base 相差 ≥20% 的两条 episode，低分项不得仅靠 recency 越级（doc6/04 §3.1）。
+        for age_days in [0i64, 30, 90, 200, 400] {
+            let ts = (chrono::DateTime::parse_from_rfc3339(NOW).unwrap()
+                - chrono::Duration::days(age_days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            let hi = recency_factor("linear", Some(&ts), NOW, NOW);
+            let lo = recency_factor("exponential", Some(&ts), NOW, NOW);
+            let (f_min, f_max) = (hi.min(lo), hi.max(lo));
+            assert!(
+                f_max / f_min < memory_contract::RECENCY_OVERRIDE_RATIO,
+                "age={age_days} 天时因子比 {} 超界",
+                f_max / f_min
+            );
+        }
+    }
+}
+
+/// D6-8：对象写入后入队异步向量索引（doc6/02 §4）。embedding 未配置时不入队
+/// （索引队列为空 = 语义支路 disabled）。
+fn enqueue_semantic_index(state: &AppState, scope: &ScopeKey, object_kind: &str, object_id: &str) {
+    if let Some(emb) = &state.embedding {
+        let mut g = state.store.lock().unwrap();
+        if let Err(e) = g.semantic_enqueue(scope, object_kind, object_id, emb.model_id()) {
+            eprintln!("[memoryd] 语义索引入队失败 {object_kind}/{object_id}: {e}");
+        }
+    }
+}
+
 async fn get_resident(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
@@ -2339,8 +2525,13 @@ async fn post_context_bundle(
         Ok(s) => s,
         Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     };
-    // retrieved 段：词法检索（doc6/04 §2 词法路线），排除 resident 已含与冲突 ID。
+    // retrieved 段（doc6/04 §2/§3，D6-8）：各通道独立取候选与排名 → 单次全局 RRF
+    // → 可选 cross-encoder 精排 → 对象复核（active/published/有效期）→ 排除
+    // resident → 页/原子覆盖去重 → episode recency → 预算装配。分数仅用于排序。
     let mut lexical_status = "empty_query";
+    let mut semantic_status = if state.embedding.is_some() { "ok" } else { "disabled" };
+    let mut rerank_status = if state.rerank.is_some() { "ok" } else { "disabled" };
+    let mut page_index_status = "not_applicable";
     let mut retrieved_text = String::new();
     let mut retrieved_items: Vec<serde_json::Value> = Vec::new();
     let mut retrieved_omitted: Vec<serde_json::Value> = Vec::new();
@@ -2350,32 +2541,202 @@ async fn post_context_bundle(
         source_versions.insert(i.memory_id.clone(), serde_json::json!(i.version));
     }
     if !query_trim.is_empty() {
-        let resident_ids: Vec<&str> = selection
+        let resident_ids: std::collections::HashSet<String> = selection
             .items
             .iter()
-            .map(|i| i.memory_id.as_str())
-            .chain(selection.conflict_ids.iter().map(|s| s.as_str()))
+            .map(|i| i.memory_id.clone())
+            .chain(selection.conflict_ids.iter().cloned())
             .collect();
-        let mut used_chars_retrieved = 0usize;
-        let search = {
+        let lane_k = q_items.max(memory_contract::ADJUDICATE_RECALL_TOP_K);
+        // ---- 通道 1：词法记忆（FTS+grams 内部融合，单一词法通道排名）。----
+        let search_res = {
             let guard = state.store.lock().unwrap();
-            guard.search_memories(&scope, query_trim, q_items, false)
+            guard.search_memories(&scope, query_trim, lane_k, false)
         };
-        match search {
-            Ok((hits, index_degraded)) => {
-                lexical_status = if index_degraded { "index_degraded" } else { "ok" };
-                let mut used_chars = 0usize;
-                for hit in hits {
-                    if resident_ids.contains(&hit.memory_id.as_str()) {
-                        continue; // 排除 resident 已含/冲突 ID（doc6/04 §3）。
+        let (mem_lex, index_degraded) = match search_res {
+            Ok(v) => v,
+            Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+        };
+        lexical_status = if index_degraded { "index_degraded" } else { "ok" };
+        // ---- 通道 2：词法页面（published；读时复核在装配段统一做）。----
+        let page_lex: Vec<String> = {
+            let guard = state.store.lock().unwrap();
+            guard.page_fts_search(&scope, query_trim, lane_k).unwrap_or_default()
+        };
+        page_index_status = "ok";
+        // ---- 通道 3/4：向量（embedding 已配置才启用；query embedding 800ms 预算，
+        // doc6/04 §2）。ready 总数达上限 → limit_exceeded 只做词法。----
+        let mut mem_vec: Vec<String> = Vec::new();
+        let mut page_vec: Vec<String> = Vec::new();
+        if let Some(emb) = &state.embedding {
+            let qtexts = vec![query_trim.to_string()];
+            let fut = emb.embed(&qtexts);
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(memory_contract::QUERY_EMBEDDING_TIMEOUT_MS),
+                fut,
+            )
+            .await
+            {
+                Ok(Ok(vs)) if !vs.is_empty() => {
+                    let qv = &vs[0];
+                    let guard = state.store.lock().unwrap();
+                    let scan_m = guard.semantic_scan(&scope, "memory", emb.model_id(), qv, lane_k);
+                    let scan_p = guard.semantic_scan(&scope, "page", emb.model_id(), qv, lane_k);
+                    match (scan_m, scan_p) {
+                        (Ok((mh, mc)), Ok((ph, pc))) => {
+                            if mc >= memory_contract::SEMANTIC_SCAN_LIMIT
+                                || pc >= memory_contract::SEMANTIC_SCAN_LIMIT
+                            {
+                                semantic_status = "limit_exceeded"; // 只做词法（doc6/04 §2）
+                            } else {
+                                mem_vec = mh.into_iter().map(|(id, _)| id).collect();
+                                page_vec = ph.into_iter().map(|(id, _)| id).collect();
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            semantic_status = "unavailable";
+                            eprintln!("[bundle] 向量扫描失败: {e}");
+                        }
                     }
-                    let entry = format!("- [memory: {}] {}", hit.memory_id, hit.claim);
+                }
+                Ok(Ok(_)) => { semantic_status = "unavailable"; } // 空向量
+                Ok(Err(e)) => {
+                    semantic_status = "unavailable";
+                    eprintln!("[bundle] query embedding 失败: {e}");
+                }
+                Err(_) => {
+                    semantic_status = "unavailable"; // 800ms 超时，降级词法
+                    eprintln!("[bundle] query embedding 超时（{}ms）", memory_contract::QUERY_EMBEDDING_TIMEOUT_MS);
+                }
+            }
+        }
+        // ---- 对象复核与信息补全（active/published/有效期；不信任索引缓存）。----
+        let mut mem_ids: Vec<String> = mem_lex.iter().map(|h| h.memory_id.clone()).collect();
+        mem_ids.extend(mem_vec.iter().cloned());
+        mem_ids.dedup();
+        let mut page_ids: Vec<String> = page_lex.clone();
+        page_ids.extend(page_vec.iter().cloned());
+        page_ids.dedup();
+        let mut mem_info: std::collections::HashMap<String, memory_store_sqlite::memories::MemoryRow> =
+            std::collections::HashMap::new();
+        {
+            let guard = state.store.lock().unwrap();
+            for mid in &mem_ids {
+                if let Ok(Some(m)) = guard.get_memory(&scope, mid) {
+                    mem_info.insert(mid.clone(), m);
+                }
+            }        }
+        let mut page_info: std::collections::HashMap<String, memory_store_sqlite::pages::PageRow> =
+            std::collections::HashMap::new();
+        {
+            let guard = state.store.lock().unwrap();
+            for pid in &page_ids {
+                if let Ok(Some(p)) = guard.get_page(&scope, pid, &now) {
+                    page_info.insert(pid.clone(), p);
+                }
+            }
+        }
+        // ---- 单次全局 RRF（doc6/04 §2：禁止向量支路内部再 RRF）。----
+        let mut channels: Vec<(&str, Vec<String>)> = Vec::new();
+        channels.push(("lexical", mem_lex.iter().filter(|h| mem_info.contains_key(&h.memory_id)).map(|h| h.memory_id.clone()).collect()));
+        channels.push(("page", page_lex.iter().filter(|p| page_info.contains_key(*p)).cloned().collect()));
+        if semantic_status == "ok" {
+            channels.push(("semantic", mem_vec.iter().filter(|m| mem_info.contains_key(*m)).cloned().collect()));
+            channels.push(("semantic", page_vec.iter().filter(|p| page_info.contains_key(*p)).cloned().collect()));
+        }
+        let mut rrf: std::collections::HashMap<String, (Vec<u32>, Vec<&str>)> =
+            std::collections::HashMap::new();
+        for (name, ch) in &channels {
+            for (i, key) in ch.iter().enumerate() {
+                let entry = rrf.entry(key.clone()).or_default();
+                entry.0.push(i as u32 + 1);
+                if !entry.1.contains(name) {
+                    entry.1.push(name);
+                }
+            }
+        }
+        let mut scored: Vec<(String, f64)> = rrf
+            .iter()
+            .map(|(k, (ranks, _))| (k.clone(), memory_recall::rrf_score(ranks)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // ---- cross-encoder 后置精排（可选；有界 top-N；失败保留 RRF 顺序并报告）。
+        let n_rerank = scored.len().min((q_items * 3).max(10));
+        if n_rerank > 1 {
+            if let Some(rk) = &state.rerank {
+                let docs: Vec<String> = scored[..n_rerank]
+                    .iter()
+                    .map(|(k, _)| match k.split_once(':') {
+                        Some(("m", id)) => mem_info.get(id).map(|m| m.claim.clone()).unwrap_or_default(),
+                        Some(("p", id)) => page_info.get(id).map(|p| p.title.clone()).unwrap_or_default(),
+                        _ => String::new(),
+                    })
+                    .collect();
+                let fut = rk.rerank(query_trim, &docs, n_rerank);
+                match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+                    Ok(Ok(order)) if !order.is_empty() => {
+                        rerank_status = "success";
+                        let mut reranked: Vec<(String, f64)> = Vec::with_capacity(n_rerank);
+                        for (idx, s) in order {
+                            if let Some((k, _)) = scored.get(idx) {
+                                reranked.push((k.clone(), s));
+                            }
+                        }
+                        let tail: Vec<(String, f64)> = scored[n_rerank..].to_vec();
+                        scored = reranked;
+                        scored.extend(tail);
+                    }
+                    Ok(Err(e)) => {
+                        rerank_status = "unavailable";
+                        eprintln!("[bundle] 精排失败（保留 RRF 顺序）: {e}");
+                    }
+                    Ok(Ok(_)) => rerank_status = "unavailable",
+                    Err(_) => {
+                        rerank_status = "unavailable";
+                        eprintln!("[bundle] 精排超时（保留 RRF 顺序）");
+                    }
+                }
+            }
+        }
+        // ---- episode recency（doc6/04 §3.1：仅 episode 的 Retrieved 排序信号；
+        // fact/preference/instruction/Soul/pinned Resident 因子恒 1）。----
+        for (k, base) in scored.iter_mut() {
+            if let Some(("m", id)) = k.split_once(':') {
+                if let Some(m) = mem_info.get(id) {
+                    if m.kind == "episode" {
+                        let f = recency_factor(
+                            state.recency_mode,
+                            m.occurred_at.as_deref(),
+                            &m.updated_at,
+                            &now,
+                        );
+                        *base *= f;
+                    }
+                }
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // ---- 装配：排除 resident → 页/原子覆盖去重 → 预算整条组装。----
+        let mut covered: std::collections::HashSet<String> = resident_ids;
+        let mut used_chars_retrieved = 0usize;
+        let channel_of = |k: &str, rrf: &std::collections::HashMap<String, (Vec<u32>, Vec<&str>)>| -> String {
+            rrf.get(k).map(|(_, names)| names.join("+")).unwrap_or_else(|| "fused".into())
+        };
+        for (key, _score) in &scored {
+            match key.split_once(':') {
+                Some(("m", mid)) => {
+                    if covered.contains(mid) {
+                        continue; // resident 已含/冲突 ID 或已被页面覆盖。
+                    }
+                    let Some(m) = mem_info.get(mid) else { continue };
+                    let refs: Vec<String> = m.evidence_refs.iter().map(|(e, _, _)| e.clone()).collect();
+                    let entry = format!("- [memory: {}] {}", m.memory_id, m.claim);
                     let entry_chars = entry.chars().count();
                     if retrieved_items.len() >= q_items
                         || (used_chars_retrieved > 0 && used_chars_retrieved + entry_chars + 1 > q_chars)
                     {
                         retrieved_omitted.push(serde_json::json!({
-                            "memory_id": hit.memory_id,
+                            "memory_id": mid,
                             "reason": if retrieved_items.len() >= q_items { "ITEM_LIMIT" } else { "CHAR_LIMIT" },
                         }));
                         retrieved_truncated = true;
@@ -2390,43 +2751,20 @@ async fn post_context_bundle(
                     }
                     retrieved_items.push(serde_json::json!({
                         "kind": "memory",
-                        "memory_id": hit.memory_id,
-                        "memory_kind": hit.kind,
-                        "claim": hit.claim,
-                        "reason": "lexical",
-                        "evidence_ids": hit.evidence_refs,
+                        "memory_id": m.memory_id,
+                        "memory_kind": m.kind,
+                        "claim": m.claim,
+                        "reason": channel_of(key, &rrf),
+                        "evidence_ids": refs,
                     }));
-                    source_versions.insert(hit.memory_id.clone(), serde_json::json!(hit.version));
+                    source_versions.insert(m.memory_id.clone(), serde_json::json!(m.version));
+                    covered.insert(mid.to_string());
                 }
-            }
-            Err(e) => {
-                return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string())
-            }
-        }
-        // 页面通道（D6-6，doc6/04 §3）：page_fts 命中 published 页（get_page 读时
-        // 复核来源）；标 derived=true、列 sources；与 L1 重合按覆盖规则去重。
-        let page_hit_ids = {
-            let guard = state.store.lock().unwrap();
-            guard.page_fts_search(&scope, query_trim, q_items)
-        };
-        match page_hit_ids {
-            Ok(ids) => {
-                let mut covered: std::collections::HashSet<String> =
-                    resident_ids.iter().map(|s| s.to_string()).collect();
-                for i in retrieved_items.iter() {
-                    if let Some(mid) = i.get("memory_id").and_then(|v| v.as_str()) {
-                        covered.insert(mid.to_string());
-                    }
-                }
-                for pid in ids {
-                    if covered.contains(&pid) {
+                Some(("p", pid)) => {
+                    if covered.contains(pid) {
                         continue; // resident 已含该页。
                     }
-                    let page = {
-                        let guard = state.store.lock().unwrap();
-                        guard.get_page(&scope, &pid, &now)
-                    };
-                    let Ok(Some(p)) = page else { continue }; // 来源失效 → 不可见
+                    let Some(p) = page_info.get(pid) else { continue }; // 来源失效 → 不可见
                     let source_ids: Vec<String> = p.sources.iter().map(|(id, _)| id.clone()).collect();
                     let uncovered = source_ids.iter().filter(|s| !covered.contains(*s)).count();
                     let min_needed = if p.document_kind == "mental_model" { 1 } else { 2 };
@@ -2459,19 +2797,16 @@ async fn post_context_bundle(
                         "document_kind": p.document_kind,
                         "title": p.title,
                         "derived": true,
-                        "reason": "lexical",
+                        "reason": channel_of(key, &rrf),
                         "version": p.version,
                         "source_memory_ids": p.sources,
                     }));
                     source_versions.insert(p.page_id.clone(), serde_json::json!(p.version));
                 }
-            }
-            Err(e) => {
-                return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string())
+                _ => {}
             }
         }
     }
-    // D6-8 前：语义/精排/页面索引未实施，状态明确 disabled（doc6/04 §4）。
     Json(serde_json::json!({
         "request_id": req_id.0,
         "agent_id": req.agent_id,
@@ -2483,9 +2818,9 @@ async fn post_context_bundle(
             "truncated": retrieved_truncated,
         },
         "lexical_status": lexical_status,
-        "semantic_status": "disabled",
-        "rerank_status": "disabled",
-        "page_index_status": "not_applicable",
+        "semantic_status": semantic_status,
+        "rerank_status": rerank_status,
+        "page_index_status": page_index_status,
         "source_versions": source_versions,
     }))
     .into_response()
@@ -3014,14 +3349,18 @@ async fn correct_memory(
         replacement_quote: body.replacement_quote,
     };
     match state.store.lock().unwrap().correct_memory(&scope, &memory_id, &req) {
-        Ok(out) => Json(serde_json::json!({
-            "request_id": req_id.0,
-            "old_memory_id": out.old_memory_id,
-            "new_memory_id": out.new_memory_id,
-            "old_version": out.old_version,
-            "new_version": out.new_version
-        }))
-        .into_response(),
+        Ok(out) => {
+            // D6-8：新记忆入队向量索引（旧记忆向量已在 correct 事务内置 stale）。
+            enqueue_semantic_index(&state, &scope, "memory", &out.new_memory_id);
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "old_memory_id": out.old_memory_id,
+                "new_memory_id": out.new_memory_id,
+                "old_version": out.old_version,
+                "new_version": out.new_version
+            }))
+            .into_response()
+        }
         Err(StoreError::MemoryNotFound) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "记忆不存在或非 active"),
         Err(StoreError::VersionConflict) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::VersionConflict, "版本冲突，请重读当前版本"),
         Err(StoreError::StaleUserEvidence) | Err(StoreError::EvidenceNotFound) => {

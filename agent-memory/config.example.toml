@@ -15,6 +15,20 @@ migrations_dir = "migrations"
 # model_timeout_secs = 30                # 单次模型调用超时（默认 30）
 # model_extra_json = { enable_thinking = false }   # provider 专有开关，顶层合并进请求体
 
+# ---- D6-8 语义支路（doc6/04 §2：全部显式配置；未配置即 disabled，只做词法）----
+# embedding 为单独配置的 OpenAI 兼容 /embeddings 端点（完整 URL，不猜路径）。
+# embedding_endpoint = "https://api.example.com/v1/embeddings"
+# embedding_model = "bge-m3"
+# embedding_key_file = "secrets/embedding.key"
+# embedding_dimensions = 1024            # 预期维度；响应维度不符即失败
+# embedding_timeout_secs = 30            # 实时 query embedding 另受 800ms 总预算约束
+# reranker 须单独配置专用 rerank 端点（Jina/Cohere 兼容形状）；不配则保留 RRF 顺序。
+# rerank_endpoint = "https://api.example.com/v1/rerank"
+# rerank_model = "bge-reranker-v2-m3"
+# rerank_key_file = "secrets/rerank.key"
+# episode Retrieved 排序的 recency 模式：linear|exponential|none（默认 linear，doc6/04 §3.1）。
+# recency_mode = "linear"
+
 # ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500
 # spool_limit_mb = 100

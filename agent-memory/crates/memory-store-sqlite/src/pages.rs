@@ -602,6 +602,8 @@ pub fn page_list(
             params![scope.tenant_id, scope.user_id, page_id, now_rfc3339()?, expected_version],
         )?;
         remove_page_index_tx(&tx, scope, page_id)?;
+        // D6-8：页面向量失效与归档同事务（doc6/02 §4）。
+        crate::Store::stale_vectors_in_tx(&tx, scope, "page", page_id)?;
         tx.commit()?;
         Ok(n > 0)
     }

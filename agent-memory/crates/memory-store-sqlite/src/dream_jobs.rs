@@ -43,6 +43,7 @@ pub struct DreamCandidateOut {
     pub candidate_id: String,
     pub kind: String,
     pub claim: String,
+    pub quote: String,
     pub status: String,
     pub evidence_id: String,
     pub start_byte: i64,
@@ -212,6 +213,49 @@ impl Store {
         Ok(self.dream_get(scope, &id)?)
     }
 
+    /// 跨 scope 领取（内置 worker 单循环，doc6/10 §8）。先恢复过期 running 回
+    /// queued；领取 due 的 queued / provider_wait（provider_wait 到期即端点恢复
+    /// 续作同一冻结输入，doc6/10 §5）。返回 (scope, 行)。
+    pub fn dream_claim_next(&mut self, now: &str, lease_secs: u64) -> Result<Option<(ScopeKey, DreamJobRow)>, StoreError> {
+        let tx = self.conn_mut().transaction()?;
+        tx.execute(
+            "UPDATE dream_jobs SET status='queued', lease_until=NULL, attempts=attempts+1, updated_at=?2
+             WHERE status='running' AND (lease_until IS NULL OR lease_until<=?1)",
+            params![now, now],
+        )?;
+        let next: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT tenant_id, user_id, id FROM dream_jobs
+                 WHERE status IN ('queued','provider_wait') AND run_after<=?1
+                 ORDER BY run_after, created_at, id LIMIT 1",
+                params![now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((tenant, user, id)) = next else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let lease = (chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|e| StoreError::Time(e.to_string()))?
+            + chrono::Duration::seconds(lease_secs as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let n = tx.execute(
+            "UPDATE dream_jobs SET status='running', lease_until=?5,
+                    claim_generation=claim_generation+1, attempts=attempts+1, updated_at=?6
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+               AND status IN ('queued','provider_wait') AND run_after<=?4",
+            params![tenant, user, id, now, lease, now],
+        )?;
+        tx.commit()?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let scope = ScopeKey { tenant_id: tenant, user_id: user };
+        let job = self.dream_get(&scope, &id)?;
+        Ok(job.filter(|j| j.status == "running").map(|j| (scope, j)))
+    }
+
     /// 接收 Dream 提案（doc6/10 §6）：Rust 核验每个候选的 evidence 在冻结输入内、
     /// quote 为该事件原文连续 byte span → 落 dream_candidates（candidate ID 由
     /// Rust 生成）。任一非法候选不影响其他合法候选（非法者拒绝并记录）。
@@ -276,8 +320,9 @@ impl Store {
                 continue;
             }
             let cid = Uuid::now_v7().to_string();
-            tx.execute(
-                "INSERT INTO dream_candidates
+            // OR IGNORE：同 job 同 kind+quote_hash 重复提交（重放/续作）幂等。
+            let n = tx.execute(
+                "INSERT OR IGNORE INTO dream_candidates
                    (id, tenant_id, user_id, dream_job_id, kind, claim, quote, quote_sha256,
                     status, reason_code, policy_version, occurred_at, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -297,12 +342,14 @@ impl Store {
                     now
                 ],
             )?;
-            tx.execute(
-                "INSERT INTO dream_candidate_evidence
-                   (tenant_id, user_id, candidate_id, evidence_id, start_byte, end_byte)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![scope.tenant_id, scope.user_id, cid, p.evidence_id, p.start_byte, p.end_byte],
-            )?;
+            if n > 0 {
+                tx.execute(
+                    "INSERT INTO dream_candidate_evidence
+                       (tenant_id, user_id, candidate_id, evidence_id, start_byte, end_byte)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![scope.tenant_id, scope.user_id, cid, p.evidence_id, p.start_byte, p.end_byte],
+                )?;
+            }
             accepted += 1;
         }
         tx.commit()?;
@@ -310,7 +357,8 @@ impl Store {
     }
 
     /// 完成（成功）：冻结输入证据推进 processed（doc6/10 §5：processed 表示已被
-    /// 成功判断过，含 not_memory/defer）。
+    /// 成功判断过，含 not_memory/defer）。接受 running 或 provider_wait（裁决
+    /// provider_wait 恢复后续作完成）。
     pub fn dream_succeed(
         &mut self,
         scope: &ScopeKey,
@@ -325,7 +373,7 @@ impl Store {
             "UPDATE dream_jobs SET status='succeeded', model_name=?5, input_tokens=?6,
                     output_tokens=?7, updated_at=?8
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
-               AND status='running' AND claim_generation=?4",
+               AND status IN ('running','provider_wait') AND claim_generation=?4",
             params![scope.tenant_id, scope.user_id, job_id, expected_generation,
                     model_name, input_tokens, output_tokens, now],
         )?;
@@ -347,19 +395,31 @@ impl Store {
         Ok(true)
     }
 
-    /// provider 故障：provider_wait，保留冻结输入与 assigned（doc6/10 §5 不伪装 defer）。
+    /// provider 故障：provider_wait，保留冻结输入与 assigned（doc6/10 §5 不伪装
+    /// defer）；retry_delay_secs 提供退避 run_after（端点恢复续作入口）。
     pub fn dream_provider_wait(
         &mut self,
         scope: &ScopeKey,
         job_id: &str,
         expected_generation: i64,
         error_code: &str,
+        retry_delay_secs: Option<i64>,
     ) -> Result<bool, StoreError> {
+        let now = now_rfc3339()?;
+        let run_after = retry_delay_secs
+            .map(|s| {
+                let t = chrono::DateTime::parse_from_rfc3339(&now)
+                    .map_err(|e| StoreError::Time(e.to_string()))?
+                    + chrono::Duration::seconds(s);
+                Ok::<String, StoreError>(t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+            })
+            .transpose()?;
         let n = self.conn_mut().execute(
-            "UPDATE dream_jobs SET status='provider_wait', error_code=?5, updated_at=?6
+            "UPDATE dream_jobs SET status='provider_wait', error_code=?5,
+                    run_after=COALESCE(?6, run_after), updated_at=?7
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
-               AND status='running' AND claim_generation=?4",
-            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, now_rfc3339()?],
+               AND status IN ('running','provider_wait') AND claim_generation=?4",
+            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, run_after, now],
         )?;
         Ok(n > 0)
     }
@@ -375,10 +435,117 @@ impl Store {
         let n = self.conn_mut().execute(
             "UPDATE dream_jobs SET status='dead', error_code=?5, updated_at=?6
              WHERE tenant_id=?1 AND user_id=?2 AND id=?3
-               AND status='running' AND claim_generation=?4",
+               AND status IN ('running','provider_wait') AND claim_generation=?4",
             params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, now_rfc3339()?],
         )?;
         Ok(n > 0)
+    }
+
+    /// 输入漂移（裁决 stale）：整批不提交，作业 stale_input；证据保持 assigned
+    /// 由后续新作业处理（doc6/10 §5）。
+    pub fn dream_stale_input(
+        &mut self,
+        scope: &ScopeKey,
+        job_id: &str,
+        expected_generation: i64,
+        error_code: &str,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn_mut().execute(
+            "UPDATE dream_jobs SET status='stale_input', error_code=?5, updated_at=?6
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+               AND status IN ('running','provider_wait') AND claim_generation=?4",
+            params![scope.tenant_id, scope.user_id, job_id, expected_generation, error_code, now_rfc3339()?],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 读取冻结输入的当前正文（doc6/10 §6：模型只看冻结输入）。返回
+    /// (evidence_id, role, content)；hash 不符的行返回 Err（证据被篡改不可信）。
+    pub fn dream_frozen_inputs(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+    ) -> Result<Vec<(String, String, String)>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT i.evidence_id, i.role, e.content, e.content_sha256
+             FROM dream_job_inputs i
+             JOIN evidence_events e
+               ON e.tenant_id=i.tenant_id AND e.user_id=i.user_id AND e.id=i.evidence_id
+             WHERE i.tenant_id=?1 AND i.user_id=?2 AND i.job_id=?3
+             ORDER BY i.input_order",
+        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, role, content, sha) = row?;
+            if sha256_hex(&content) != sha {
+                return Err(StoreError::StaleInput);
+            }
+            out.push((id, role, content));
+        }
+        Ok(out)
+    }
+
+    /// 已接收候选（extract 之后、裁决之前）：候选主字段 + 冻结 evidence span。
+    pub fn dream_accepted_candidates(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+    ) -> Result<Vec<(DreamCandidateOut, Vec<(String, i64, i64)>)>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, kind, claim, quote, status, start_byte, end_byte, evidence_id
+             FROM (
+               SELECT c.id, c.kind, c.claim, c.quote, c.status,
+                      e.start_byte, e.end_byte, e.evidence_id
+               FROM dream_candidates c
+               JOIN dream_candidate_evidence e
+                 ON e.tenant_id=c.tenant_id AND e.user_id=c.user_id AND e.candidate_id=c.id
+               WHERE c.tenant_id=?1 AND c.user_id=?2 AND c.dream_job_id=?3 AND c.status='candidate'
+             )
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, job_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut out: Vec<(DreamCandidateOut, Vec<(String, i64, i64)>)> = Vec::new();
+        for row in rows {
+            let (id, kind, claim, quote, status, sb, eb, eid) = row?;
+            match out.last_mut() {
+                Some((c, spans)) if c.candidate_id == id => {
+                    spans.push((eid, sb, eb));
+                }
+                _ => out.push((
+                    DreamCandidateOut {
+                        candidate_id: id.clone(),
+                        kind,
+                        claim: claim.clone(),
+                        quote,
+                        status,
+                        evidence_id: eid.clone(),
+                        start_byte: sb,
+                        end_byte: eb,
+                    },
+                    vec![(eid, sb, eb)],
+                )),
+            }
+        }
+        Ok(out)
     }
 
     /// 崩溃恢复：过期 running 回 queued（冻结输入与账本保留；doc6/10 §5）。
@@ -389,6 +556,17 @@ impl Store {
             params![now, now],
         )?;
         Ok(n as i64)
+    }
+
+    /// 心跳：所有 running dream job 续租（单 worker 内串行处理；跨迭代保持
+    /// 所有权，防止 extract 与其裁决之间的租约过期重领）。不动 generation。
+    pub fn dream_renew_running_leases(&mut self, now: &str, lease_secs: u64) -> Result<usize, StoreError> {
+        let lease = lease_from(now, lease_secs)?;
+        let n = self.conn_mut().execute(
+            "UPDATE dream_jobs SET lease_until=?2, updated_at=?3 WHERE status='running'",
+            params![now, lease, now_rfc3339()?],
+        )?;
+        Ok(n)
     }
 
     /// 读取单 job（scope 内）。

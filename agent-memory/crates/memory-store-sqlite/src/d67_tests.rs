@@ -164,7 +164,7 @@ fn dream_recover_expired_and_provider_wait() {
     let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
     let gen = claimed.claim_generation;
     // provider 故障 → provider_wait；账本保持 assigned（不伪装 defer）。
-    assert!(store.dream_provider_wait(&scope, &job.id, gen, "MODEL_TIMEOUT").unwrap());
+    assert!(store.dream_provider_wait(&scope, &job.id, gen, "MODEL_TIMEOUT", None).unwrap());
     let estatus: String = store
         .conn()
         .query_row(
