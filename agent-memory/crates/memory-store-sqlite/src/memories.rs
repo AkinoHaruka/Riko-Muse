@@ -42,6 +42,8 @@ pub struct SearchHit {
     pub score: f64,
     pub match_reason: String,
     pub evidence_refs: Vec<String>,
+    /// 命中时的当前版本（D6-3 bundle source_versions；doc6/04 §4）。
+    pub version: i64,
 }
 
 pub struct ComposeResult {
@@ -210,7 +212,7 @@ impl Store {
         Ok(())
     }
 
-    fn evidence_refs_of(
+    pub(crate) fn evidence_refs_of(
         &self,
         scope: &ScopeKey,
         memory_id: &str,
@@ -582,16 +584,23 @@ impl Store {
                 .conn()
                 .query_row(
                     &format!(
-                        "SELECT kind, claim, status FROM memories
+                        "SELECT kind, claim, status, version FROM memories
                          WHERE tenant_id=? AND user_id=? AND id=? AND {status_clause}
                            AND (valid_until IS NULL OR valid_until > ?)
                          ORDER BY updated_at DESC"
                     ),
                     params![scope.tenant_id, scope.user_id, id, now],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some((kind, claim, status)) = row else { continue };
+            let Some((kind, claim, status, version)) = row else { continue };
             let refs = self
                 .evidence_refs_of(scope, &id)?
                 .into_iter()
@@ -610,6 +619,7 @@ impl Store {
                 score,
                 match_reason,
                 evidence_refs: refs,
+                version,
             });
         }
         Ok((hits, self.index_degraded()))
@@ -994,14 +1004,21 @@ impl Store {
             let row = self
                 .conn()
                 .query_row(
-                    "SELECT kind, claim, status FROM memories
+                    "SELECT kind, claim, status, version FROM memories
                      WHERE tenant_id=? AND user_id=? AND id=? AND status='active'
                        AND (valid_until IS NULL OR valid_until > ?)",
                     params![scope.tenant_id, scope.user_id, id, now],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some((kind, claim, status)) = row else { continue };
+            let Some((kind, claim, status, version)) = row else { continue };
             let _ = kind;
             let refs = self
                 .evidence_refs_of(scope, &id)?
@@ -1016,6 +1033,7 @@ impl Store {
                 score: 0.0,
                 match_reason: "instruction".into(),
                 evidence_refs: refs,
+                version,
             });
         }
         Ok(hits)

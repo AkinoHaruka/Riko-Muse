@@ -452,6 +452,242 @@ fn reposition_in_tx(
     Ok(())
 }
 
+// ---- D6-3：resident 选择函数 v1（doc6/03 §3，Rust 纯查询函数）----
+
+/// resident 正文条目：携带 ID/kind/来源，不把裸记忆正文升级为 system 指令。
+#[derive(Debug, Clone)]
+pub struct ResidentItem {
+    pub memory_id: String,
+    pub kind: String,
+    pub claim: String,
+    /// 选择原因：pinned | resident_auto（未 pin 的 active instruction）。
+    pub reason: &'static str,
+    pub version: i64,
+    pub evidence_ids: Vec<String>,
+}
+
+/// 每轮重算的 resident 选择（doc6/03 §3/§4）：
+/// pinned 优先（position 升序），随后未 pin 的 active instruction
+/// （updated_at DESC, id ASC，无固定条数特权）；未 pin 的
+/// fact/preference/episode 不自动常驻。预算逐条完整计数，不截断半句；
+/// 已知 contradicts 的候选对整体退出正文并进 conflict_ids。
+#[derive(Debug, Default)]
+pub struct ResidentSelection {
+    pub text: String,
+    pub items: Vec<ResidentItem>,
+    /// (memory_id, reason)：ITEM_LIMIT / CHAR_LIMIT（预算省略可见，doc6/03 §3）。
+    pub omitted: Vec<(String, &'static str)>,
+    /// 已知 contradicts 且两端均进入候选的 ID（不选赢家，两条都不进正文）。
+    pub conflict_ids: Vec<String>,
+    /// pin 指向非 active 记忆（correct 产生新 ID 不自动迁移；doc6/03 §4）。
+    pub needs_review: Vec<String>,
+    pub truncated: bool,
+}
+
+/// suggestions 候选（doc6/03 §3）：可供 pin 的 active fact/preference；
+/// 建议列表不改变注入。
+#[derive(Debug, Clone)]
+pub struct SuggestionRow {
+    pub memory_id: String,
+    pub kind: String,
+    pub claim: String,
+    pub updated_at: String,
+    pub evidence_ids: Vec<String>,
+}
+
+/// 渲染一条 resident 条目（doc6/03 §2 视图格式的注入形态）。
+fn render_entry(item: &ResidentItem) -> String {
+    format!("- [memory: {}] {}", item.memory_id, item.claim)
+}
+
+impl Store {
+    /// resident 选择 v1。同一连接读事务语义（SQLite 单连接顺序读）；
+    /// retired 覆盖过滤随 0010（D6-9）加入。
+    pub fn select_resident(
+        &self,
+        scope: &ScopeKey,
+        now: &str,
+        max_items: usize,
+        max_chars: usize,
+    ) -> Result<ResidentSelection, StoreError> {
+        // 1. enabled pin JOIN active 未过期记忆（position 升序）。
+        let mut items: Vec<ResidentItem> = Vec::new();
+        let mut candidate_ids: Vec<String> = Vec::new();
+        let mut needs_review: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn().prepare(
+                "SELECT p.memory_id, m.kind, m.claim, m.version, m.status
+                 FROM resident_pins p JOIN memories m
+                   ON m.tenant_id=p.tenant_id AND m.user_id=p.user_id AND m.id=p.memory_id
+                 WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.enabled=1
+                 ORDER BY p.position, p.memory_id",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (memory_id, kind, claim, version, status) = row?;
+                if status != "active" {
+                    // forgotten/superseded/expired：pin 行保留作历史，但不可见；
+                    // correct 后旧 pin 不自动迁移，报 needs_review 供用户决策。
+                    needs_review.push(memory_id);
+                    continue;
+                }
+                candidate_ids.push(memory_id.clone());
+                items.push(ResidentItem {
+                    memory_id,
+                    kind,
+                    claim,
+                    reason: "pinned",
+                    version,
+                    evidence_ids: Vec::new(),
+                });
+            }
+        }
+        // 2. 未 pin 的 active instruction（updated_at DESC, id ASC；无固定条数特权）。
+        {
+            let mut stmt = self.conn().prepare(
+                "SELECT m.id, m.kind, m.claim, m.version FROM memories m
+                 WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.status='active'
+                   AND m.kind='instruction'
+                   AND (m.valid_until IS NULL OR m.valid_until > ?3)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM resident_pins p
+                     WHERE p.tenant_id=m.tenant_id AND p.user_id=m.user_id
+                       AND p.memory_id=m.id AND p.enabled=1
+                   )
+                 ORDER BY m.updated_at DESC, m.id ASC LIMIT 200",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (memory_id, kind, claim, version) = row?;
+                candidate_ids.push(memory_id.clone());
+                items.push(ResidentItem {
+                    memory_id,
+                    kind,
+                    claim,
+                    reason: "resident_auto",
+                    version,
+                    evidence_ids: Vec::new(),
+                });
+            }
+        }
+        // 3. 已知 contradicts：两端均在本轮候选中 → 全部退出正文（doc6/03 §3）。
+        let mut conflict_ids: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn().prepare(
+                "SELECT from_memory_id, to_memory_id FROM memory_relations
+                 WHERE tenant_id=?1 AND user_id=?2 AND kind='contradicts'",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (from, to) = row?;
+                if candidate_ids.contains(&from) && candidate_ids.contains(&to) {
+                    if !conflict_ids.contains(&from) {
+                        conflict_ids.push(from);
+                    }
+                    if !conflict_ids.contains(&to) {
+                        conflict_ids.push(to);
+                    }
+                }
+            }
+        }
+        // 4. 预算装配：逐条完整渲染计数；条数满/字符超 → omitted，不截断半句。
+        let mut selection = ResidentSelection {
+            conflict_ids,
+            needs_review,
+            ..Default::default()
+        };
+        let mut used_chars = 0usize;
+        for item in items {
+            if selection.conflict_ids.contains(&item.memory_id) {
+                continue; // 冲突对整体退出正文，单独诊断，不算 omitted。
+            }
+            if selection.items.len() >= max_items {
+                selection.omitted.push((item.memory_id, "ITEM_LIMIT"));
+                continue;
+            }
+            let evidence_ids = self
+                .evidence_refs_of(scope, &item.memory_id)?
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect();
+            let entry = ResidentItem { evidence_ids, ..item };
+            let entry_chars = render_entry(&entry).chars().count();
+            if used_chars > 0 && used_chars + entry_chars + 1 > max_chars {
+                // 字符超预算：跳过该条，继续看后续更短条（doc6/03 §3）。
+                selection.omitted.push((entry.memory_id, "CHAR_LIMIT"));
+                continue;
+            }
+            used_chars += entry_chars + if selection.items.is_empty() { 0 } else { 1 };
+            selection.items.push(entry);
+        }
+        selection.text =
+            selection.items.iter().map(render_entry).collect::<Vec<_>>().join("\n");
+        selection.truncated = !selection.omitted.is_empty();
+        Ok(selection)
+    }
+
+    /// resident suggestions（doc6/03 §3）：active fact/preference 按
+    /// updated_at DESC, id ASC 有界列表，排除已 enabled pin；不改变注入。
+    pub fn resident_suggestions(
+        &self,
+        scope: &ScopeKey,
+        now: &str,
+        limit: usize,
+    ) -> Result<Vec<SuggestionRow>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT m.id, m.kind, m.claim, m.updated_at FROM memories m
+             WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.status='active'
+               AND m.kind IN ('fact','preference')
+               AND (m.valid_until IS NULL OR m.valid_until > ?3)
+               AND NOT EXISTS (
+                 SELECT 1 FROM resident_pins p
+                 WHERE p.tenant_id=m.tenant_id AND p.user_id=m.user_id
+                   AND p.memory_id=m.id AND p.enabled=1
+               )
+             ORDER BY m.updated_at DESC, m.id ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, now, limit as i64],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (memory_id, kind, claim, updated_at) = row?;
+            let evidence_ids = self
+                .evidence_refs_of(scope, &memory_id)?
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect();
+            out.push(SuggestionRow { memory_id, kind, claim, updated_at, evidence_ids });
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +897,138 @@ mod tests {
         let positions2: Vec<i64> =
             store.resident_pins(&scope).unwrap().into_iter().map(|p| p.position).collect();
         assert_eq!(positions2, vec![0, 1, 2]);
+    }
+
+    // ---- D6-3：选择函数 v1（doc6/03 §3/§4）----
+
+    fn remember_kind(
+        store: &mut Store,
+        scope: &ScopeKey,
+        origin: &Origin,
+        seq: i64,
+        claim: &str,
+        kind: MemoryKind,
+    ) -> String {
+        let t = chrono::Utc::now();
+        let ev = match store
+            .record_evidence(scope, origin, seq, "user", "user", &t, claim)
+            .unwrap()
+        {
+            IngestOutcome::Recorded(id) => id,
+            IngestOutcome::AlreadyRecorded(id) => id,
+        };
+        match store.remember(scope, origin, &ev, claim, kind).unwrap() {
+            crate::RememberOutcome::Created { memory_id, .. } => memory_id,
+            crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
+        }
+    }
+
+    #[test]
+    fn select_resident_pinned_first_instructions_auto_facts_not() {
+        // doc6/03 §3：pinned 优先；未 pin instruction 自动；未 pin fact/episode 不常驻。
+        let (mut store, scope, origin) = setup("select");
+        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+        let ep = remember_kind(&mut store, &scope, &origin, 2, "用户上周去了西湖", MemoryKind::Episode);
+        let i1 = remember_kind(&mut store, &scope, &origin, 3, "以后回答先给结论", MemoryKind::Instruction);
+        let i2 = remember_kind(&mut store, &scope, &origin, 4, "以后回答用中文", MemoryKind::Instruction);
+        store.resident_pin(&scope, &f1, None, None, None).unwrap();
+        let now = now_rfc3339().unwrap();
+        let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+        let ids: Vec<&str> = sel.items.iter().map(|i| i.memory_id.as_str()).collect();
+        // pinned fact 在前；instruction 按 updated_at DESC（最新的 i2 在前）。
+        assert_eq!(ids, vec![f1.as_str(), i2.as_str(), i1.as_str()]);
+        // 未 pin 的 fact/episode 不自动常驻。
+        assert!(!ids.contains(&ep.as_str()));
+        assert_eq!(sel.omitted.len(), 0);
+        assert!(!sel.truncated);
+        // reasons：pinned / resident_auto。
+        assert_eq!(sel.items[0].reason, "pinned");
+        assert_eq!(sel.items[1].reason, "resident_auto");
+        // 每条携带证据引用。
+        assert!(!sel.items[0].evidence_ids.is_empty());
+        // text 渲染含 ID。
+        assert!(sel.text.contains(&format!("[memory: {}]", f1)));
+    }
+
+    #[test]
+    fn select_resident_budget_omits_without_truncation() {
+        // doc6/03 §3：条数满 → ITEM_LIMIT；字符超 → CHAR_LIMIT 且后续短条可进；
+        // 不截断半句（items 内均为完整条目）。
+        let (mut store, scope, origin) = setup("budget");
+        let f1 = remember_kind(&mut store, &scope, &origin, 1, "第一条比较长的偏好内容用于占预算", MemoryKind::Fact);
+        let f2 = remember_kind(&mut store, &scope, &origin, 2, "第二条也很长的偏好内容继续占位", MemoryKind::Preference);
+        let i1 = remember_kind(&mut store, &scope, &origin, 3, "以后回答简短", MemoryKind::Instruction);
+        store.resident_pin(&scope, &f1, None, None, None).unwrap();
+        store.resident_pin(&scope, &f2, None, None, None).unwrap();
+        let now = now_rfc3339().unwrap();
+        // 条数限制：2 条 pin 后 instruction 被 ITEM_LIMIT。
+        let sel = store.select_resident(&scope, &now, 2, 10000).unwrap();
+        assert_eq!(sel.items.len(), 2);
+        assert!(sel.omitted.iter().any(|(id, r)| id == &i1 && *r == "ITEM_LIMIT"));
+        assert!(sel.truncated);
+        // 字符限制：预算极小 → 长条 CHAR_LIMIT；正文仍为完整条目（非半句）。
+        let sel2 = store.select_resident(&scope, &now, 24, 40).unwrap();
+        assert!(sel2.items.iter().all(|i| render_entry(i).chars().count() <= 40 || sel2.items.len() == 1));
+        assert!(sel2.omitted.iter().any(|(_, r)| *r == "CHAR_LIMIT"));
+    }
+
+    #[test]
+    fn select_resident_conflicts_exit_body_not_omitted() {
+        // doc6/03 §3：已知 contradicts 且两端均为候选 → conflict_ids，两条都不进正文。
+        let (mut store, scope, origin) = setup("conflict");
+        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+        let f2 = remember_kind(&mut store, &scope, &origin, 2, "用户住在上海", MemoryKind::Fact);
+        store.resident_pin(&scope, &f1, None, None, None).unwrap();
+        store.resident_pin(&scope, &f2, None, None, None).unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO memory_relations (tenant_id, user_id, from_memory_id, to_memory_id, kind, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'contradicts', '2026-09-26T00:00:00Z')",
+                params![scope.tenant_id, scope.user_id, f1, f2],
+            )
+            .unwrap();
+        let now = now_rfc3339().unwrap();
+        let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+        assert_eq!(sel.conflict_ids.len(), 2, "两端都进 conflict_ids");
+        assert!(sel.items.is_empty(), "冲突对默认都不进正文");
+        assert!(sel.omitted.is_empty(), "冲突退出不算预算省略");
+        assert!(sel.text.is_empty());
+    }
+
+    #[test]
+    fn select_resident_needs_review_on_forgotten_pin() {
+        // doc6/03 §4：correct/forget 后旧 pin 不自动迁移也不可注入 → needs_review。
+        let (mut store, scope, origin) = setup("review");
+        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+        store.resident_pin(&scope, &f1, None, None, None).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status='forgotten' WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, f1],
+            )
+            .unwrap();
+        let now = now_rfc3339().unwrap();
+        let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+        assert!(sel.needs_review.contains(&f1), "旧 pin 报 needs_review");
+        assert!(sel.items.is_empty());
+    }
+
+    #[test]
+    fn suggestions_list_active_facts_excluding_pinned() {
+        // doc6/03 §3：建议= active fact/preference（未 pin），episode/instruction 不在建议。
+        let (mut store, scope, origin) = setup("suggest");
+        let f1 = remember_kind(&mut store, &scope, &origin, 1, "用户住在杭州", MemoryKind::Fact);
+        let p2 = remember_kind(&mut store, &scope, &origin, 2, "用户偏好简短回答", MemoryKind::Preference);
+        let _ep = remember_kind(&mut store, &scope, &origin, 3, "用户上周去了西湖", MemoryKind::Episode);
+        let _i4 = remember_kind(&mut store, &scope, &origin, 4, "以后回答先给结论", MemoryKind::Instruction);
+        store.resident_pin(&scope, &f1, None, None, None).unwrap();
+        let now = now_rfc3339().unwrap();
+        let rows = store.resident_suggestions(&scope, &now, 20).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.memory_id.as_str()).collect();
+        assert!(!ids.contains(&f1.as_str()), "已 pin 的不出现在建议");
+        assert!(ids.contains(&p2.as_str()));
+        assert_eq!(rows.len(), 1, "episode/instruction 不进建议");
     }
 }

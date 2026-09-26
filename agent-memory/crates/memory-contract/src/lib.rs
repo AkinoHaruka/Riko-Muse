@@ -155,4 +155,10 @@ pub struct VersionResponse {
     pub protocol_version: u32,
     pub schema_version: u32,
     pub build: &'static str,
+    /// D6 能力握手（doc6/06 §1）：老客户端忽略未知字段；适配器按能力启用新注入。
+    pub capabilities: Vec<&'static str>,
 }
+
+/// 已交付能力（doc6/06 §1）：D6-1/D6-2 soul 存储与接口；D6-3 resident/bundle。
+pub const CAPABILITY_SOUL_V1: &str = "soul_v1";
+pub const CAPABILITY_CONTEXT_BUNDLE_V1: &str = "context_bundle_v1";

@@ -364,6 +364,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/soul/revisions", get(list_soul_revisions))
                 .route("/v1/resident/pins", post(post_resident_pin))
                 .route("/v1/resident/pins/{memory_id}", delete(delete_resident_pin))
+                .route("/v1/resident", get(get_resident))
+                .route("/v1/resident/suggestions", get(get_resident_suggestions))
+                .route("/v1/context/bundle", post(post_context_bundle))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
@@ -1718,6 +1721,291 @@ async fn delete_resident_pin(
     }
 }
 
+// ---- D6-3：GET /v1/resident、GET /v1/resident/suggestions、POST /v1/context/bundle ----
+
+/// bundle 预算默认值/上限（doc6/01 §4）。
+const RESIDENT_MAX_ITEMS_DEFAULT: usize = 24;
+const RESIDENT_MAX_ITEMS_MAX: usize = 100;
+const RESIDENT_MAX_CHARS_DEFAULT: usize = 3000;
+const RESIDENT_MAX_CHARS_MAX: usize = 12000;
+const RETRIEVED_MAX_ITEMS_DEFAULT: usize = 8;
+const RETRIEVED_MAX_ITEMS_MAX: usize = 100;
+const RETRIEVED_MAX_CHARS_DEFAULT: usize = 2400;
+const RETRIEVED_MAX_CHARS_MAX: usize = 24000;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleRequest {
+    agent_id: String,
+    /// 空查询（工具续步等 step）仍给 resident，retrieved 为空（doc6/04 §4）。
+    #[serde(default)]
+    query: String,
+    resident_max_items: Option<usize>,
+    resident_max_chars: Option<usize>,
+    retrieved_max_items: Option<usize>,
+    retrieved_max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResidentQuery {
+    /// 仅诊断回显；选择本身是 scope 级（doc6/06 §2）。
+    agent_id: Option<String>,
+    limit: Option<usize>,
+}
+
+fn resident_section_json(
+    req_id: &str,
+    sel: &memory_store_sqlite::resident::ResidentSelection,
+) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = sel
+        .items
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "kind": "memory",
+                "memory_id": i.memory_id,
+                "memory_kind": i.kind,
+                "claim": i.claim,
+                "reason": i.reason,
+                "version": i.version,
+                "evidence_ids": i.evidence_ids,
+            })
+        })
+        .collect();
+    let omitted: Vec<serde_json::Value> = sel
+        .omitted
+        .iter()
+        .map(|(id, r)| serde_json::json!({"memory_id": id, "reason": r}))
+        .collect();
+    serde_json::json!({
+        "text": sel.text,
+        "items": items,
+        "omitted": omitted,
+        "conflict_ids": sel.conflict_ids,
+        "truncated": sel.truncated,
+    })
+}
+
+fn budget_check(
+    req_id: &str,
+    name: &str,
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+) -> Result<usize, Response> {
+    let v = value.unwrap_or(default);
+    if !(1..=max).contains(&v) {
+        return Err(err(
+            req_id,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            Box::leak(format!("{name} 必须 1～{max}").into_boxed_str()),
+        ));
+    }
+    Ok(v)
+}
+
+async fn get_resident(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<ResidentQuery>,
+) -> Response {
+    let limit = match budget_check(&req_id.0, "limit", query.limit, RESIDENT_MAX_ITEMS_DEFAULT, RESIDENT_MAX_ITEMS_MAX) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let now = match memory_store_sqlite::now_rfc3339_pub() {
+        Ok(t) => t,
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    let guard = state.store.lock().unwrap();
+    match guard.select_resident(&scope, &now, limit, RESIDENT_MAX_CHARS_MAX) {
+        Ok(sel) => {
+            let needs_review: Vec<&String> = sel.needs_review.iter().collect();
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "agent_id": query.agent_id,
+                "resident": resident_section_json(&req_id.0, &sel),
+                "needs_review": needs_review,
+            }))
+            .into_response()
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn get_resident_suggestions(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<ResidentQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "limit 必须 1～100");
+    }
+    let now = match memory_store_sqlite::now_rfc3339_pub() {
+        Ok(t) => t,
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    let guard = state.store.lock().unwrap();
+    match guard.resident_suggestions(&scope, &now, limit) {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "kind": "memory",
+                        "memory_id": r.memory_id,
+                        "memory_kind": r.kind,
+                        "claim": r.claim,
+                        "updated_at": r.updated_at,
+                        "evidence_ids": r.evidence_ids,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "items": items,
+            }))
+            .into_response()
+        }
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn post_context_bundle(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<BundleRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    if let Err(msg) = validate_agent_id(&req.agent_id) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, msg);
+    }
+    let r_items = match budget_check(&req_id.0, "resident_max_items", req.resident_max_items, RESIDENT_MAX_ITEMS_DEFAULT, RESIDENT_MAX_ITEMS_MAX) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let r_chars = match budget_check(&req_id.0, "resident_max_chars", req.resident_max_chars, RESIDENT_MAX_CHARS_DEFAULT, RESIDENT_MAX_CHARS_MAX) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let q_items = match budget_check(&req_id.0, "retrieved_max_items", req.retrieved_max_items, RETRIEVED_MAX_ITEMS_DEFAULT, RETRIEVED_MAX_ITEMS_MAX) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let q_chars = match budget_check(&req_id.0, "retrieved_max_chars", req.retrieved_max_chars, RETRIEVED_MAX_CHARS_DEFAULT, RETRIEVED_MAX_CHARS_MAX) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let now = match memory_store_sqlite::now_rfc3339_pub() {
+        Ok(t) => t,
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    let query_trim = req.query.trim();
+    // resident 段（查询无关，每轮重算；doc6/03 §3）。
+    let selection = {
+        let guard = state.store.lock().unwrap();
+        guard.select_resident(&scope, &now, r_items, r_chars)
+    };
+    let selection = match selection {
+        Ok(s) => s,
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    // retrieved 段：词法检索（doc6/04 §2 词法路线），排除 resident 已含与冲突 ID。
+    let mut lexical_status = "empty_query";
+    let mut retrieved_text = String::new();
+    let mut retrieved_items: Vec<serde_json::Value> = Vec::new();
+    let mut retrieved_omitted: Vec<serde_json::Value> = Vec::new();
+    let mut retrieved_truncated = false;
+    let mut source_versions = serde_json::Map::new();
+    for i in &selection.items {
+        source_versions.insert(i.memory_id.clone(), serde_json::json!(i.version));
+    }
+    if !query_trim.is_empty() {
+        let resident_ids: Vec<&str> = selection
+            .items
+            .iter()
+            .map(|i| i.memory_id.as_str())
+            .chain(selection.conflict_ids.iter().map(|s| s.as_str()))
+            .collect();
+        let search = {
+            let guard = state.store.lock().unwrap();
+            guard.search_memories(&scope, query_trim, q_items, false)
+        };
+        match search {
+            Ok((hits, index_degraded)) => {
+                lexical_status = if index_degraded { "index_degraded" } else { "ok" };
+                let mut used_chars = 0usize;
+                for hit in hits {
+                    if resident_ids.contains(&hit.memory_id.as_str()) {
+                        continue; // 排除 resident 已含/冲突 ID（doc6/04 §3）。
+                    }
+                    let entry = format!("- [memory: {}] {}", hit.memory_id, hit.claim);
+                    let entry_chars = entry.chars().count();
+                    if retrieved_items.len() >= q_items
+                        || (used_chars > 0 && used_chars + entry_chars + 1 > q_chars)
+                    {
+                        retrieved_omitted.push(serde_json::json!({
+                            "memory_id": hit.memory_id,
+                            "reason": if retrieved_items.len() >= q_items { "ITEM_LIMIT" } else { "CHAR_LIMIT" },
+                        }));
+                        retrieved_truncated = true;
+                        continue;
+                    }
+                    used_chars += entry_chars + if retrieved_items.is_empty() { 0 } else { 1 };
+                    if retrieved_text.is_empty() {
+                        retrieved_text = entry;
+                    } else {
+                        retrieved_text.push('\n');
+                        retrieved_text.push_str(&entry);
+                    }
+                    retrieved_items.push(serde_json::json!({
+                        "kind": "memory",
+                        "memory_id": hit.memory_id,
+                        "memory_kind": hit.kind,
+                        "claim": hit.claim,
+                        "reason": "lexical",
+                        "evidence_ids": hit.evidence_refs,
+                    }));
+                    source_versions.insert(hit.memory_id.clone(), serde_json::json!(hit.version));
+                }
+            }
+            Err(e) => {
+                return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string())
+            }
+        }
+    }
+    // D6-8 前：语义/精排/页面索引未实施，状态明确 disabled（doc6/04 §4）。
+    Json(serde_json::json!({
+        "request_id": req_id.0,
+        "agent_id": req.agent_id,
+        "resident": resident_section_json(&req_id.0, &selection),
+        "retrieved": {
+            "text": retrieved_text,
+            "items": retrieved_items,
+            "omitted": retrieved_omitted,
+            "truncated": retrieved_truncated,
+        },
+        "lexical_status": lexical_status,
+        "semantic_status": "disabled",
+        "rerank_status": "disabled",
+        "page_index_status": "not_applicable",
+        "source_versions": source_versions,
+    }))
+    .into_response()
+}
+
 /// GET /v1/jobs（doc4/04 §1）：scope 内分页作业列表，默认 dead，不返回正文。
 async fn list_jobs(
     State(state): State<AppState>,
@@ -2006,6 +2294,11 @@ async fn version() -> impl IntoResponse {
         protocol_version: PROTOCOL_VERSION,
         schema_version: SCHEMA_VERSION,
         build: BUILD,
+        // D6 能力握手（doc6/06 §1）：随卡交付递增；适配器据此启用新注入路径。
+        capabilities: vec![
+            memory_contract::CAPABILITY_SOUL_V1,
+            memory_contract::CAPABILITY_CONTEXT_BUNDLE_V1,
+        ],
     })
 }
 
