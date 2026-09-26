@@ -1,8 +1,8 @@
 //! Dream 作业存储（doc6/02 §5、doc6/10）：trigger 持久入队（快照事务：选择待处理
 //! L0 → 固化 job/inputs/evidence_state assigned）、lease/generation 状态机、
 //! 候选接收（Rust 核验 evidence/byte span 后落 dream_candidates）。
-//! runner = memoryd 内置受控 worker（doc6/10 §8 路径：由持久 trigger/jobs 驱动；
-//! D6-0 已核实该 seam 可用；DSH continuable subagent 仅作未来宿主触发承载）。
+//! runner 与 DSH 的持久 dispatch 通过 dream_runners / claim_generation 管理；
+//! 触发器与输入始终先由 memoryd 持久化。
 
 use memory_domain::ScopeKey;
 use rusqlite::{params, OptionalExtension};
@@ -24,6 +24,7 @@ pub const DREAM_MAX_INPUT_BYTES: usize = 24 * 1024;
 #[derive(Debug, Clone)]
 pub struct DreamJobRow {
     pub id: String,
+    pub purpose: String,
     pub trigger_kind: String,
     pub trigger_key: String,
     pub extract_version: String,
@@ -50,11 +51,29 @@ pub struct DreamCandidateOut {
     pub end_byte: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DreamRedecisionRecord {
+    pub candidate_id: String,
+    pub evidence_id: String,
+    pub redecision_kind: String,
+    pub strategy_fingerprint: String,
+}
+
 fn sha256_hex(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
 impl Store {
+    /// 当前 scope 中 lease 尚有效的 DSH runner 数量（doctor readiness）。
+    pub fn dream_live_runner_count(&self, now: &str) -> Result<usize, StoreError> {
+        let count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM dream_runners WHERE lease_until>?1",
+            params![now],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// trigger 入队（doc6/10 §4）：同 trigger_key 重放返回原 job（幂等 coalesce）。
     /// 快照事务边界（doc6/10 §5）：同一事务选择待处理 L0（user events，未
     /// processed/未 assigned，跨 session 按 (host,session,event_seq) 排序，上限
@@ -78,7 +97,7 @@ impl Store {
         // 幂等：同 scope 同 trigger_key 已存在 → 原样返回（不合并进 running 输入）。
         let existing: Option<DreamJobRow> = tx
             .query_row(
-                "SELECT id, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
+                "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
                         lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at
                  FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND trigger_key=?3",
                 params![scope.tenant_id, scope.user_id, trigger_key],
@@ -206,6 +225,185 @@ impl Store {
         tx.commit()?;
         let job = self.dream_get(scope, &id)?.ok_or(StoreError::JobNotFound)?;
         Ok(Some(job))
+    }
+
+    /// 用户明确要求重裁一条 Held candidate：复用其有效原始证据，创建独立持久 Dream
+    /// job，不重置原 evidence_state，也不把摘要转成新证据。
+    pub fn dream_redecision_trigger(
+        &mut self,
+        scope: &ScopeKey,
+        candidate_id: &str,
+        idempotency_key: &str,
+        agent_id: Option<&str>,
+        host_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<DreamJobRow, StoreError> {
+        if idempotency_key.is_empty() || idempotency_key.chars().count() > 128 {
+            return Err(StoreError::InvalidPageField);
+        }
+        let now = now_rfc3339()?;
+        let trigger_key = format!(
+            "rejudge-{}",
+            sha256_hex(&format!("{}\0{}", candidate_id, idempotency_key))
+        );
+        let tx = self.conn_mut().transaction()?;
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts,
+                        run_after, lease_until, claim_generation, input_fingerprint, error_code,
+                        created_at, updated_at
+                 FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND trigger_key=?3",
+                params![scope.tenant_id, scope.user_id, trigger_key],
+                map_dream_row,
+            )
+            .optional()?
+        {
+            tx.commit()?;
+            return Ok(existing);
+        }
+
+        let candidate: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT kind, quote, policy_version FROM dream_candidates
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='held'",
+                params![scope.tenant_id, scope.user_id, candidate_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((_kind, quote, policy_version)) = candidate else {
+            return Err(StoreError::JobNotFound);
+        };
+        let mut inputs = Vec::new();
+        {
+        let mut stmt = tx.prepare(
+            "SELECT e.id,e.host_id,e.session_id,e.event_seq,e.content_sha256,e.content,
+                    ce.start_byte,ce.end_byte
+             FROM dream_candidate_evidence ce
+             JOIN evidence_events e ON e.tenant_id=ce.tenant_id AND e.user_id=ce.user_id
+                                    AND e.id=ce.evidence_id
+             WHERE ce.tenant_id=?1 AND ce.user_id=?2 AND ce.candidate_id=?3
+               AND e.role='user' AND e.source_kind='user'
+               AND NOT EXISTS (SELECT 1 FROM suppressed_sources ss
+                 WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+               AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt
+                 WHERE pt.tenant_id=e.tenant_id AND pt.user_id=e.user_id
+                   AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)
+               AND NOT EXISTS (SELECT 1 FROM memory_evidence me
+                 JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                 WHERE me.tenant_id=e.tenant_id AND me.user_id=e.user_id AND me.evidence_id=e.id
+                   AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                     OR EXISTS (SELECT 1 FROM memory_retirements mr
+                       WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)
+                     OR EXISTS (SELECT 1 FROM purge_jobs pj
+                       WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id
+                         AND pj.target_id=m.id AND pj.status IN ('pending','running'))))
+             ORDER BY e.host_id,e.session_id,e.event_seq",
+        )?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, candidate_id, now],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (evidence_id, host, session, seq, hash, content, start, end) = row?;
+            if start < 0
+                || end <= start
+                || end > content.len() as i64
+                || !content.is_char_boundary(start as usize)
+                || !content.is_char_boundary(end as usize)
+                || content.get(start as usize..end as usize) != Some(quote.as_str())
+                || sha256_hex(&content) != hash
+            {
+                continue;
+            }
+            inputs.push((evidence_id, host, session, seq, hash));
+        }
+        }
+        if inputs.is_empty() {
+            return Err(StoreError::StaleInput);
+        }
+        let strategy = format!(
+            "{}:{}:{}",
+            policy_version,
+            memory_contract::ADMISSION_VERSION_V3,
+            memory_contract::ADJUDICATION_VERSION_V1
+        );
+        // 明确重裁以候选、冻结证据和策略版本为唯一裁决指纹；换一个 HTTP
+        // idempotency key 不能制造重复模型调用。
+        let previous_job: Option<String> = tx
+            .query_row(
+                "SELECT dream_job_id FROM dream_candidate_redecisions
+                 WHERE tenant_id=?1 AND user_id=?2 AND candidate_id=?3
+                   AND strategy_fingerprint=?4 ORDER BY created_at LIMIT 1",
+                params![scope.tenant_id, scope.user_id, candidate_id, strategy],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(previous_job) = previous_job {
+            tx.commit()?;
+            return self
+                .dream_get(scope, &previous_job)?
+                .ok_or(StoreError::JobNotFound);
+        }
+        let fingerprint_input = inputs
+            .iter()
+            .map(|(id, _, _, seq, sha)| format!("{id}:{seq}:{sha}"))
+            .collect::<Vec<_>>()
+            .join("\0");
+        let fingerprint = sha256_hex(&format!(
+            "redecision\0{candidate_id}\0{policy_version}\0{fingerprint_input}"
+        ));
+        let job_id = Uuid::now_v7().to_string();
+        tx.execute(
+            "INSERT INTO dream_jobs
+               (id,tenant_id,user_id,trigger_kind,trigger_key,agent_id,host_id,session_id,
+                pipeline_version,extract_version,status,attempts,run_after,claim_generation,
+                input_fingerprint,created_at,updated_at,purpose)
+             VALUES (?1,?2,?3,'manual',?4,?5,?6,?7,?8,?9,'queued',0,?10,0,?11,?10,?10,'redecision')",
+            params![
+                job_id,
+                scope.tenant_id,
+                scope.user_id,
+                trigger_key,
+                agent_id,
+                host_id,
+                session_id,
+                DREAM_PIPELINE_V1,
+                DREAM_EXTRACT_V1,
+                now,
+                fingerprint
+            ],
+        )?;
+        for (order, (evidence_id, host, session, seq, hash)) in inputs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO dream_job_inputs
+                   (tenant_id,user_id,job_id,input_order,evidence_id,role,host_id,session_id,
+                    event_seq,content_sha256)
+                 VALUES (?1,?2,?3,?4,?5,'user',?6,?7,?8,?9)",
+                params![scope.tenant_id, scope.user_id, job_id, order as i64,
+                    evidence_id, host, session, seq, hash],
+            )?;
+            tx.execute(
+                "INSERT INTO dream_candidate_redecisions
+                   (tenant_id,user_id,candidate_id,dream_job_id,evidence_id,redecision_kind,
+                    strategy_fingerprint,created_at)
+                 VALUES (?1,?2,?3,?4,?5,'user_request',?6,?7)",
+                params![scope.tenant_id, scope.user_id, candidate_id, job_id,
+                    evidence_id, strategy, now],
+            )?;
+        }
+        tx.commit()?;
+        self.dream_get(scope, &job_id)?.ok_or(StoreError::JobNotFound)
     }
 
     /// 领取（doc4 契约）。
@@ -670,6 +868,199 @@ impl Store {
         Ok(out)
     }
 
+    /// 当前 scope 中仍有有效来源的 Held 候选；调用方必须再以新候选做相关性筛选。
+    pub fn dream_held_candidates(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Vec<(DreamCandidateOut, Vec<(String, i64, i64)>)>, StoreError> {
+        let now = now_rfc3339()?;
+        let mut stmt = self.conn().prepare(
+            "SELECT c.id, c.kind, c.claim, c.quote, c.status,
+                    ce.start_byte, ce.end_byte, ce.evidence_id
+             FROM dream_candidates c
+             JOIN dream_candidate_evidence ce
+               ON ce.tenant_id=c.tenant_id AND ce.user_id=c.user_id AND ce.candidate_id=c.id
+             JOIN evidence_events ev
+               ON ev.tenant_id=ce.tenant_id AND ev.user_id=ce.user_id AND ev.id=ce.evidence_id
+             WHERE c.tenant_id=?1 AND c.user_id=?2 AND c.status='held'
+               AND c.id IN (SELECT recent.id FROM dream_candidates recent
+                 WHERE recent.tenant_id=?1 AND recent.user_id=?2 AND recent.status='held'
+                 ORDER BY recent.created_at DESC, recent.id DESC LIMIT 100)
+               AND NOT EXISTS (SELECT 1 FROM dream_candidate_evidence bad
+                 JOIN evidence_events src ON src.tenant_id=bad.tenant_id AND src.user_id=bad.user_id
+                                           AND src.id=bad.evidence_id
+                 WHERE bad.tenant_id=c.tenant_id AND bad.user_id=c.user_id AND bad.candidate_id=c.id
+                   AND (EXISTS (SELECT 1 FROM suppressed_sources ss
+                         WHERE ss.tenant_id=src.tenant_id AND ss.user_id=src.user_id AND ss.evidence_id=src.id)
+                     OR EXISTS (SELECT 1 FROM purge_tombstones pt
+                         WHERE pt.tenant_id=src.tenant_id AND pt.user_id=src.user_id
+                           AND pt.source_kind='evidence' AND pt.source_id=src.content_sha256)
+                     OR EXISTS (SELECT 1 FROM memory_evidence me
+                         JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                         WHERE me.tenant_id=src.tenant_id AND me.user_id=src.user_id AND me.evidence_id=src.id
+                           AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?3)
+                             OR EXISTS (SELECT 1 FROM memory_retirements mr
+                               WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)
+                             OR EXISTS (SELECT 1 FROM purge_jobs pj
+                               WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id
+                                 AND pj.target_id=m.id AND pj.status IN ('pending','running'))))))
+             ORDER BY c.id, ce.evidence_id",
+        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut out: Vec<(DreamCandidateOut, Vec<(String, i64, i64)>)> = Vec::new();
+        for row in rows {
+            let (id, kind, claim, quote, status, start, end, evidence_id) = row?;
+            match out.last_mut() {
+                Some((candidate, spans)) if candidate.candidate_id == id => {
+                    spans.push((evidence_id, start, end));
+                }
+                _ => out.push((
+                    DreamCandidateOut {
+                        candidate_id: id,
+                        kind,
+                        claim,
+                        quote,
+                        status,
+                        evidence_id: evidence_id.clone(),
+                        start_byte: start,
+                        end_byte: end,
+                    },
+                    vec![(evidence_id, start, end)],
+                )),
+            }
+        }
+        Ok(out)
+    }
+
+    /// 同一 held candidate、同一新证据与同一策略是否已经裁决过。
+    pub fn dream_candidate_redecision_seen(
+        &self,
+        scope: &ScopeKey,
+        candidate_id: &str,
+        evidence_id: &str,
+        strategy_fingerprint: &str,
+    ) -> Result<bool, StoreError> {
+        let exists: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM dream_candidate_redecisions
+             WHERE tenant_id=?1 AND user_id=?2 AND candidate_id=?3 AND evidence_id=?4
+               AND strategy_fingerprint=?5)",
+            params![scope.tenant_id, scope.user_id, candidate_id, evidence_id, strategy_fingerprint],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// 显式重裁作业冻结的旧 Held candidate 与仍有效的来源 span。
+    pub fn dream_redecision_candidates(
+        &self,
+        scope: &ScopeKey,
+        dream_job_id: &str,
+    ) -> Result<Vec<(DreamCandidateOut, Vec<(String, i64, i64)>)>, StoreError> {
+        let now = now_rfc3339()?;
+        let mut stmt = self.conn().prepare(
+            "SELECT c.id,c.kind,c.claim,c.quote,c.status,ce.start_byte,ce.end_byte,ce.evidence_id
+             FROM dream_candidate_redecisions d
+             JOIN dream_candidates c ON c.tenant_id=d.tenant_id AND c.user_id=d.user_id
+                                      AND c.id=d.candidate_id
+             JOIN dream_candidate_evidence ce ON ce.tenant_id=c.tenant_id AND ce.user_id=c.user_id
+                                               AND ce.candidate_id=c.id AND ce.evidence_id=d.evidence_id
+             JOIN evidence_events ev ON ev.tenant_id=ce.tenant_id AND ev.user_id=ce.user_id
+                                      AND ev.id=ce.evidence_id
+             WHERE d.tenant_id=?1 AND d.user_id=?2 AND d.dream_job_id=?3
+               AND d.redecision_kind='user_request' AND c.status='held'
+               AND ev.role='user' AND ev.source_kind='user'
+               AND NOT EXISTS (SELECT 1 FROM suppressed_sources ss
+                 WHERE ss.tenant_id=ev.tenant_id AND ss.user_id=ev.user_id AND ss.evidence_id=ev.id)
+               AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt
+                 WHERE pt.tenant_id=ev.tenant_id AND pt.user_id=ev.user_id
+                   AND pt.source_kind='evidence' AND pt.source_id=ev.content_sha256)
+               AND NOT EXISTS (SELECT 1 FROM memory_evidence me
+                 JOIN memories m ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                 WHERE me.tenant_id=ev.tenant_id AND me.user_id=ev.user_id AND me.evidence_id=ev.id
+                   AND (m.status<>'active' OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
+                     OR EXISTS (SELECT 1 FROM memory_retirements mr
+                       WHERE mr.tenant_id=m.tenant_id AND mr.user_id=m.user_id AND mr.memory_id=m.id)
+                     OR EXISTS (SELECT 1 FROM purge_jobs pj
+                       WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id
+                         AND pj.target_id=m.id AND pj.status IN ('pending','running'))))
+             ORDER BY c.id,ce.evidence_id",
+        )?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, dream_job_id, now],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            },
+        )?;
+        let mut out: Vec<(DreamCandidateOut, Vec<(String, i64, i64)>)> = Vec::new();
+        for row in rows {
+            let (id, kind, claim, quote, status, start, end, evidence_id) = row?;
+            match out.last_mut() {
+                Some((candidate, spans)) if candidate.candidate_id == id => {
+                    spans.push((evidence_id, start, end));
+                }
+                _ => out.push((
+                    DreamCandidateOut {
+                        candidate_id: id,
+                        kind,
+                        claim,
+                        quote,
+                        status,
+                        evidence_id: evidence_id.clone(),
+                        start_byte: start,
+                        end_byte: end,
+                    },
+                    vec![(evidence_id, start, end)],
+                )),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn dream_redecision_records(
+        &self,
+        scope: &ScopeKey,
+        dream_job_id: &str,
+    ) -> Result<Vec<DreamRedecisionRecord>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT candidate_id,evidence_id,redecision_kind,strategy_fingerprint
+             FROM dream_candidate_redecisions
+             WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3
+             ORDER BY candidate_id,evidence_id",
+        )?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, dream_job_id],
+            |r| {
+                Ok(DreamRedecisionRecord {
+                    candidate_id: r.get(0)?,
+                    evidence_id: r.get(1)?,
+                    redecision_kind: r.get(2)?,
+                    strategy_fingerprint: r.get(3)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// 崩溃恢复：过期 running 回 queued（冻结输入与账本保留；doc6/10 §5）。
     pub fn dream_recover_expired(&mut self, now: &str) -> Result<i64, StoreError> {
         let n = self.conn_mut().execute(
@@ -704,7 +1095,7 @@ impl Store {
         let row = self
             .conn()
             .query_row(
-                "SELECT id, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
+                "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
                         lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at
                  FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, job_id],
@@ -738,7 +1129,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DreamJobRow>, StoreError> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
+            "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
                     lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at
              FROM dream_jobs
              WHERE tenant_id=?1 AND user_id=?2 AND (?3 IS NULL OR status=?3)
@@ -801,18 +1192,19 @@ impl Store {
 fn map_dream_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DreamJobRow> {
     Ok(DreamJobRow {
         id: r.get(0)?,
-        trigger_kind: r.get(1)?,
-        trigger_key: r.get(2)?,
-        extract_version: r.get(3)?,
-        status: r.get(4)?,
-        attempts: r.get(5)?,
-        run_after: r.get(6)?,
-        lease_until: r.get(7)?,
-        claim_generation: r.get(8)?,
-        input_fingerprint: r.get(9)?,
-        error_code: r.get(10)?,
-        created_at: r.get(11)?,
-        updated_at: r.get(12)?,
+        purpose: r.get(1)?,
+        trigger_kind: r.get(2)?,
+        trigger_key: r.get(3)?,
+        extract_version: r.get(4)?,
+        status: r.get(5)?,
+        attempts: r.get(6)?,
+        run_after: r.get(7)?,
+        lease_until: r.get(8)?,
+        claim_generation: r.get(9)?,
+        input_fingerprint: r.get(10)?,
+        error_code: r.get(11)?,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
     })
 }
 

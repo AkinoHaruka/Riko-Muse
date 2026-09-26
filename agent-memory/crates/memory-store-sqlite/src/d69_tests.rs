@@ -28,6 +28,59 @@ fn setup(tag: &str) -> (Store, ScopeKey, Origin) {
     (store, scope, origin)
 }
 
+#[test]
+fn migration_0011_adds_runner_and_redecision_protocol() {
+    let root = std::env::temp_dir().join(format!(
+        "am-d69-test-{}-migration-0011",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let migrations_10 = root.join("migrations-10");
+    std::fs::create_dir_all(&migrations_10).unwrap();
+    for version in 1..=10 {
+        let source = std::fs::read_dir(migrations_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(&format!("{version:04}_")))
+            .unwrap()
+            .path();
+        std::fs::copy(&source, migrations_10.join(source.file_name().unwrap())).unwrap();
+    }
+    let db = root.join("migration.db");
+    let mut store = Store::open(&db, &migrations_10).unwrap();
+    let token_path = root.join("user.token");
+    store.principal_add("t", "u", &token_path).unwrap();
+    let token = std::fs::read_to_string(&token_path).unwrap();
+    let scope = store.verify_token(token.trim()).unwrap().unwrap();
+    store.conn_mut().execute(
+        "INSERT INTO consolidation_jobs
+           (id,tenant_id,user_id,document_kind,document_key,input_fingerprint,generator_version,
+            status,attempts,run_after,claim_generation,created_at,updated_at)
+         VALUES ('legacy-job',?1,?2,'topic_page','legacy','fingerprint','consolidate_v1',
+                 'queued',0,'2026-09-26T00:00:00Z',0,'2026-09-26T00:00:00Z','2026-09-26T00:00:00Z')",
+        rusqlite::params![scope.tenant_id, scope.user_id],
+    ).unwrap();
+    drop(store);
+    let store = Store::open(&db, &migrations_dir()).unwrap();
+    let applied: i64 = store
+        .conn()
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(applied, 11);
+    assert_eq!(store.dream_live_runner_count("9999-01-01T00:00:00Z").unwrap(), 0);
+    let redecisions: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM dream_candidate_redecisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(redecisions, 0);
+    let legacy: (String, Option<String>, i64) = store.conn().query_row(
+        "SELECT status,error_code,claim_generation FROM consolidation_jobs WHERE id='legacy-job'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(legacy, ("stale_input".into(), Some("DREAM_TRIGGER_REQUIRED".into()), 1));
+}
+
 fn remember_one(
     store: &mut Store,
     scope: &ScopeKey,
@@ -47,6 +100,175 @@ fn remember_one(
         crate::RememberOutcome::Created { memory_id, .. }
         | crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
     }
+}
+
+#[test]
+fn held_candidate_redecision_is_frozen_and_idempotent() {
+    let (mut store, scope, origin) = setup("held-redecision");
+    let old_text = "我目前在杭州工作";
+    let old_evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            old_text,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let old_job = store
+        .dream_trigger(&scope, "manual", "held-original", Some("a"), Some("dsh"), Some("s"))
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let (_, old_running) = store.dream_claim_next(&now, 900).unwrap().unwrap();
+    let (old_start, old_end) = crate::dream_jobs::locate_quote_span(old_text, old_text).unwrap();
+    store
+        .dream_submit_candidates(
+            &scope,
+            &old_job.id,
+            old_running.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[crate::dream_jobs::DreamProposal {
+                kind: "fact".into(),
+                claim: old_text.into(),
+                quote: old_text.into(),
+                evidence_id: old_evidence.clone(),
+                start_byte: old_start,
+                end_byte: old_end,
+                status: "held".into(),
+                reason_code: Some("defer".into()),
+                occurred_at: None,
+            }],
+        )
+        .unwrap();
+    store
+        .dream_succeed(&scope, &old_job.id, old_running.claim_generation, None, None, None)
+        .unwrap();
+    let held_id: String = store
+        .conn()
+        .query_row(
+            "SELECT id FROM dream_candidates WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, old_job.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let new_text = "我现在仍在杭州工作";
+    let new_evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            2,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            new_text,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let new_job = store
+        .dream_trigger(&scope, "manual", "held-related-new-evidence", Some("a"), Some("dsh"), Some("s"))
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let (_, new_running) = store.dream_claim_next(&now, 900).unwrap().unwrap();
+    let (new_start, new_end) = crate::dream_jobs::locate_quote_span(new_text, new_text).unwrap();
+    store
+        .dream_submit_candidates(
+            &scope,
+            &new_job.id,
+            new_running.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[crate::dream_jobs::DreamProposal {
+                kind: "fact".into(),
+                claim: new_text.into(),
+                quote: new_text.into(),
+                evidence_id: new_evidence.clone(),
+                start_byte: new_start,
+                end_byte: new_end,
+                status: "candidate".into(),
+                reason_code: None,
+                occurred_at: None,
+            }],
+        )
+        .unwrap();
+    let fresh = store.dream_accepted_candidates(&scope, &new_job.id).unwrap();
+    let old_held = store.dream_held_candidates(&scope).unwrap();
+    let old_held = old_held.iter().find(|(c, _)| c.candidate_id == held_id).unwrap();
+    let (fresh_candidate, fresh_spans) = fresh.first().unwrap();
+    let mut inputs = Vec::new();
+    for (evidence_id, start_byte, end_byte) in &old_held.1 {
+        inputs.push(crate::adjudication::AdjudicationCandidate {
+            candidate_id: old_held.0.candidate_id.clone(),
+            kind: old_held.0.kind.clone(),
+            claim: old_held.0.claim.clone(),
+            quote: old_held.0.quote.clone(),
+            status: "held".into(),
+            evidence_id: evidence_id.clone(),
+            start_byte: *start_byte,
+            end_byte: *end_byte,
+        });
+    }
+    for (evidence_id, start_byte, end_byte) in fresh_spans {
+        inputs.push(crate::adjudication::AdjudicationCandidate {
+            candidate_id: fresh_candidate.candidate_id.clone(),
+            kind: fresh_candidate.kind.clone(),
+            claim: fresh_candidate.claim.clone(),
+            quote: fresh_candidate.quote.clone(),
+            status: "candidate".into(),
+            evidence_id: evidence_id.clone(),
+            start_byte: *start_byte,
+            end_byte: *end_byte,
+        });
+    }
+    let strategy = "admit_v3:adjudicate_v1:test-embedding";
+    let links = [crate::adjudication::AdjudicationRedecision {
+        candidate_id: held_id.clone(),
+        evidence_id: new_evidence.clone(),
+        redecision_kind: "related_evidence".into(),
+        strategy_fingerprint: strategy.into(),
+    }];
+    let adjudication = store
+        .adjudication_create_with_redecisions(
+            &scope,
+            &new_job.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("test-embedding"),
+            &inputs,
+            &[],
+            &links,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .dream_candidate_redecision_seen(&scope, &held_id, &new_evidence, strategy)
+        .unwrap());
+    let frozen = store.adjudication_inputs(&scope, &adjudication.id).unwrap().0;
+    assert!(frozen.iter().any(|c| c.candidate_id == held_id && c.status == "held"));
+    assert!(frozen
+        .iter()
+        .any(|c| c.candidate_id == fresh_candidate.candidate_id));
+
+    let manual = store
+        .dream_redecision_trigger(&scope, &held_id, "user-rejudge-1", Some("a"), Some("dsh"), Some("s"))
+        .unwrap();
+    assert_eq!(manual.purpose, "redecision");
+    let duplicate = store
+        .dream_redecision_trigger(&scope, &held_id, "user-rejudge-different-http-key", None, None, None)
+        .unwrap();
+    assert_eq!(duplicate.id, manual.id, "相同 Held/evidence/strategy 只建一个重裁 job");
+    let manual_inputs = store.dream_redecision_candidates(&scope, &manual.id).unwrap();
+    assert_eq!(manual_inputs.len(), 1);
+    assert_eq!(manual_inputs[0].0.candidate_id, held_id);
+    assert!(manual_inputs[0].1.iter().any(|(id, _, _)| id == &old_evidence));
 }
 
 #[test]

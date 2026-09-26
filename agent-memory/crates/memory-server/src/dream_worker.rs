@@ -1,4 +1,4 @@
-//! D6-8 Dream 执行 worker（doc6/10 §8：memoryd 内置受控 runner）+ 语义裁决链
+//! D6 Dream/语义执行管线与异步向量索引 worker
 //! （doc6/09 §4：exact → 词法/向量召回 → 批量裁决 → Rust 原子应用）+ 异步向量
 //! 索引 worker（doc6/02 §4）。
 //!
@@ -14,14 +14,14 @@ use memory_domain::{claim_sha256, fold_whitespace, MemoryKind, ScopeKey};
 use memory_extract::{ExtractError, ExtractModel};
 use memory_store_sqlite::adjudication::{
     parse_adjudicate_v1, AdjudicationCandidate, AdjudicationJobRow, AdjudicationProposal,
-    AdjudicationRecall, ADJUDICATE_V1_PROMPT,
+    AdjudicationRecall, AdjudicationRedecision, ADJUDICATE_V1_PROMPT,
 };
 use memory_store_sqlite::dream_jobs::{
     locate_quote_span, parse_dream_extract_v1, DreamJobRow, DreamProposal, DREAM_EXTRACT_V1_PROMPT,
     DREAM_POLICY_V1,
 };
 use memory_store_sqlite::semantic_index::semantic_index_text;
-use memory_store_sqlite::{StoreError};
+use memory_store_sqlite::StoreError;
 
 use crate::embedding::EmbeddingClient;
 use crate::worker::{ModelConfig, OpenAiCompatibleClient};
@@ -34,7 +34,12 @@ const MAX_ATTEMPTS: i64 = memory_contract::JOB_MAX_ATTEMPTS as i64;
 
 /// 启动 Dream 管线 + 语义索引 worker。chat 未配置：Dream/裁决停队列；
 /// embedding 未配置：索引不跑、裁决停队列（见模块注释）。
-pub fn spawn_dream_pipeline(state: AppState, chat: Option<ModelConfig>, embedding: Option<Arc<EmbeddingClient>>) {
+pub fn spawn_dream_pipeline(
+    state: AppState,
+    chat: Option<ModelConfig>,
+    embedding: Option<Arc<EmbeddingClient>>,
+    dream_enabled: bool,
+) {
     let chat_client = chat.and_then(|cfg| match OpenAiCompatibleClient::new(cfg) {
         Ok(c) => Some(Arc::new(c)),
         Err(e) => {
@@ -45,31 +50,32 @@ pub fn spawn_dream_pipeline(state: AppState, chat: Option<ModelConfig>, embeddin
     tokio::spawn(async move {
         loop {
             let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-            // 心跳：running Dream job 续租（extract 与其裁决跨迭代保持所有权）。
-            {
+            // 心跳：Dream 启用时续租；关闭配置不得延长旧 job 的 running lease。
+            if dream_enabled {
                 let mut g = state.store.lock().unwrap();
                 let _ = g.dream_renew_running_leases(&now, LEASE_SECS);
             }
             // 1. Dream extract（chat 可用才领）。
-            if let Some(client) = &chat_client {
-                let claimed = {
-                    let mut g = state.store.lock().unwrap();
-                    g.dream_claim_next(&now, LEASE_SECS).ok().flatten()
-                };
-                if let Some((scope, job)) = claimed {
-                    process_dream_extract(&state, client.as_ref(), &scope, &job).await;
-                    continue;
-                }
-            }
-            // 2. 裁决作业（chat + embedding 都可用才领；doc6/09 §6）。
-            if let (Some(client), Some(_emb)) = (&chat_client, &embedding) {
-                let claimed = {
-                    let mut g = state.store.lock().unwrap();
-                    g.adjudication_claim(&now, LEASE_SECS).ok().flatten()
-                };
-                if let Some((scope, job)) = claimed {
-                    process_adjudication(&state, client.as_ref(), &scope, &job).await;
-                    continue;
+            if dream_enabled {
+                if let (Some(client), Some(_emb)) = (&chat_client, &embedding) {
+                    let claimed = {
+                        let mut g = state.store.lock().unwrap();
+                        g.dream_claim_next(&now, LEASE_SECS).ok().flatten()
+                    };
+                    if let Some((scope, job)) = claimed {
+                        process_dream_extract(&state, client.as_ref(), &scope, &job).await;
+                        continue;
+                    }
+
+                    // 裁决作业只有 chat 与 embedding 都可用时才领取；否则输入与账本保持原状。
+                    let claimed = {
+                        let mut g = state.store.lock().unwrap();
+                        g.adjudication_claim(&now, LEASE_SECS).ok().flatten()
+                    };
+                    if let Some((scope, job)) = claimed {
+                        process_adjudication(&state, client.as_ref(), &scope, &job).await;
+                        continue;
+                    }
                 }
             }
             // 3. 语义索引作业（embedding 可用才领）。
@@ -89,7 +95,9 @@ pub fn spawn_dream_pipeline(state: AppState, chat: Option<ModelConfig>, embeddin
 }
 
 fn retry_delay_for(attempts: i64) -> Option<i64> {
-    RETRY_DELAYS_SECS.get((attempts - 1).clamp(0, 2) as usize).copied()
+    RETRY_DELAYS_SECS
+        .get((attempts - 1).clamp(0, 2) as usize)
+        .copied()
 }
 
 fn kind_of(s: &str) -> Option<MemoryKind> {
@@ -118,7 +126,13 @@ async fn handle_provider_error(
     if job.attempts >= MAX_ATTEMPTS {
         let _ = g.dream_dead(scope, &job.id, job.claim_generation, code);
     } else {
-        let _ = g.dream_provider_wait(scope, &job.id, job.claim_generation, code, retry_delay_for(job.attempts.max(1)));
+        let _ = g.dream_provider_wait(
+            scope,
+            &job.id,
+            job.claim_generation,
+            code,
+            retry_delay_for(job.attempts.max(1)),
+        );
     }
 }
 
@@ -130,6 +144,42 @@ async fn process_dream_extract<M: ExtractModel>(
     scope: &ScopeKey,
     job: &DreamJobRow,
 ) {
+    if job.purpose == "redecision" {
+        match freeze_manual_redecision(state, scope, job).await {
+            // 留在 running，待后续 adjudication job 成功应用后统一推进终态。
+            Ok(()) => {}
+            Err(FreezeError::EmbeddingUnavailable) => {
+                let mut g = state.store.lock().unwrap();
+                let _ = g.dream_provider_wait(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "EMBEDDING_UNAVAILABLE",
+                    retry_delay_for(job.attempts.max(1)),
+                );
+            }
+            Err(FreezeError::StaleInput) => {
+                let mut g = state.store.lock().unwrap();
+                let _ = g.dream_stale_input(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "REDECISION_SOURCE_STALE",
+                );
+            }
+            Err(FreezeError::Store(e)) => {
+                eprintln!("[dream] 重裁 {} 冻结失败: {e}", job.id);
+                let mut g = state.store.lock().unwrap();
+                let _ = g.dream_dead(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "REDECISION_FREEZE_FAILED",
+                );
+            }
+        }
+        return;
+    }
     // 冻结输入序列化（锁内读）。
     let user_prompt = {
         let g = state.store.lock().unwrap();
@@ -203,12 +253,23 @@ async fn process_dream_extract<M: ExtractModel>(
     // 提交候选（唯一键幂等；重放安全）。
     let accepted = {
         let mut g = state.store.lock().unwrap();
-        match g.dream_submit_candidates(scope, &job.id, job.claim_generation, DREAM_POLICY_V1, &proposals) {
+        match g.dream_submit_candidates(
+            scope,
+            &job.id,
+            job.claim_generation,
+            DREAM_POLICY_V1,
+            &proposals,
+        ) {
             Ok((a, _r)) => a,
             Err(StoreError::StaleClaim) => return,
             Err(e) => {
                 eprintln!("[dream] job {} 候选提交失败: {e}", job.id);
-                let _ = g.dream_dead(scope, &job.id, job.claim_generation, "CANDIDATE_SUBMIT_FAILED");
+                let _ = g.dream_dead(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "CANDIDATE_SUBMIT_FAILED",
+                );
                 return;
             }
         }
@@ -216,7 +277,14 @@ async fn process_dream_extract<M: ExtractModel>(
     if accepted == 0 {
         // 无候选：直接完成（证据 processed）。
         let mut g = state.store.lock().unwrap();
-        let _ = g.dream_succeed(scope, &job.id, job.claim_generation, Some("dream"), out.input_tokens, out.output_tokens);
+        let _ = g.dream_succeed(
+            scope,
+            &job.id,
+            job.claim_generation,
+            Some("dream"),
+            out.input_tokens,
+            out.output_tokens,
+        );
         return;
     }
     // 裁决冻结；embedding 瞬时故障 → provider_wait 稍后重试（候选唯一键幂等）。
@@ -226,15 +294,35 @@ async fn process_dream_extract<M: ExtractModel>(
             if state.embedding.is_some() {
                 // 配置了但此刻失败：退避重试（重新 extract；候选唯一键防重复）。
                 let mut g = state.store.lock().unwrap();
-                let _ = g.dream_provider_wait(scope, &job.id, job.claim_generation, "EMBEDDING_UNAVAILABLE", retry_delay_for(job.attempts.max(1)));
+                let _ = g.dream_provider_wait(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "EMBEDDING_UNAVAILABLE",
+                    retry_delay_for(job.attempts.max(1)),
+                );
             }
             // 未配置 embedding：裁决作业已带 NULL model 冻结，保持待处理
             // （doc6/09 §6：新 Dream 语义自动应用保持待处理并报告 disabled）。
         }
+        Err(FreezeError::StaleInput) => {
+            let mut g = state.store.lock().unwrap();
+            let _ = g.dream_stale_input(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "DREAM_SOURCE_STALE",
+            );
+        }
         Err(FreezeError::Store(e)) => {
             eprintln!("[dream] job {} 裁决冻结失败: {e}", job.id);
             let mut g = state.store.lock().unwrap();
-            let _ = g.dream_dead(scope, &job.id, job.claim_generation, "ADJUDICATION_FREEZE_FAILED");
+            let _ = g.dream_dead(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "ADJUDICATION_FREEZE_FAILED",
+            );
         }
     }
     eprintln!("[dream] job {} extract 完成：候选 {accepted}", job.id);
@@ -242,21 +330,156 @@ async fn process_dream_extract<M: ExtractModel>(
 
 enum FreezeError {
     EmbeddingUnavailable,
+    StaleInput,
     Store(StoreError),
 }
 
+/// 显式重裁只消费 trigger 时冻结的 Held ID 与证据 span；不重新抽取、不创建
+/// second candidate，也不改变原 evidence 的 processed/pending 水位。
+async fn freeze_manual_redecision(
+    state: &AppState,
+    scope: &ScopeKey,
+    dream_job: &DreamJobRow,
+) -> Result<(), FreezeError> {
+    let (candidates, records) = {
+        let g = state.store.lock().unwrap();
+        (
+            g.dream_redecision_candidates(scope, &dream_job.id)
+                .map_err(FreezeError::Store)?,
+            g.dream_redecision_records(scope, &dream_job.id)
+                .map_err(FreezeError::Store)?,
+        )
+    };
+    if candidates.is_empty() || records.is_empty() {
+        return Err(FreezeError::StaleInput);
+    }
+    let embedding = state
+        .embedding
+        .clone()
+        .ok_or(FreezeError::EmbeddingUnavailable)?;
+    let claims: Vec<String> = candidates.iter().map(|(c, _)| c.claim.clone()).collect();
+    let vectors = embedding.embed(&claims).await.map_err(|e| {
+        eprintln!("[dream] 显式重裁 embedding 不可用: {e}");
+        FreezeError::EmbeddingUnavailable
+    })?;
+    let mut inputs = Vec::new();
+    for (candidate, spans) in &candidates {
+        for (evidence_id, start_byte, end_byte) in spans {
+            inputs.push(AdjudicationCandidate {
+                candidate_id: candidate.candidate_id.clone(),
+                kind: candidate.kind.clone(),
+                claim: candidate.claim.clone(),
+                quote: candidate.quote.clone(),
+                status: "held".into(),
+                evidence_id: evidence_id.clone(),
+                start_byte: *start_byte,
+                end_byte: *end_byte,
+            });
+        }
+    }
+    let redecisions: Vec<AdjudicationRedecision> = records
+        .iter()
+        .map(|r| AdjudicationRedecision {
+            candidate_id: r.candidate_id.clone(),
+            evidence_id: r.evidence_id.clone(),
+            redecision_kind: r.redecision_kind.clone(),
+            strategy_fingerprint: r.strategy_fingerprint.clone(),
+        })
+        .collect();
+    let k = memory_contract::ADJUDICATE_RECALL_TOP_K;
+    let mut recalls = Vec::new();
+    {
+        let g = state.store.lock().unwrap();
+        for (index, (candidate, _)) in candidates.iter().enumerate() {
+            let Some(kind) = kind_of(&candidate.kind) else {
+                continue;
+            };
+            let hash = claim_sha256(kind, &fold_whitespace(&candidate.claim));
+            for (id, _) in g
+                .memories_by_exact_hash(scope, kind.as_str(), &hash, k)
+                .map_err(FreezeError::Store)?
+            {
+                if let Some(memory) = g.get_memory(scope, &id).map_err(FreezeError::Store)? {
+                    recalls.push(AdjudicationRecall {
+                        candidate_id: candidate.candidate_id.clone(),
+                        target_memory_id: id,
+                        target_version: memory.version,
+                        channel: "exact".into(),
+                    });
+                }
+            }
+            if let Ok((hits, _)) = g.search_memories(scope, &candidate.claim, k, false) {
+                recalls.extend(hits.into_iter().map(|hit| AdjudicationRecall {
+                    candidate_id: candidate.candidate_id.clone(),
+                    target_memory_id: hit.memory_id,
+                    target_version: hit.version,
+                    channel: "lexical".into(),
+                }));
+            }
+            if let Some(vector) = vectors.get(index) {
+                if let Ok((hits, _)) = g.semantic_scan(scope, "memory", embedding.model_id(), vector, k) {
+                    for (id, _) in hits {
+                        if let Some(memory) = g.get_memory(scope, &id).map_err(FreezeError::Store)? {
+                            recalls.push(AdjudicationRecall {
+                                candidate_id: candidate.candidate_id.clone(),
+                                target_memory_id: id,
+                                target_version: memory.version,
+                                channel: "semantic".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    recalls.retain(|r| seen.insert((r.candidate_id.clone(), r.target_memory_id.clone())));
+    let mut g = state.store.lock().unwrap();
+    g.adjudication_create_with_redecisions(
+        scope,
+        &dream_job.id,
+        memory_contract::ADMISSION_VERSION_V3,
+        memory_store_sqlite::adjudication::ADJUDICATE_V1,
+        Some(embedding.model_id()),
+        &inputs,
+        &recalls,
+        &redecisions,
+    )
+    .map_err(FreezeError::Store)?
+    .ok_or(FreezeError::StaleInput)?;
+    Ok(())
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.is_empty() || left.len() != right.len() {
+        return None;
+    }
+    let dot: f32 = left.iter().zip(right).map(|(a, b)| a * b).sum();
+    let left_norm = left.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let right_norm = right.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if !dot.is_finite() || left_norm <= 0.0 || right_norm <= 0.0 {
+        return None;
+    }
+    let score = dot / (left_norm * right_norm);
+    score.is_finite().then_some(score)
+}
+
 /// 召回计算与裁决作业冻结（doc6/09 §4.B.1/§4.B.2）：exact → 词法 top-K →
-/// 向量 top-K；逐 channel 记录，每候选去重后合并。embedding 不可用时冻结
-/// embedding_model_id=NULL（worker 不处理此类作业 = 语义自动应用待处理）。
+/// 向量 top-K；旧 Held 仅在新证据 claim cosine 达到冻结阈值时加入本批；
+/// 每个 (candidate,evidence,strategy) 的重裁关系与 job 输入原子持久化。
 async fn freeze_adjudication(
     state: &AppState,
     scope: &ScopeKey,
     dream_job: &DreamJobRow,
 ) -> Result<(), FreezeError> {
-    let accepted = {
+    let (accepted, held) = {
         let g = state.store.lock().unwrap();
-        g.dream_accepted_candidates(scope, &dream_job.id)
-            .map_err(FreezeError::Store)?
+        (
+            g.dream_accepted_candidates(scope, &dream_job.id)
+                .map_err(FreezeError::Store)?,
+            g.dream_held_candidates(scope)
+                .map_err(FreezeError::Store)?,
+        )
     };
     if accepted.is_empty() {
         return Ok(());
@@ -277,13 +500,92 @@ async fn freeze_adjudication(
             });
         }
     }
+    let emb = state
+        .embedding
+        .clone()
+        .ok_or(FreezeError::EmbeddingUnavailable)?;
+    let strategy_fingerprint = format!(
+        "{}:{}:{}",
+        memory_contract::ADMISSION_VERSION_V3,
+        memory_store_sqlite::adjudication::ADJUDICATE_V1,
+        emb.model_id()
+    );
+    let mut redecisions: Vec<AdjudicationRedecision> = Vec::new();
+    let mut held_inputs = Vec::new();
+    let mut held_similarity_vectors: Option<Vec<Vec<f32>>> = None;
+    if !held.is_empty() {
+        let mut texts: Vec<String> = accepted.iter().map(|(c, _)| c.claim.clone()).collect();
+        texts.extend(held.iter().map(|(c, _)| c.claim.clone()));
+        let vectors = emb.embed(&texts).await.map_err(|e| {
+            eprintln!("[dream] Held 重裁相关性 embedding 不可用: {e}");
+            FreezeError::EmbeddingUnavailable
+        })?;
+        let fresh_count = accepted.len();
+        let mut linked_pairs = std::collections::HashSet::new();
+        for (held_index, (held_candidate, held_spans)) in held.iter().enumerate() {
+            let mut include_held = false;
+            for (fresh_index, (_fresh_candidate, fresh_spans)) in accepted.iter().enumerate() {
+                let related = cosine_similarity(
+                    &vectors[fresh_index],
+                    &vectors[fresh_count + held_index],
+                )
+                .is_some_and(|score| score >= memory_contract::HELD_REDECISION_MIN_COSINE);
+                if !related {
+                    continue;
+                }
+                for (evidence_id, _, _) in fresh_spans {
+                    if !linked_pairs.insert((held_candidate.candidate_id.clone(), evidence_id.clone())) {
+                        continue;
+                    }
+                    let already_seen = {
+                        let g = state.store.lock().unwrap();
+                        g.dream_candidate_redecision_seen(
+                            scope,
+                            &held_candidate.candidate_id,
+                            evidence_id,
+                            &strategy_fingerprint,
+                        )
+                        .map_err(FreezeError::Store)?
+                    };
+                    if already_seen {
+                        continue;
+                    }
+                    include_held = true;
+                    redecisions.push(AdjudicationRedecision {
+                        candidate_id: held_candidate.candidate_id.clone(),
+                        evidence_id: evidence_id.clone(),
+                        redecision_kind: "related_evidence".into(),
+                        strategy_fingerprint: strategy_fingerprint.clone(),
+                    });
+                }
+            }
+            if include_held {
+                for (evidence_id, start_byte, end_byte) in held_spans {
+                    held_inputs.push(AdjudicationCandidate {
+                        candidate_id: held_candidate.candidate_id.clone(),
+                        kind: held_candidate.kind.clone(),
+                        claim: held_candidate.claim.clone(),
+                        quote: held_candidate.quote.clone(),
+                        status: "held".into(),
+                        evidence_id: evidence_id.clone(),
+                        start_byte: *start_byte,
+                        end_byte: *end_byte,
+                    });
+                }
+            }
+        }
+        held_similarity_vectors = Some(vectors);
+        cand_inputs.extend(held_inputs);
+    }
     let k = memory_contract::ADJUDICATE_RECALL_TOP_K;
     let mut recalls: Vec<AdjudicationRecall> = Vec::new();
     // exact 快速路径（scope 内同 kind+hash 的 active 记忆；doc6/09 §4.B.1）。
     {
         let g = state.store.lock().unwrap();
         for (c, _) in &accepted {
-            let Some(kind) = kind_of(&c.kind) else { continue };
+            let Some(kind) = kind_of(&c.kind) else {
+                continue;
+            };
             let hash = claim_sha256(kind, &fold_whitespace(&c.claim));
             let hits = g
                 .memories_by_exact_hash(scope, kind.as_str(), &hash, k)
@@ -301,18 +603,15 @@ async fn freeze_adjudication(
         }
     }
     // 向量召回：批量 embed 候选 claim（锁外）。配置了但失败 → EmbeddingUnavailable。
-    let emb = state.embedding.clone();
-    let mut query_vecs: Option<Vec<Vec<f32>>> = None;
-    if let Some(emb) = &emb {
+    let query_vecs = if let Some(vectors) = held_similarity_vectors {
+        vectors.into_iter().take(accepted.len()).collect::<Vec<_>>()
+    } else {
         let texts: Vec<String> = accepted.iter().map(|(c, _)| c.claim.clone()).collect();
-        match emb.embed(&texts).await {
-            Ok(vs) => query_vecs = Some(vs),
-            Err(e) => {
-                eprintln!("[dream] 候选向量召回不可用: {e}");
-                return Err(FreezeError::EmbeddingUnavailable);
-            }
-        }
-    }
+        emb.embed(&texts).await.map_err(|e| {
+            eprintln!("[dream] 候选向量召回不可用: {e}");
+            FreezeError::EmbeddingUnavailable
+        })?
+    };
     // 词法 + 向量逐候选召回（锁内）。
     {
         let g = state.store.lock().unwrap();
@@ -327,19 +626,18 @@ async fn freeze_adjudication(
                     });
                 }
             }
-            if let Some(vs) = &query_vecs {
-                if let Some(qv) = vs.get(i) {
-                    let model_id = emb.as_ref().expect("query_vecs 非空则 embedding 必在").model_id();
-                    if let Ok((vhits, _n)) = g.semantic_scan(scope, "memory", model_id, qv, k) {
-                        for (mid, _sim) in vhits {
-                            if let Some(v) = g.get_memory(scope, &mid).map_err(FreezeError::Store)? {
-                                recalls.push(AdjudicationRecall {
-                                    candidate_id: c.candidate_id.clone(),
-                                    target_memory_id: mid.clone(),
-                                    target_version: v.version,
-                                    channel: "semantic".into(),
-                                });
-                            }
+            if let Some(qv) = query_vecs.get(i) {
+                if let Ok((vhits, _n)) =
+                    g.semantic_scan(scope, "memory", emb.model_id(), qv, k)
+                {
+                    for (mid, _sim) in vhits {
+                        if let Some(v) = g.get_memory(scope, &mid).map_err(FreezeError::Store)? {
+                            recalls.push(AdjudicationRecall {
+                                candidate_id: c.candidate_id.clone(),
+                                target_memory_id: mid.clone(),
+                                target_version: v.version,
+                                channel: "semantic".into(),
+                            });
                         }
                     }
                 }
@@ -351,14 +649,15 @@ async fn freeze_adjudication(
     recalls.retain(|r| seen.insert((r.candidate_id.clone(), r.target_memory_id.clone())));
     // 冻结（embedding_model_id 仅在向量召回实际可用时记录）。
     let mut g = state.store.lock().unwrap();
-    g.adjudication_create(
+    g.adjudication_create_with_redecisions(
         scope,
         &dream_job.id,
         memory_contract::ADMISSION_VERSION_V3,
         memory_store_sqlite::adjudication::ADJUDICATE_V1,
-        query_vecs.as_ref().map(|_| emb.as_ref().unwrap().model_id()),
+        Some(emb.model_id()),
         &cand_inputs,
         &recalls,
+        &redecisions,
     )
     .map_err(FreezeError::Store)?;
     Ok(())
@@ -386,10 +685,27 @@ async fn process_adjudication<M: ExtractModel>(
             .flatten()
             .map(|j| j.claim_generation)
             .unwrap_or(-1);
-        let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "succeeded", Some("NO_INPUTS"), None, None, None, None);
+        let _ = g.adjudication_finish(
+            scope,
+            &job.id,
+            job.claim_generation,
+            "succeeded",
+            Some("NO_INPUTS"),
+            None,
+            None,
+            None,
+            None,
+        );
         let _ = g.dream_succeed(scope, &job.dream_job_id, dream_gen, None, None, None);
         return;
     }
+    let dream_generation = {
+        let g = state.store.lock().unwrap();
+        match g.dream_get(scope, &job.dream_job_id) {
+            Ok(Some(parent)) => parent.claim_generation,
+            _ => return,
+        }
+    };
     let mut targets_json: Vec<serde_json::Value> = Vec::new();
     let mut target_scope_ok: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
@@ -427,11 +743,32 @@ async fn process_adjudication<M: ExtractModel>(
             };
             let mut g = state.store.lock().unwrap();
             if job.attempts >= MAX_ATTEMPTS {
-                let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "dead", Some(code), None, None, None, None);
-                let _ = g.dream_dead(scope, &job.dream_job_id, 0, code);
+                let _ = g.adjudication_finish(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "dead",
+                    Some(code),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let _ = g.dream_dead(scope, &job.dream_job_id, dream_generation, code);
             } else {
-                let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "provider_wait", Some(code), None, None, None, retry_delay_for(job.attempts.max(1)));
-                let _ = g.dream_provider_wait(scope, &job.dream_job_id, 0, code, None);
+                let _ = g.adjudication_finish(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "provider_wait",
+                    Some(code),
+                    None,
+                    None,
+                    None,
+                    retry_delay_for(job.attempts.max(1)),
+                );
+                let _ =
+                    g.dream_provider_wait(scope, &job.dream_job_id, dream_generation, code, None);
             }
             eprintln!("[adjudicate] job {} 模型失败: {code}", job.id);
             return;
@@ -442,8 +779,23 @@ async fn process_adjudication<M: ExtractModel>(
         Err(_) => {
             // 坏 JSON = 确定性失败：dead，不重复调用同一坏输出（doc6/09 §7）。
             let mut g = state.store.lock().unwrap();
-            let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "dead", Some("BAD_JSON"), None, None, None, None);
-            let _ = g.dream_dead(scope, &job.dream_job_id, 0, "ADJUDICATION_BAD_JSON");
+            let _ = g.adjudication_finish(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "dead",
+                Some("BAD_JSON"),
+                None,
+                None,
+                None,
+                None,
+            );
+            let _ = g.dream_dead(
+                scope,
+                &job.dream_job_id,
+                dream_generation,
+                "ADJUDICATION_BAD_JSON",
+            );
             eprintln!("[adjudicate] job {} 输出坏 JSON → dead", job.id);
             return;
         }
@@ -461,7 +813,7 @@ async fn process_adjudication<M: ExtractModel>(
             valid_until: i.valid_until,
         })
         .collect();
-    // Rust 原子应用（generation 0 的 dream 传播占位——见 process 末尾按 dream 行实际 gen）。
+    // Rust 原子应用；父 Dream job generation 在下方按数据库当前值复核。
     let applied_ids: Vec<String>;
     let apply_result = {
         let mut g = state.store.lock().unwrap();
@@ -484,14 +836,44 @@ async fn process_adjudication<M: ExtractModel>(
             }
             Err(StoreError::StaleInput) => {
                 // 任一召回 target 在模型运行中变化：整批 stale，不部分提交。
-                let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "stale_input", Some("INPUT_DRIFT"), None, None, None, None);
-                let _ = g.dream_stale_input(scope, &job.dream_job_id, dream_gen, "ADJUDICATION_INPUT_DRIFT");
+                let _ = g.adjudication_finish(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "stale_input",
+                    Some("INPUT_DRIFT"),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let _ = g.dream_stale_input(
+                    scope,
+                    &job.dream_job_id,
+                    dream_gen,
+                    "ADJUDICATION_INPUT_DRIFT",
+                );
                 eprintln!("[adjudicate] job {} 输入漂移 → stale_input", job.id);
                 return;
             }
             Err(e) => {
-                let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "dead", Some("APPLY_FAILED"), None, None, None, None);
-                let _ = g.dream_dead(scope, &job.dream_job_id, dream_gen, "ADJUDICATION_APPLY_FAILED");
+                let _ = g.adjudication_finish(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "dead",
+                    Some("APPLY_FAILED"),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let _ = g.dream_dead(
+                    scope,
+                    &job.dream_job_id,
+                    dream_gen,
+                    "ADJUDICATION_APPLY_FAILED",
+                );
                 eprintln!("[adjudicate] job {} 应用失败: {e}", job.id);
                 return;
             }
@@ -510,8 +892,25 @@ async fn process_adjudication<M: ExtractModel>(
             .flatten()
             .map(|j| j.claim_generation)
             .unwrap_or(-1);
-        let _ = g.adjudication_finish(scope, &job.id, job.claim_generation, "succeeded", None, Some("dream"), out.input_tokens, out.output_tokens, None);
-        let _ = g.dream_succeed(scope, &job.dream_job_id, dream_gen, Some("dream"), None, None);
+        let _ = g.adjudication_finish(
+            scope,
+            &job.id,
+            job.claim_generation,
+            "succeeded",
+            None,
+            Some("dream"),
+            out.input_tokens,
+            out.output_tokens,
+            None,
+        );
+        let _ = g.dream_succeed(
+            scope,
+            &job.dream_job_id,
+            dream_gen,
+            Some("dream"),
+            None,
+            None,
+        );
     }
     // 应用成功的 L1 异步入向量索引（索引失败不回滚证据，doc6/09 §6）。
     if let Some(emb) = &state.embedding {
@@ -541,19 +940,40 @@ async fn process_semantic_index(
             "memory" => match g.get_memory(scope, &job.object_id) {
                 Ok(Some(m)) => semantic_index_text("memory", None, &m.claim),
                 _ => {
-                    let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, "stale_input", Some("OBJECT_GONE"), None);
+                    let _ = g.semantic_job_finish(
+                        scope,
+                        &job.id,
+                        job.claim_generation,
+                        "stale_input",
+                        Some("OBJECT_GONE"),
+                        None,
+                    );
                     return;
                 }
             },
             "page" => match g.get_page(scope, &job.object_id, &now_rfc()) {
                 Ok(Some(p)) => semantic_index_text("page", Some(&p.title), &p.body_md),
                 _ => {
-                    let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, "stale_input", Some("OBJECT_GONE"), None);
+                    let _ = g.semantic_job_finish(
+                        scope,
+                        &job.id,
+                        job.claim_generation,
+                        "stale_input",
+                        Some("OBJECT_GONE"),
+                        None,
+                    );
                     return;
                 }
             },
             _ => {
-                let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, "dead", Some("BAD_KIND"), None);
+                let _ = g.semantic_job_finish(
+                    scope,
+                    &job.id,
+                    job.claim_generation,
+                    "dead",
+                    Some("BAD_KIND"),
+                    None,
+                );
                 return;
             }
         }
@@ -569,13 +989,26 @@ async fn process_semantic_index(
             };
             let mut g = state.store.lock().unwrap();
             let delay = retry_delay_for(job.attempts.max(1));
-            let status = if job.attempts >= MAX_ATTEMPTS { "dead" } else { status };
-            let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, status, Some(code), delay);
+            let status = if job.attempts >= MAX_ATTEMPTS {
+                "dead"
+            } else {
+                status
+            };
+            let _ = g.semantic_job_finish(
+                scope,
+                &job.id,
+                job.claim_generation,
+                status,
+                Some(code),
+                delay,
+            );
             eprintln!("[semantic] job {} embed 失败: {e}", job.id);
             return;
         }
     };
-    let Some(v) = vecs.into_iter().next() else { return };
+    let Some(v) = vecs.into_iter().next() else {
+        return;
+    };
     // 保存（核冻结版本/哈希；维度不符已在客户端核过）。
     let mut g = state.store.lock().unwrap();
     match g.semantic_vector_save(
@@ -588,14 +1021,35 @@ async fn process_semantic_index(
         &v,
     ) {
         Ok(()) => {
-            let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, "succeeded", None, None);
+            let _ = g.semantic_job_finish(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "succeeded",
+                None,
+                None,
+            );
         }
         Err(StoreError::StaleInput) => {
-            let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, "stale_input", Some("VERSION_DRIFT"), None);
+            let _ = g.semantic_job_finish(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "stale_input",
+                Some("VERSION_DRIFT"),
+                None,
+            );
         }
         Err(e) => {
             eprintln!("[semantic] job {} 保存失败: {e}", job.id);
-            let _ = g.semantic_job_finish(scope, &job.id, job.claim_generation, "dead", Some("SAVE_FAILED"), None);
+            let _ = g.semantic_job_finish(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "dead",
+                Some("SAVE_FAILED"),
+                None,
+            );
         }
     }
 }

@@ -10,7 +10,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// prompt_version/admission_version 分别选提示词与准入规则。0005 起新增表
 /// （doc6/02）：0005 soul/resident/audit/receipts；0006 派生知识文档、问题目录、
 /// 整理作业与页面索引；历史迁移 0001—0004 冻结不改。
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
@@ -78,6 +78,8 @@ pub const SEMANTIC_SCAN_LIMIT: usize = 10000;
 pub const QUERY_EMBEDDING_TIMEOUT_MS: u64 = 800;
 /// 裁决候选召回的混合 top-K（doc6/09 §4.2 初值）。
 pub const ADJUDICATE_RECALL_TOP_K: usize = 20;
+/// 旧 Held candidate 进入新裁决的最低新证据 claim cosine 相关度。
+pub const HELD_REDECISION_MIN_COSINE: f32 = 0.78;
 /// recency 因子（doc6/04 §3.1 Hindsight 初值，仅 episode Retrieved 排序）。
 pub const RECENCY_MODE_DEFAULT: &str = "linear";
 pub const RECENCY_HALFLIFE_DAYS: f64 = 90.0;

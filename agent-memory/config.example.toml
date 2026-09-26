@@ -29,6 +29,10 @@ migrations_dir = "migrations"
 # episode Retrieved 排序的 recency 模式：linear|exponential|none（默认 linear，doc6/04 §3.1）。
 # recency_mode = "linear"
 
+# ---- D6 Auto Dream（doc6/10）：默认启用；关闭只停止自动调度，不清除已持久作业 ----
+[dream]
+enabled = true
+
 # ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500
 # spool_limit_mb = 100

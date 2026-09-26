@@ -568,6 +568,9 @@ struct Config {
     listen_addr: String,
     db_path: PathBuf,
     migrations_dir: PathBuf,
+    /// Auto Dream 默认启用；关停只取消自动触发与领取，不删除已持久作业。
+    #[serde(default)]
+    dream: DreamConfig,
     /// OpenAI 兼容提取端点（http://host:port/path）。未配置则不启动提取 worker。
     model_endpoint: Option<String>,
     model_name: Option<String>,
@@ -597,6 +600,18 @@ struct Config {
     rerank_key_file: Option<PathBuf>,
     /// episode Retrieved 排序的 recency 模式：linear|exponential|none（默认 linear）。
     recency_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct DreamConfig {
+    enabled: bool,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl Config {
@@ -755,12 +770,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             worker::spawn_worker(state.clone(), model_cfg);
             // D6-8：Dream 管线 + 语义索引 worker（doc6/10 §8 受控 runner）。
             // chat 模型复用提取端点配置；embedding 由语义支路配置决定。
-            dream_worker::spawn_dream_pipeline(state.clone(), model_cfg_dream, embedding_client);
+            dream_worker::spawn_dream_pipeline(
+                state.clone(),
+                model_cfg_dream,
+                embedding_client,
+                cfg.dream.enabled,
+            );
             // D6-7：Auto Dream scheduler（doc6/10 §4.2，默认启用；memoryd 内置受控
             // runner，doc6/10 §8 路径——由持久 trigger/jobs 驱动）。周期 15 分钟
             // tick；每 scope 24 小时一次 + 空闲 15 分钟 + ≥1 条新 user event 才入队。
             // 无模型配置时作业停在 queued，doctor 报 dream_status=missing_model。
-            {
+            if cfg.dream.enabled {
                 let sched_state = state.clone();
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
@@ -786,6 +806,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 });
+            } else {
+                eprintln!("[memoryd] Auto Dream 已关闭：保留已持久作业与 L0，不新建定时 trigger");
             }
             let addr: SocketAddr = cfg.listen_addr.parse().expect("配置已校验为 loopback");
             let app = Router::new()
@@ -815,6 +837,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/pages/{page_id}", get(get_page))
                 .route("/v1/mental-model/questions", get(list_questions))
                 .route("/v1/dream/triggers", post(post_dream_trigger))
+                .route(
+                    "/v1/dream/candidates/{candidate_id}/rejudge",
+                    post(post_dream_rejudge),
+                )
                 .route("/v1/dream/jobs", get(list_dream_jobs))
                 .route("/v1/dream/jobs/{job_id}", get(get_dream_job))
                 .route("/v1/resident/page-pins", post(post_page_pin))
@@ -1036,6 +1062,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // db=ready 不代表作业健康，卡住的作业在此可见。
             let stats: JobDoctorStats = store.job_doctor_stats()?;
             println!("{}", stats.summary());
+            let chat_ready = cfg.model_endpoint.is_some()
+                && cfg.model_name.is_some()
+                && cfg.model_key_file.is_some();
+            let embedding_ready = cfg.embedding_endpoint.is_some()
+                && cfg.embedding_model.is_some()
+                && cfg.embedding_key_file.is_some()
+                && cfg.embedding_dimensions.is_some();
+            let now = memory_store_sqlite::now_rfc3339_pub()?;
+            let runner_ready = store.dream_live_runner_count(&now)? > 0;
+            let missing = [
+                (!chat_ready, "chat"),
+                (!embedding_ready, "embedding"),
+                (!runner_ready, "runner"),
+            ]
+            .into_iter()
+            .filter_map(|(is_missing, name)| is_missing.then_some(name))
+            .collect::<Vec<_>>();
+            let readiness = if !cfg.dream.enabled {
+                "disabled".to_string()
+            } else if missing.is_empty() {
+                "ready".to_string()
+            } else {
+                format!("missing_{}", missing.join(","))
+            };
+            println!(
+                "dream.enabled={} dream_readiness={} chat={} embedding={} runner={}",
+                cfg.dream.enabled,
+                readiness,
+                if chat_ready { "configured" } else { "missing" },
+                if embedding_ready { "configured" } else { "missing" },
+                if runner_ready { "online" } else { "missing_runner" },
+            );
             Ok(())
         }
         Commands::RebuildIndex { config } => {
@@ -1676,13 +1734,13 @@ fn run_questions_action(action: QuestionsAction) -> Result<(), String> {
             let v = store
                 .question_add(&scope, &key, &text, "user_cli")
                 .map_err(|e| match e {
-                StoreError::InvalidQuestionKey => "问题键须为 1—64 个 ASCII [a-z0-9_]".into(),
+                    StoreError::InvalidQuestionKey => "问题键须为 1—64 个 ASCII [a-z0-9_]".into(),
                     StoreError::InvalidQuestionText => {
                         "问题正文须 1—200 个 Unicode 标量字符".into()
                     }
-                StoreError::StateConflict => "该问题键已存在（add 要求 key 不存在）".into(),
-                other => other.to_string(),
-            })?;
+                    StoreError::StateConflict => "该问题键已存在（add 要求 key 不存在）".into(),
+                    other => other.to_string(),
+                })?;
             println!("已登记问题 {key} version={v}");
             Ok(())
         }
@@ -1703,9 +1761,9 @@ fn run_questions_action(action: QuestionsAction) -> Result<(), String> {
             let v = store
                 .question_update(&scope, &key, &text, expected_version, "user_cli")
                 .map_err(|e| match e {
-                StoreError::QuestionNotFound => "问题不存在或不属于当前 scope".into(),
-                other => other.to_string(),
-            })?;
+                    StoreError::QuestionNotFound => "问题不存在或不属于当前 scope".into(),
+                    other => other.to_string(),
+                })?;
             println!("已更新问题 {key} version={v}（旧画像已立即 stale）");
             Ok(())
         }
@@ -3977,7 +4035,7 @@ async fn post_context_bundle(
                 rrf.get(k)
                     .map(|(_, names)| names.join("+"))
                     .unwrap_or_else(|| "fused".into())
-        };
+            };
         for (key, _score) in &scored {
             match key.split_once(':') {
                 Some(("m", mid)) => {
@@ -4442,6 +4500,86 @@ async fn post_dream_trigger(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DreamRedecisionRequest {
+    idempotency_key: String,
+}
+
+async fn post_dream_rejudge(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(candidate_id): AxumPath<String>,
+    body: Result<Json<DreamRedecisionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidJson,
+                "请求不是合法 JSON",
+            )
+        }
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let result = {
+        let mut guard = state.store.lock().unwrap();
+        guard.dream_redecision_trigger(
+            &scope,
+            &candidate_id,
+            &req.idempotency_key,
+            None,
+            None,
+            None,
+        )
+    };
+    match result {
+        Ok(job) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "status": "redecision_queued",
+                "job": dream_job_json(&job),
+            })),
+        )
+            .into_response(),
+        Err(StoreError::JobNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "Held candidate 不存在或不属于当前 scope",
+        ),
+        Err(StoreError::StaleInput) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "Held candidate 已没有有效来源，不能重裁",
+        ),
+        Err(StoreError::InvalidPageField) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "idempotency_key 须为 1—128 字符",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DreamJobsQuery {
     status: Option<String>,
     limit: Option<usize>,
@@ -4450,6 +4588,7 @@ struct DreamJobsQuery {
 fn dream_job_json(job: &memory_store_sqlite::dream_jobs::DreamJobRow) -> serde_json::Value {
     serde_json::json!({
         "job_id": job.id,
+        "purpose": job.purpose,
         "trigger_kind": job.trigger_kind,
         "trigger_key": job.trigger_key,
         "extract_version": job.extract_version,
@@ -5038,7 +5177,7 @@ async fn retire_memory(
                 ErrorCode::InvalidField,
                 m,
             )
-    }
+        }
     };
     let req = memory_store_sqlite::lifecycle::RetireRequest {
         expected_version: body.expected_version,
@@ -5289,5 +5428,25 @@ mod cursor_tests {
         // 超长解码（>512 字节）。
         let big = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![b'x'; 600]);
         assert!(decode_job_cursor(&big).is_err(), "解码超长拒绝");
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+
+    const BASE: &str = r#"
+listen_addr = "127.0.0.1:8791"
+db_path = "memory.db"
+migrations_dir = "migrations"
+"#;
+
+    #[test]
+    fn auto_dream_defaults_to_enabled_and_can_be_disabled() {
+        let default: Config = toml::from_str(BASE).unwrap();
+        assert!(default.dream.enabled);
+
+        let disabled: Config = toml::from_str(&format!("{BASE}\n[dream]\nenabled = false\n")).unwrap();
+        assert!(!disabled.dream.enabled);
     }
 }

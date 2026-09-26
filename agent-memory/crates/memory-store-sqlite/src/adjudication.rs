@@ -64,6 +64,15 @@ pub struct AdjudicationRecall {
     pub channel: String,
 }
 
+/// 旧 Held candidate 与本 job 新证据的持久关联。
+#[derive(Debug, Clone)]
+pub struct AdjudicationRedecision {
+    pub candidate_id: String,
+    pub evidence_id: String,
+    pub redecision_kind: String,
+    pub strategy_fingerprint: String,
+}
+
 /// 模型裁决建议（已过 adjudicate_v1 schema 校验；Rust 仍复核引用与版本）。
 #[derive(Debug, Clone)]
 pub struct AdjudicationProposal {
@@ -129,6 +138,30 @@ impl Store {
         candidates: &[AdjudicationCandidate],
         recalls: &[AdjudicationRecall],
     ) -> Result<Option<AdjudicationJobRow>, StoreError> {
+        self.adjudication_create_with_redecisions(
+            scope,
+            dream_job_id,
+            admission_version,
+            adjudication_version,
+            embedding_model_id,
+            candidates,
+            recalls,
+            &[],
+        )
+    }
+
+    /// 与普通冻结相同；Held 重裁来源关系、候选输入和裁决 job 原子提交。
+    pub fn adjudication_create_with_redecisions(
+        &mut self,
+        scope: &ScopeKey,
+        dream_job_id: &str,
+        admission_version: &str,
+        adjudication_version: &str,
+        embedding_model_id: Option<&str>,
+        candidates: &[AdjudicationCandidate],
+        recalls: &[AdjudicationRecall],
+        redecisions: &[AdjudicationRedecision],
+    ) -> Result<Option<AdjudicationJobRow>, StoreError> {
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -147,6 +180,12 @@ impl Store {
             format!(
                 "r|{}|{}|{}|{}",
                 r.candidate_id, r.target_memory_id, r.target_version, r.channel
+            )
+        }));
+        parts.extend(redecisions.iter().map(|r| {
+            format!(
+                "d|{}|{}|{}|{}",
+                r.candidate_id, r.evidence_id, r.redecision_kind, r.strategy_fingerprint
             )
         }));
         parts.sort();
@@ -215,6 +254,24 @@ impl Store {
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![scope.tenant_id, scope.user_id, id, r.candidate_id,
                         r.target_memory_id, r.target_version, r.channel],
+            )?;
+        }
+        for r in redecisions {
+            tx.execute(
+                "INSERT OR IGNORE INTO dream_candidate_redecisions
+                   (tenant_id,user_id,candidate_id,dream_job_id,evidence_id,redecision_kind,
+                    strategy_fingerprint,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    r.candidate_id,
+                    dream_job_id,
+                    r.evidence_id,
+                    r.redecision_kind,
+                    r.strategy_fingerprint,
+                    now
+                ],
             )?;
         }
         tx.commit()?;
