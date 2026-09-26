@@ -1,5 +1,5 @@
 /**
- * 五个记忆工具（doc2/04，官方 defineTool 已核对 @477b4f4）。
+ * 用户记忆工具（doc2/04，官方 defineTool 已核对 @477b4f4）。
  *
  * - 证据定位：exec.agent.session.id + exec.agent.id；最新 user/user 消息来自事件线维护的
  *   记录（不按"最后一条正文事件"猜，也不用 deriveMessages 反推）。
@@ -11,10 +11,11 @@
  *   其余工具的同名错误仍 throw。
  * - 输出固定为 JSON 对象（schema 与 execute 返回值一致），render 为文本块。
  */
+import { createHash } from "node:crypto";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 import type { MemoryClient, ApiResult } from "./client.js";
-import type { EventPipeline, Logger } from "./events.js";
+import type { EventPipeline, LatestUserMessage, Logger } from "./events.js";
 
 export interface ToolServices {
   client: MemoryClient;
@@ -74,13 +75,17 @@ const USER_FIXABLE = new Set([
   "NOT_FOUND",
   "EVENT_CONFLICT",
   "INVALID_FIELD",
+  "IDEMPOTENCY_CONFLICT",
 ]);
 
 function toJson(value: unknown): Json {
   return JSON.parse(JSON.stringify(value ?? null)) as Json;
 }
 
-function toToolResult(r: ApiResult, opts?: { rememberStateConflict?: boolean }): ToolResultBody {
+function toToolResult(
+  r: ApiResult,
+  opts?: { rememberStateConflict?: boolean; lifecycleStateConflict?: boolean },
+): ToolResultBody {
   if (r.failure === "ok" && r.status >= 200 && r.status < 300) {
     return { ok: true, data: toJson(r.body) };
   }
@@ -93,6 +98,9 @@ function toToolResult(r: ApiResult, opts?: { rememberStateConflict?: boolean }):
   if (opts?.rememberStateConflict && r.status === 409 && code === "STATE_CONFLICT") {
     return { ok: false, error: { code, message } };
   }
+  if (opts?.lifecycleStateConflict && r.status === 409 && code === "STATE_CONFLICT") {
+    return { ok: false, error: { code, message } };
+  }
   if (USER_FIXABLE.has(code)) return { ok: false, error: { code, message } };
   // 基础设施/协议错误：抛出并记录 request_id，不把失败包装成成功。
   throw new Error(`agent-memory 内核错误 code=${code} request_id=${r.requestId ?? "?"}: ${message}`);
@@ -100,7 +108,12 @@ function toToolResult(r: ApiResult, opts?: { rememberStateConflict?: boolean }):
 
 export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
   type EvidenceCtx =
-    | { kind: "ok"; origin: { host_id: string; agent_id: string; session_id: string }; userEvidenceId: string }
+    | {
+        kind: "ok";
+        origin: { host_id: string; agent_id: string; session_id: string };
+        userEvidenceId: string;
+        latestUser: LatestUserMessage;
+      }
     | { kind: "err"; body: ToolResultBody };
   const evidenceContext = async (exec: ToolExecLike): Promise<EvidenceCtx> => {
     const agent = exec.agent;
@@ -119,8 +132,29 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
       kind: "ok",
       origin: { host_id: svc.hostId, agent_id: agentId, session_id: sessionId },
       userEvidenceId: evidenceId,
+      latestUser: latest,
     };
   };
+
+  const instructionSpan = (latest: LatestUserMessage, quote: string): [number, number] | undefined => {
+    if (quote.length === 0) return undefined;
+    const first = latest.content.indexOf(quote);
+    if (first < 0 || latest.content.indexOf(quote, first + 1) >= 0) return undefined;
+    const startByte = Buffer.byteLength(latest.content.slice(0, first), "utf8");
+    return [startByte, startByte + Buffer.byteLength(quote, "utf8")];
+  };
+  const lifecycleKey = (
+    op: string,
+    memoryId: string,
+    expectedVersion: number,
+    ctx: Extract<EvidenceCtx, { kind: "ok" }>,
+    span: [number, number],
+  ) =>
+    `dsh-${op}-${createHash("sha256")
+      .update(
+        `${memoryId}\0${expectedVersion}\0${ctx.userEvidenceId}\0${span[0]}\0${span[1]}\0${ctx.latestUser.messageId}`,
+      )
+      .digest("hex")}`;
 
   return [
     defineTool({
@@ -225,6 +259,78 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
             expected_version: args.expected_version,
             target_quote: args.target_quote,
           }),
+        );
+      },
+    }),
+    defineTool({
+      name: "memory_retire",
+      description: "仅在用户明确要求停用某条记忆时调用；先查当前版本，并引用最新用户消息中的唯一原文指令片段。",
+      parameters: {
+        id: { type: "string", required: true, description: "memory_id" },
+        expected_version: { type: "number", required: true, description: "来自 memory_search/memory_get 的当前版本" },
+        instruction_quote: { type: "string", required: true, description: "最新用户消息中唯一出现的连续原文指令片段" },
+      },
+      output: { schema: RESULT_SCHEMA, render: renderResult },
+      async execute(
+        args: { id: string; expected_version: number; instruction_quote: string },
+        exec: ToolExecLike,
+      ) {
+        if (!Number.isSafeInteger(args.expected_version) || args.expected_version <= 0) {
+          return { ok: false, error: { code: "INVALID_FIELD", message: "expected_version 必须是正整数，请先查当前记忆版本" } };
+        }
+        const ctx = await evidenceContext(exec);
+        if (ctx.kind === "err") return ctx.body;
+        const span = instructionSpan(ctx.latestUser, args.instruction_quote);
+        if (!span) {
+          return { ok: false, error: { code: "AMBIGUOUS_TARGET", message: "指令片段必须在最新用户消息中唯一、逐字出现" } };
+        }
+        return toToolResult(
+          await svc.client.retire(args.id, {
+            expected_version: args.expected_version,
+            idempotency_key: lifecycleKey("retire", args.id, args.expected_version, ctx, span),
+            origin: ctx.origin,
+            user_evidence_id: ctx.userEvidenceId,
+            target_quote: args.instruction_quote,
+            start_byte: span[0],
+            end_byte: span[1],
+          }),
+          { lifecycleStateConflict: true },
+        );
+      },
+    }),
+    defineTool({
+      name: "memory_restore",
+      description: "仅在用户明确要求恢复某条已退休记忆时调用；引用最新用户消息中的唯一原文恢复指令。",
+      parameters: {
+        id: { type: "string", required: true, description: "memory_id" },
+        expected_version: { type: "number", required: true, description: "来自 memory_search/memory_get 的当前版本" },
+        instruction_quote: { type: "string", required: true, description: "最新用户消息中唯一出现的连续原文恢复指令片段" },
+      },
+      output: { schema: RESULT_SCHEMA, render: renderResult },
+      async execute(
+        args: { id: string; expected_version: number; instruction_quote: string },
+        exec: ToolExecLike,
+      ) {
+        if (!Number.isSafeInteger(args.expected_version) || args.expected_version <= 0) {
+          return { ok: false, error: { code: "INVALID_FIELD", message: "expected_version 必须是正整数，请先查当前记忆版本" } };
+        }
+        const ctx = await evidenceContext(exec);
+        if (ctx.kind === "err") return ctx.body;
+        const span = instructionSpan(ctx.latestUser, args.instruction_quote);
+        if (!span) {
+          return { ok: false, error: { code: "AMBIGUOUS_TARGET", message: "指令片段必须在最新用户消息中唯一、逐字出现" } };
+        }
+        return toToolResult(
+          await svc.client.restore(args.id, {
+            expected_version: args.expected_version,
+            idempotency_key: lifecycleKey("restore", args.id, args.expected_version, ctx, span),
+            origin: ctx.origin,
+            user_evidence_id: ctx.userEvidenceId,
+            target_quote: args.instruction_quote,
+            start_byte: span[0],
+            end_byte: span[1],
+          }),
+          { lifecycleStateConflict: true },
         );
       },
     }),

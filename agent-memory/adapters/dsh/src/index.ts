@@ -147,14 +147,6 @@ class AgentMemoryPlugin {
 
   /** 注册 system-prompt/assemble waterfall：唯一 Soul system section。 */
   private registerSoulAssemble(): void {
-    if (!this.cfg.agentName) {
-      // DSH agent.id 是随机会话 ID（session-*），跨会话不稳；Soul 按
-      // (tenant,user,agent_id) 隔离会退化为按会话空人格。doc6/03 §1 要求
-      // agent 身份来自本进程配置——部署未提供时明确告警并回退。
-      this.logger.error?.(
-        "agent-memory: contextBundleEnabled 未配置 agentName；Soul 将回退到随机会话 ID，人格无法跨会话生效",
-      );
-    }
     const hook = makeSoulAssembleHook(
       this.client,
       this.logger,

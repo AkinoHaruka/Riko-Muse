@@ -8,7 +8,6 @@
 use memory_domain::{Origin, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::soul::{insert_receipt_tx, AuditAction, AuditLayer, MemoryAuditEntry};
 use crate::{now_rfc3339, Store, StoreError};

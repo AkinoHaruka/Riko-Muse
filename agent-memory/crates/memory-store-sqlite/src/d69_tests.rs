@@ -165,6 +165,21 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         store.retire_memory(&scope, &mid, &req).unwrap(),
         "同键同请求重放返回原回执"
     );
+    let different_request = RetireRequest {
+        expected_version: req.expected_version,
+        actor_kind: req.actor_kind,
+        reason_code: req.reason_code.clone(),
+        idempotency_key: req.idempotency_key.clone(),
+        origin: req.origin.clone(),
+        user_evidence_id: req.user_evidence_id.clone(),
+        target_quote: "用户住在杭州这条".into(),
+        start_byte: req.start_byte,
+        end_byte: req.end_byte,
+    };
+    assert!(matches!(
+        store.retire_memory(&scope, &mid, &different_request),
+        Err(StoreError::IdempotencyConflict)
+    ));
     let restore_evidence = match store
         .record_evidence(
             &scope,
@@ -198,6 +213,20 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         store.restore_memory(&scope, &mid, &restore).unwrap(),
         "同键 restore 重放返回原回执"
     );
+    let different_restore = RestoreRequest {
+        expected_version: restore.expected_version,
+        actor_kind: restore.actor_kind,
+        idempotency_key: restore.idempotency_key.clone(),
+        origin: restore.origin.clone(),
+        user_evidence_id: restore.user_evidence_id.clone(),
+        target_quote: "另一条恢复指令".into(),
+        start_byte: restore.start_byte,
+        end_byte: restore.end_byte,
+    };
+    assert!(matches!(
+        store.restore_memory(&scope, &mid, &different_restore),
+        Err(StoreError::IdempotencyConflict)
+    ));
     assert!(store.get_memory(&scope, &mid).unwrap().is_some());
     assert!(
         store

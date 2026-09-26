@@ -117,4 +117,12 @@ export class MemoryClient {
   forget(memoryId: string, request: Record<string, unknown>): Promise<ApiResult> {
     return this.post(`/v1/memories/${encodeURIComponent(memoryId)}/forget`, request, this.cfg.writeTimeoutMs);
   }
+
+  retire(memoryId: string, request: Record<string, unknown>): Promise<ApiResult> {
+    return this.post(`/v1/memories/${encodeURIComponent(memoryId)}/retire`, request, this.cfg.writeTimeoutMs);
+  }
+
+  restore(memoryId: string, request: Record<string, unknown>): Promise<ApiResult> {
+    return this.post(`/v1/memories/${encodeURIComponent(memoryId)}/restore`, request, this.cfg.writeTimeoutMs);
+  }
 }

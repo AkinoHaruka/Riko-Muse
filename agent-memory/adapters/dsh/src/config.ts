@@ -20,7 +20,7 @@ export interface AdapterConfig {
   captureEnabled: boolean;
   /** pre-step 自动注入。默认 true。 */
   injectionEnabled: boolean;
-  /** 注册五个记忆工具。默认 true。 */
+  /** 注册用户记忆工具。默认 true。Dream 子 Agent 不使用此工具集。 */
   toolsEnabled: boolean;
   /** 本地 spool 上限（events+receipts 总保留量）。默认 100 MiB。 */
   spoolLimitBytes: number;
@@ -42,8 +42,8 @@ export interface AdapterConfig {
   /**
    * 部署级稳定 agent ID（doc6/03 §1「本进程配置的宿主 Agent ID」）。Soul 按
    * (tenant,user,agent_id) 隔离，DSH 的 agent.id 是随机会话 ID（session-*），
-   * 跨会话不稳；部署须显式指定（如 'agent-a'）。缺省回退会话 ID 并告警
-   * （人格将按会话隔离，等价于每会话空人格）。
+   * 跨会话不稳。启用 v6 context bundle 时必须配置稳定值（如 'agent-a'）；
+   * 不允许回退到随机会话 ID，避免 Soul 随会话漂移。
    */
   agentName: string;
 }
@@ -68,6 +68,12 @@ export function loadConfig(raw: unknown): AdapterConfig {
   const hostId = strOr(r.hostId, "");
   if (hostId.length === 0) throw new Error("hostId 必填：当前 DSH 安装的稳定来源 ID（非空、非秘密、重启不变）");
   if (hostId.length > HOST_ID_MAX_CHARS) throw new Error(`hostId 最长 ${HOST_ID_MAX_CHARS} 字符`);
+  const contextBundleEnabled = boolOr(r.contextBundleEnabled, false);
+  const agentName = strOr(r.agentName, "").trim();
+  if (contextBundleEnabled && agentName.length === 0) {
+    throw new Error("contextBundleEnabled=true 时必须配置稳定 agentName，Soul 不能使用随机会话 ID");
+  }
+  if (agentName.length > HOST_ID_MAX_CHARS) throw new Error(`agentName 最长 ${HOST_ID_MAX_CHARS} 字符`);
   return {
     memoryUrl,
     userTokenFile,
@@ -79,11 +85,11 @@ export function loadConfig(raw: unknown): AdapterConfig {
     injectionEnabled: boolOr(r.injectionEnabled, true),
     toolsEnabled: boolOr(r.toolsEnabled, true),
     spoolLimitBytes: positiveIntOr(r.spoolLimitBytes, DEFAULT_SPOOL_LIMIT_BYTES, "spoolLimitBytes"),
-    contextBundleEnabled: boolOr(r.contextBundleEnabled, false),
+    contextBundleEnabled,
     requireContextBundle: boolOr(r.requireContextBundle, false),
     soulTimeoutMs: positiveIntOr(r.soulTimeoutMs, DEFAULT_SOUL_TIMEOUT_MS, "soulTimeoutMs"),
     bundleTimeoutMs: positiveIntOr(r.bundleTimeoutMs, DEFAULT_BUNDLE_TIMEOUT_MS, "bundleTimeoutMs"),
-    agentName: strOr(r.agentName, ""),
+    agentName,
   };
 }
 
