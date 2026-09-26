@@ -63,16 +63,30 @@ pub enum StoreError {
     IdempotencyConflict,
     #[error("幂等键不合法（1—128 个 ASCII [A-Za-z0-9._-]）")]
     InvalidIdempotencyKey,
+    #[error("问题键不合法（1—64 个 ASCII [a-z0-9_]）")]
+    InvalidQuestionKey,
+    #[error("问题正文须 1—200 个 Unicode 标量字符")]
+    InvalidQuestionText,
+    #[error("页面字段不合法（title 1—80、正文 1—1200、来源非空）")]
+    InvalidPageField,
+    #[error("问题不存在或不属于当前 scope")]
+    QuestionNotFound,
+    #[error("输入已失效（来源版本/状态变化），整批不发布")]
+    StaleInput,
     #[error("时间溢出: {0}")]
     Time(String),
 }
 
 pub mod diagnostics;
 #[cfg(test)]
+mod d65_tests;
+#[cfg(test)]
 mod probes;
+pub mod consolidation_jobs;
 pub mod evidence;
 pub mod jobs;
 pub mod memories;
+pub mod pages;
 pub mod resident;
 pub mod soul;
 
