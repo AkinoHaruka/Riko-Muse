@@ -803,6 +803,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 eprintln!("[memoryd] Auto Dream 已关闭：保留已持久作业与 L0，不新建定时 trigger");
             }
+            // Retention 是纯 Rust/SQLite 清理，不调用模型；仅扫描用户已经启用
+            // 正值策略的 scope。retention_run 在单一 IMMEDIATE transaction 内
+            // 复核策略版本、删除依赖闭包并写入完成回执。
+            let retention_state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+                loop {
+                    tick.tick().await;
+                    let scopes = {
+                        let Ok(store) = retention_state.store.lock() else {
+                            eprintln!("[memoryd] retention scheduler 无法取得 Store 锁");
+                            continue;
+                        };
+                        match store.retention_enabled_scopes() {
+                            Ok(scopes) => scopes,
+                            Err(error) => {
+                                eprintln!("[memoryd] retention scope 扫描失败: {error}");
+                                continue;
+                            }
+                        }
+                    };
+                    for scope in scopes {
+                        let result = match retention_state.store.lock() {
+                            Ok(mut store) => store.retention_run(&scope),
+                            Err(_) => {
+                                eprintln!("[memoryd] retention scheduler 无法取得 Store 锁");
+                                continue;
+                            }
+                        };
+                        match result {
+                            Ok(Some(result)) => {
+                                eprintln!("[memoryd] retention 批次完成: {}", result)
+                            }
+                            Ok(None) => {}
+                            Err(error) => eprintln!("[memoryd] retention 批次失败: {error}"),
+                        }
+                    }
+                }
+            });
             let addr: SocketAddr = cfg.listen_addr.parse().expect("配置已校验为 loopback");
             let app = Router::new()
                 .route("/v1/health", get(health))

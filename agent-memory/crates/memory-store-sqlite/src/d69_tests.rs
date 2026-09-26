@@ -30,10 +30,8 @@ fn setup(tag: &str) -> (Store, ScopeKey, Origin) {
 
 #[test]
 fn migration_0011_adds_runner_and_redecision_protocol() {
-    let root = std::env::temp_dir().join(format!(
-        "am-d69-test-{}-migration-0011",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("am-d69-test-{}-migration-0011", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let migrations_10 = root.join("migrations-10");
     std::fs::create_dir_all(&migrations_10).unwrap();
@@ -41,7 +39,12 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
         let source = std::fs::read_dir(migrations_dir())
             .unwrap()
             .filter_map(Result::ok)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with(&format!("{version:04}_")))
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{version:04}_"))
+            })
             .unwrap()
             .path();
         std::fs::copy(&source, migrations_10.join(source.file_name().unwrap())).unwrap();
@@ -64,13 +67,24 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
     let store = Store::open(&db, &migrations_dir()).unwrap();
     let applied: i64 = store
         .conn()
-        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(applied, 11);
-    assert_eq!(store.dream_live_runner_count("9999-01-01T00:00:00Z").unwrap(), 0);
+    assert_eq!(
+        store
+            .dream_live_runner_count("9999-01-01T00:00:00Z")
+            .unwrap(),
+        0
+    );
     let redecisions: i64 = store
         .conn()
-        .query_row("SELECT COUNT(*) FROM dream_candidate_redecisions", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM dream_candidate_redecisions",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(redecisions, 0);
     let legacy: (String, Option<String>, i64) = store.conn().query_row(
@@ -78,7 +92,14 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).unwrap();
-    assert_eq!(legacy, ("stale_input".into(), Some("DREAM_TRIGGER_REQUIRED".into()), 1));
+    assert_eq!(
+        legacy,
+        (
+            "stale_input".into(),
+            Some("DREAM_TRIGGER_REQUIRED".into()),
+            1
+        )
+    );
 }
 
 fn remember_one(
@@ -102,6 +123,18 @@ fn remember_one(
     }
 }
 
+fn source_of(store: &Store, scope: &ScopeKey, memory_id: &str) -> (String, i64, String) {
+    let (version, claim_sha256): (i64, String) = store
+        .conn()
+        .query_row(
+            "SELECT version,claim_sha256 FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    (memory_id.to_string(), version, claim_sha256)
+}
+
 #[test]
 fn held_candidate_redecision_is_frozen_and_idempotent() {
     let (mut store, scope, origin) = setup("held-redecision");
@@ -121,7 +154,14 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
     let old_job = store
-        .dream_trigger(&scope, "manual", "held-original", Some("a"), Some("dsh"), Some("s"))
+        .dream_trigger(
+            &scope,
+            "manual",
+            "held-original",
+            Some("a"),
+            Some("dsh"),
+            Some("s"),
+        )
         .unwrap()
         .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
@@ -147,7 +187,14 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
         )
         .unwrap();
     store
-        .dream_succeed(&scope, &old_job.id, old_running.claim_generation, None, None, None)
+        .dream_succeed(
+            &scope,
+            &old_job.id,
+            old_running.claim_generation,
+            None,
+            None,
+            None,
+        )
         .unwrap();
     let held_id: String = store
         .conn()
@@ -174,7 +221,14 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
     let new_job = store
-        .dream_trigger(&scope, "manual", "held-related-new-evidence", Some("a"), Some("dsh"), Some("s"))
+        .dream_trigger(
+            &scope,
+            "manual",
+            "held-related-new-evidence",
+            Some("a"),
+            Some("dsh"),
+            Some("s"),
+        )
         .unwrap()
         .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
@@ -199,9 +253,14 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
             }],
         )
         .unwrap();
-    let fresh = store.dream_accepted_candidates(&scope, &new_job.id).unwrap();
+    let fresh = store
+        .dream_accepted_candidates(&scope, &new_job.id)
+        .unwrap();
     let old_held = store.dream_held_candidates(&scope).unwrap();
-    let old_held = old_held.iter().find(|(c, _)| c.candidate_id == held_id).unwrap();
+    let old_held = old_held
+        .iter()
+        .find(|(c, _)| c.candidate_id == held_id)
+        .unwrap();
     let (fresh_candidate, fresh_spans) = fresh.first().unwrap();
     let mut inputs = Vec::new();
     for (evidence_id, start_byte, end_byte) in &old_held.1 {
@@ -251,24 +310,377 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
     assert!(store
         .dream_candidate_redecision_seen(&scope, &held_id, &new_evidence, strategy)
         .unwrap());
-    let frozen = store.adjudication_inputs(&scope, &adjudication.id).unwrap().0;
-    assert!(frozen.iter().any(|c| c.candidate_id == held_id && c.status == "held"));
+    let frozen = store
+        .adjudication_inputs(&scope, &adjudication.id)
+        .unwrap()
+        .0;
+    assert!(frozen
+        .iter()
+        .any(|c| c.candidate_id == held_id && c.status == "held"));
     assert!(frozen
         .iter()
         .any(|c| c.candidate_id == fresh_candidate.candidate_id));
 
     let manual = store
-        .dream_redecision_trigger(&scope, &held_id, "user-rejudge-1", Some("a"), Some("dsh"), Some("s"))
+        .dream_redecision_trigger(
+            &scope,
+            &held_id,
+            "user-rejudge-1",
+            Some("a"),
+            Some("dsh"),
+            Some("s"),
+        )
         .unwrap();
     assert_eq!(manual.purpose, "redecision");
     let duplicate = store
-        .dream_redecision_trigger(&scope, &held_id, "user-rejudge-different-http-key", None, None, None)
+        .dream_redecision_trigger(
+            &scope,
+            &held_id,
+            "user-rejudge-different-http-key",
+            None,
+            None,
+            None,
+        )
         .unwrap();
-    assert_eq!(duplicate.id, manual.id, "相同 Held/evidence/strategy 只建一个重裁 job");
-    let manual_inputs = store.dream_redecision_candidates(&scope, &manual.id).unwrap();
+    assert_eq!(
+        duplicate.id, manual.id,
+        "相同 Held/evidence/strategy 只建一个重裁 job"
+    );
+    let manual_inputs = store
+        .dream_redecision_candidates(&scope, &manual.id)
+        .unwrap();
     assert_eq!(manual_inputs.len(), 1);
     assert_eq!(manual_inputs[0].0.candidate_id, held_id);
-    assert!(manual_inputs[0].1.iter().any(|(id, _, _)| id == &old_evidence));
+    assert!(manual_inputs[0]
+        .1
+        .iter()
+        .any(|(id, _, _)| id == &old_evidence));
+}
+
+#[test]
+fn consolidation_retry_requeues_its_persisted_dream_trigger_atomically() {
+    let (mut store, scope, origin) = setup("consolidation-retry-dream");
+    let memory_id = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "我在杭州从事 Rust 开发",
+        MemoryKind::Fact,
+    );
+    let input = source_of(&store, &scope, &memory_id);
+    let now = crate::now_rfc3339_pub().unwrap();
+    let (job, dream) = store
+        .consolidation_enqueue_manual_dream(
+            &scope,
+            "topic_page",
+            "rust",
+            None,
+            "consolidate_v1",
+            "frozen-input-fingerprint",
+            &[input],
+            &now,
+        )
+        .unwrap();
+
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE consolidation_jobs SET status='dead',error_code='PAGE_PUBLISH_FAILED',attempts=1,
+                    claim_generation=4,lease_until=NULL WHERE id=?1",
+            [&job.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE dream_jobs SET status='dead',error_code='PAGE_PUBLISH_FAILED',attempts=1,
+                    claim_generation=4,runner_id=NULL,lease_until=NULL WHERE id=?1",
+            [&dream.id],
+        )
+        .unwrap();
+
+    assert!(store.consolidation_requeue(&scope, &job.id, &now).unwrap());
+    let consolidation = store.consolidation_get(&scope, &job.id).unwrap().unwrap();
+    let dream = store.dream_get(&scope, &dream.id).unwrap().unwrap();
+    assert_eq!(consolidation.status, "queued");
+    assert_eq!(consolidation.claim_generation, 4);
+    assert_eq!(consolidation.attempts, 1);
+    assert_eq!(dream.status, "queued");
+    assert_eq!(dream.claim_generation, 4);
+    assert_eq!(dream.attempts, 1);
+    assert_eq!(dream.error_code, None);
+    let runner_id: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT runner_id FROM dream_jobs WHERE id=?1",
+            [&dream.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(runner_id, None);
+}
+
+#[test]
+fn legacy_consolidation_without_dream_link_cannot_be_retried() {
+    let (mut store, scope, _) = setup("legacy-consolidation-retry");
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO consolidation_jobs
+           (id,tenant_id,user_id,document_kind,document_key,input_fingerprint,generator_version,
+            status,attempts,run_after,claim_generation,created_at,updated_at)
+         VALUES ('legacy-unlinked',?1,?2,'topic_page','legacy','fingerprint','consolidate_v1',
+                 'dead',1,'2026-09-26T00:00:00Z',0,'2026-09-26T00:00:00Z','2026-09-26T00:00:00Z')",
+            rusqlite::params![scope.tenant_id, scope.user_id],
+        )
+        .unwrap();
+
+    assert!(!store
+        .consolidation_requeue(&scope, "legacy-unlinked", "2026-09-26T01:00:00Z")
+        .unwrap());
+    let job = store
+        .consolidation_get(&scope, "legacy-unlinked")
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, "dead");
+}
+
+#[test]
+fn manual_consolidation_dream_link_uses_scope_and_ids_in_correct_columns() {
+    let (mut store, scope, origin) = setup("manual-consolidation-link");
+    let m1 = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "Rust 后端服务",
+        MemoryKind::Fact,
+    );
+    let m2 = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        2,
+        "Rust 本地工具",
+        MemoryKind::Fact,
+    );
+    let inputs = vec![
+        source_of(&store, &scope, &m1),
+        source_of(&store, &scope, &m2),
+    ];
+    let now = crate::now_rfc3339_pub().unwrap();
+    let first = store
+        .consolidation_enqueue(
+            &scope,
+            "topic_page",
+            "manual-rust-linked",
+            None,
+            crate::pages::GENERATE_CONSOLIDATE_V1,
+            "manual-rust-linked-fingerprint",
+            &inputs,
+            &now,
+        )
+        .unwrap();
+    let linked = store
+        .dream_link_manual_consolidation(
+            &scope,
+            &first.id,
+            &format!("manual-consolidation-{}", first.id),
+        )
+        .expect("manual consolidation must persist its Dream trigger");
+    assert_eq!(linked.purpose, "consolidation");
+    assert_eq!(linked.trigger_kind, "manual");
+
+    let (job, dream) = store
+        .consolidation_enqueue_manual_dream(
+            &scope,
+            "topic_page",
+            "manual-rust-atomic",
+            None,
+            crate::pages::GENERATE_CONSOLIDATE_V1,
+            "manual-rust-atomic-fingerprint",
+            &inputs,
+            &now,
+        )
+        .unwrap();
+    assert_eq!(job.status, "queued");
+    assert_eq!(dream.purpose, "consolidation");
+    assert_eq!(dream.trigger_kind, "manual");
+
+    let (job_again, dream_again) = store
+        .consolidation_enqueue_manual_dream(
+            &scope,
+            "topic_page",
+            "manual-rust-atomic",
+            None,
+            crate::pages::GENERATE_CONSOLIDATE_V1,
+            "manual-rust-atomic-fingerprint",
+            &inputs,
+            &now,
+        )
+        .unwrap();
+    assert_eq!(job_again.id, job.id, "same manual input reuses the job");
+    assert_eq!(
+        dream_again.id, dream.id,
+        "same job reuses its Dream trigger"
+    );
+    let link_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM dream_consolidation_links
+             WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3 AND consolidation_job_id=?4",
+            rusqlite::params![scope.tenant_id, scope.user_id, dream.id, job.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(link_count, 1);
+}
+
+#[test]
+fn persistent_runner_claims_and_renews_frozen_phases() {
+    let (mut store, scope, origin) = setup("runner-claim");
+    let text = "我住在杭州";
+    let evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            text,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let triggered = store
+        .dream_trigger(
+            &scope,
+            "manual",
+            "runner-trigger",
+            Some("agent-a"),
+            Some("dsh"),
+            Some("s"),
+        )
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    store
+        .dream_runner_heartbeat(
+            &scope,
+            "runner-1",
+            "dsh",
+            "agent-a",
+            "[\"chat\",\"dream_v1\"]",
+            60,
+        )
+        .unwrap();
+    let heartbeat_now = crate::now_rfc3339_pub().unwrap();
+    assert!(store
+        .dream_runner_has_capability(&scope, "runner-1", "chat", &heartbeat_now)
+        .unwrap());
+    assert_eq!(
+        store
+            .dream_live_runner_capability_count(&heartbeat_now, "chat")
+            .unwrap(),
+        1
+    );
+    let first = store
+        .dream_runner_claim(&scope, "runner-1", &now, 90)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.dream_job.id, triggered.id);
+    assert!(first.adjudication_job.is_none());
+    assert!(
+        store
+            .dream_runner_claim(&scope, "runner-1", &now, 90)
+            .unwrap()
+            .is_none(),
+        "同 runner 不得并行领取第二个 Dream"
+    );
+
+    let (start, end) = crate::dream_jobs::locate_quote_span(text, text).unwrap();
+    store
+        .dream_submit_candidates(
+            &scope,
+            &first.dream_job.id,
+            first.dream_job.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[crate::dream_jobs::DreamProposal {
+                kind: "fact".into(),
+                claim: text.into(),
+                quote: text.into(),
+                evidence_id: evidence.clone(),
+                start_byte: start,
+                end_byte: end,
+                status: "candidate".into(),
+                reason_code: None,
+                occurred_at: None,
+            }],
+        )
+        .unwrap();
+    let (candidate, spans) = store
+        .dream_accepted_candidates(&scope, &first.dream_job.id)
+        .unwrap()
+        .remove(0);
+    let adj_input = crate::adjudication::AdjudicationCandidate {
+        candidate_id: candidate.candidate_id.clone(),
+        kind: candidate.kind,
+        claim: candidate.claim,
+        quote: candidate.quote,
+        status: "candidate".into(),
+        evidence_id: spans[0].0.clone(),
+        start_byte: spans[0].1,
+        end_byte: spans[0].2,
+    };
+    store
+        .adjudication_create(
+            &scope,
+            &first.dream_job.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("test-embedding"),
+            &[adj_input],
+            &[],
+        )
+        .unwrap();
+    let resumed = store
+        .dream_runner_claim(&scope, "runner-1", &crate::now_rfc3339_pub().unwrap(), 90)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resumed.dream_job.claim_generation,
+        first.dream_job.claim_generation
+    );
+    let adjudication = resumed.adjudication_job.unwrap();
+    assert_eq!(adjudication.status, "running");
+    assert!(store
+        .dream_runner_lease(
+            &scope,
+            "runner-1",
+            &resumed.dream_job.id,
+            resumed.dream_job.claim_generation,
+            Some((&adjudication.id, adjudication.claim_generation)),
+            None,
+            90,
+        )
+        .unwrap());
+    assert!(
+        !store
+            .dream_runner_lease(
+                &scope,
+                "runner-1",
+                &resumed.dream_job.id,
+                resumed.dream_job.claim_generation - 1,
+                Some((&adjudication.id, adjudication.claim_generation)),
+                None,
+                90,
+            )
+            .unwrap(),
+        "旧 Dream generation 不得续租"
+    );
 }
 
 #[test]
@@ -749,7 +1161,7 @@ fn retention_default_disabled_and_positive_policy_runs() {
         "用户住在杭州",
         MemoryKind::Fact,
     );
-    // 一条无记忆引用、时间戳极旧的事件：用旧 occurred_at 直插（模拟超期）。
+    // 一条无记忆引用的旧事件。retention 依据 received_at，而非可由上游回填的 occurred_at。
     let old_ev = {
         let old = chrono::Utc::now() - chrono::Duration::days(400);
         match store
@@ -764,6 +1176,22 @@ fn retention_default_disabled_and_positive_policy_runs() {
     assert!(store.get_memory(&scope, &_mid).unwrap().is_some());
     // 正值策略：raw evidence 保留 365 天 → 400 天前且无引用的事件被清理。
     store.retention_set_policy(&scope, 365, 0, true).unwrap();
+    let effective_at = (chrono::Utc::now() - chrono::Duration::days(500)).to_rfc3339();
+    let received_at = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE retention_policies SET effective_at=?3 WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![scope.tenant_id, scope.user_id, effective_at],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE evidence_events SET received_at=?4 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, old_ev, received_at],
+        )
+        .unwrap();
     let r = store.retention_run(&scope).unwrap().unwrap();
     assert_eq!(
         r.get("raw_evidence_deleted").and_then(|v| v.as_i64()),
@@ -782,4 +1210,270 @@ fn retention_default_disabled_and_positive_policy_runs() {
     assert!(store.get_memory(&scope, &_mid).unwrap().is_some());
     // 同批次重跑幂等。
     assert!(store.retention_run(&scope).unwrap().is_none());
+}
+
+#[test]
+fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
+    let (mut store, scope, origin) = setup("retention-shared-source");
+    store.retention_set_policy(&scope, 1, 0, true).unwrap();
+    let policy_effective = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE retention_policies SET effective_at=?3 WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![scope.tenant_id, scope.user_id, policy_effective],
+        )
+        .unwrap();
+    fn record_source(
+        store: &mut Store,
+        scope: &ScopeKey,
+        origin: &Origin,
+        seq: i64,
+        claim: &str,
+        old: bool,
+    ) -> String {
+        let occurred = if old {
+            chrono::Utc::now() - chrono::Duration::days(3)
+        } else {
+            chrono::Utc::now()
+        };
+        let evidence = match store
+            .record_evidence(&scope, &origin, seq, "user", "user", &occurred, claim)
+            .unwrap()
+        {
+            crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+        };
+        if old {
+            let received = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+            store.conn_mut().execute(
+                "UPDATE evidence_events SET received_at=?4 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                rusqlite::params![scope.tenant_id, scope.user_id, evidence, received],
+            ).unwrap();
+        }
+        evidence
+    }
+
+    let old_a = record_source(&mut store, &scope, &origin, 1, "用户住在杭州", true);
+    let only_old_memory = match store
+        .remember(&scope, &origin, &old_a, "用户住在杭州", MemoryKind::Fact)
+        .unwrap()
+    {
+        crate::RememberOutcome::Created { memory_id, .. }
+        | crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
+    };
+    let old_b = record_source(&mut store, &scope, &origin, 2, "用户住在杭州", true);
+    store
+        .remember(&scope, &origin, &old_b, "用户住在杭州", MemoryKind::Fact)
+        .unwrap();
+
+    let old_c = record_source(&mut store, &scope, &origin, 3, "用户在南京工作", true);
+    let shared_memory = match store
+        .remember(&scope, &origin, &old_c, "用户在南京工作", MemoryKind::Fact)
+        .unwrap()
+    {
+        crate::RememberOutcome::Created { memory_id, .. }
+        | crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
+    };
+    let recent = record_source(&mut store, &scope, &origin, 4, "用户在南京工作", false);
+    store
+        .remember(&scope, &origin, &recent, "用户在南京工作", MemoryKind::Fact)
+        .unwrap();
+
+    let result = store.retention_run(&scope).unwrap().unwrap();
+    assert_eq!(result["raw_evidence_deleted"].as_i64(), Some(3));
+    assert_eq!(result["memories_purged"].as_i64(), Some(1));
+    assert!(
+        store
+            .get_memory(&scope, &only_old_memory)
+            .unwrap()
+            .is_none(),
+        "同一批次内全部支持证据到期，L1 应进入 purge 闭包"
+    );
+    assert!(
+        store.get_memory(&scope, &shared_memory).unwrap().is_some(),
+        "仍有未到期来源时不得删除 L1"
+    );
+    let surviving_sources: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+        rusqlite::params![scope.tenant_id, scope.user_id, shared_memory], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(surviving_sources, 1, "到期来源解除关联，近期来源保留");
+    let audit_action: String = store.conn().query_row(
+        "SELECT action FROM memory_audit WHERE tenant_id=?1 AND user_id=?2 AND record_id=?3 ORDER BY updated_at_ms DESC LIMIT 1",
+        rusqlite::params![scope.tenant_id, scope.user_id, shared_memory], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(audit_action, "update", "解除一个证据关联记为 L1 update");
+    let succeeded_jobs: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM retention_jobs WHERE tenant_id=?1 AND user_id=?2 AND status='succeeded'",
+        rusqlite::params![scope.tenant_id, scope.user_id], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(succeeded_jobs, 1, "删除回执与数据清理在同一事务提交");
+}
+
+#[test]
+fn retention_processes_more_than_one_l0_batch_and_releases_terminal_dream_inputs() {
+    let (mut store, scope, origin) = setup("retention-batches-terminal-dream");
+    store.retention_set_policy(&scope, 1, 0, true).unwrap();
+    let policy_effective = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+    let old_received = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE retention_policies SET effective_at=?3 WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![scope.tenant_id, scope.user_id, policy_effective],
+        )
+        .unwrap();
+
+    let mut evidence_ids = Vec::new();
+    for seq in 0..257 {
+        let evidence_id = match store
+            .record_evidence(
+                &scope,
+                &origin,
+                seq,
+                "user",
+                "user",
+                &chrono::Utc::now(),
+                &format!("批次测试事件 {seq}"),
+            )
+            .unwrap()
+        {
+            crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+        };
+        store.conn_mut().execute(
+            "UPDATE evidence_events SET received_at=?4 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, evidence_id, old_received],
+        ).unwrap();
+        evidence_ids.push(evidence_id);
+    }
+
+    // A terminal deterministic failure retains its frozen input for explicit admin retry,
+    // but an authorized retention policy can still remove that input after its cutoff.
+    let dream_evidence = evidence_ids[0].clone();
+    let dream = store
+        .dream_trigger(&scope, "manual", "retention-dead-input", None, None, None)
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
+    assert_eq!(claimed.id, dream.id);
+    assert!(store
+        .dream_dead(&scope, &dream.id, claimed.claim_generation, "TEST_DEAD")
+        .unwrap());
+
+    let first = store.retention_run(&scope).unwrap().unwrap();
+    assert_eq!(first["raw_evidence_deleted"].as_i64(), Some(256));
+    let remaining: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_events WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![scope.tenant_id, scope.user_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 1, "超过单轮上限的 L0 必须留待下轮，不得卡死整批");
+
+    let second = store.retention_run(&scope).unwrap().unwrap();
+    assert_eq!(second["raw_evidence_deleted"].as_i64(), Some(1));
+    let remaining: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_events WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![scope.tenant_id, scope.user_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+    let state_left: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM dream_evidence_state WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+        rusqlite::params![scope.tenant_id, scope.user_id, dream_evidence],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        state_left, 0,
+        "过期 dead job 输入及账本一并从 purge 闭包清理"
+    );
+}
+
+#[test]
+fn retention_does_not_purge_expired_memory_used_by_recoverable_dream_job() {
+    let (mut store, scope, origin) = setup("retention-active-dream-closure");
+    store.retention_set_policy(&scope, 0, 1, true).unwrap();
+    let policy_effective = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE retention_policies SET effective_at=?3 WHERE tenant_id=?1 AND user_id=?2",
+            rusqlite::params![scope.tenant_id, scope.user_id, policy_effective],
+        )
+        .unwrap();
+    let evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            "用户住在杭州",
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let dream = store
+        .dream_trigger(&scope, "manual", "retention-active-dream", None, None, None)
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
+    let memory = match store
+        .remember(&scope, &origin, &evidence, "用户住在杭州", MemoryKind::Fact)
+        .unwrap()
+    {
+        crate::RememberOutcome::Created { memory_id, .. }
+        | crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
+    };
+    let expired_at = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE memories SET valid_until=?4 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, memory, expired_at],
+        )
+        .unwrap();
+
+    assert!(
+        store.retention_run(&scope).unwrap().is_none(),
+        "过期 L1 的 purge 闭包不能删除仍由可恢复 Dream job 冻结的 L0"
+    );
+    assert!(store.get_memory(&scope, &memory).unwrap().is_some());
+    let evidence_exists: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, evidence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence_exists, 1);
+
+    // Once the job is terminal, an expired policy-authorized purge may close its input.
+    assert!(store
+        .dream_dead(&scope, &dream.id, claimed.claim_generation, "TEST_DEAD")
+        .unwrap());
+    let result = store.retention_run(&scope).unwrap().unwrap();
+    assert_eq!(result["memories_purged"].as_i64(), Some(1));
+    let residual_evidence: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, evidence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        residual_evidence, 0,
+        "terminal Dream 的冻结输入随 purge 闭包删除"
+    );
 }

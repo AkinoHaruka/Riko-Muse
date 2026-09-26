@@ -7,14 +7,16 @@
 //! 删除；删 evidence 时以 purge_tombstones 防止 spool 重放复活。
 
 use memory_domain::ScopeKey;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::soul::{AuditAction, AuditLayer, MemoryAuditEntry};
 use crate::{lifecycle::sha256_hex, now_rfc3339, Store, StoreError};
 
 /// confirmation 有效期（短期一次性）。
 const CONFIRMATION_TTL_SECS: i64 = 900;
+const RETENTION_BATCH_MAX_OBJECTS: usize = 256;
 
 /// preview 闭包摘要（无正文：仅计数与 ID 清单供可信 UI 展示）。
 #[derive(Debug, Default, serde::Serialize)]
@@ -37,6 +39,22 @@ pub struct PurgeOutcome {
 }
 
 impl Store {
+    /// Scope keys with an explicitly enabled positive retention policy only.
+    /// Used by the no-LLM timer; never opens or upgrades an external database.
+    pub fn retention_enabled_scopes(&self) -> Result<Vec<ScopeKey>, StoreError> {
+        let mut stmt=self.conn().prepare(
+            "SELECT tenant_id,user_id FROM retention_policies
+             WHERE enabled=1 AND (raw_evidence_retention_days>0 OR expired_memory_purge_after_days>0)
+             ORDER BY tenant_id,user_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ScopeKey {
+                tenant_id: r.get(0)?,
+                user_id: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// 依赖闭包计算（只读）：目标记忆 + 独占 evidence + 依赖页/候选/审计。
     /// idempotency_key 由可信调用者指定（confirm 凭同键取回无正文结果）。
     pub fn purge_preview(
@@ -659,13 +677,18 @@ impl Store {
         &mut self,
         scope: &ScopeKey,
     ) -> Result<Option<serde_json::Value>, StoreError> {
-        let (version, raw_days, expired_days, enabled): (i64, i64, i64, i64) = match self
-            .conn()
+        // Begin the write transaction before reading policy or selecting targets.
+        // This prevents another process from attaching a new source or changing
+        // the retention policy between the snapshot and physical deletion.
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (version, effective_at, raw_days, expired_days, enabled): (i64, String, i64, i64, i64) = match tx
             .query_row(
-                "SELECT policy_version, raw_evidence_retention_days, expired_memory_purge_after_days, enabled
+                "SELECT policy_version,effective_at,raw_evidence_retention_days,expired_memory_purge_after_days,enabled
                  FROM retention_policies WHERE tenant_id=?1 AND user_id=?2",
                 params![scope.tenant_id, scope.user_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
             )
             .optional()?
         {
@@ -686,50 +709,146 @@ impl Store {
         let mut targets: Vec<String> = Vec::new();
         if expired_days > 0 {
             let cutoff_mem = cutoff(expired_days)?;
-            let mut stmt = self.conn().prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id FROM memories
                  WHERE tenant_id=?1 AND user_id=?2 AND status='active'
-                   AND valid_until IS NOT NULL AND valid_until < ?3",
+                   AND created_at>=?4 AND valid_until IS NOT NULL AND valid_until < ?3
+                   AND NOT EXISTS (
+                     SELECT 1 FROM memory_evidence me
+                     JOIN dream_job_inputs i ON i.tenant_id=me.tenant_id AND i.user_id=me.user_id
+                       AND i.evidence_id=me.evidence_id
+                     JOIN dream_jobs j ON j.tenant_id=i.tenant_id AND j.user_id=i.user_id AND j.id=i.job_id
+                     WHERE me.tenant_id=memories.tenant_id AND me.user_id=memories.user_id
+                       AND me.memory_id=memories.id
+                       AND j.status IN ('queued','running','provider_wait','retryable_failed'))
+                 ORDER BY id
+                 LIMIT ?5",
             )?;
-            let rows = stmt
-                .query_map(params![scope.tenant_id, scope.user_id, cutoff_mem], |r| {
-                    r.get(0)
-                })?;
+            let rows = stmt.query_map(
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    cutoff_mem,
+                    effective_at,
+                    RETENTION_BATCH_MAX_OBJECTS as i64
+                ],
+                |r| r.get(0),
+            )?;
             targets.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         // 目标 2：过期超 expired_days 的非 active 记忆（superseded/expired 行同理物理清理）。
         if expired_days > 0 {
             let cutoff_mem = cutoff(expired_days)?;
-            let mut stmt = self.conn().prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id FROM memories
                  WHERE tenant_id=?1 AND user_id=?2 AND status IN ('superseded','expired')
-                   AND updated_at < ?3",
+                   AND created_at>=?4 AND updated_at < ?3
+                   AND NOT EXISTS (
+                     SELECT 1 FROM memory_evidence me
+                     JOIN dream_job_inputs i ON i.tenant_id=me.tenant_id AND i.user_id=me.user_id
+                       AND i.evidence_id=me.evidence_id
+                     JOIN dream_jobs j ON j.tenant_id=i.tenant_id AND j.user_id=i.user_id AND j.id=i.job_id
+                     WHERE me.tenant_id=memories.tenant_id AND me.user_id=memories.user_id
+                       AND me.memory_id=memories.id
+                       AND j.status IN ('queued','running','provider_wait','retryable_failed'))
+                 ORDER BY id
+                 LIMIT ?5",
             )?;
-            let rows = stmt
-                .query_map(params![scope.tenant_id, scope.user_id, cutoff_mem], |r| {
-                    r.get(0)
-                })?;
+            let rows = stmt.query_map(
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    cutoff_mem,
+                    effective_at,
+                    RETENTION_BATCH_MAX_OBJECTS.saturating_sub(targets.len()) as i64
+                ],
+                |r| r.get(0),
+            )?;
             targets.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
-        targets.sort();
-        targets.dedup();
-        // 目标 3：raw evidence（已 processed 且无任何记忆引用的旧 user 事件）。
+        // 目标 3：按 received_at（记录时间）和策略生效时间选旧 user evidence。
+        // assigned 或仍被可恢复 job 使用的证据不能进入物理清理。
         let mut raw_evidence: Vec<(String, String)> = Vec::new(); // (id, content sha)
         if raw_days > 0 {
             let cutoff_ev = cutoff(raw_days)?;
-            let mut stmt = self.conn().prepare(
+            let mut stmt = tx.prepare(
                 "SELECT e.id, e.content_sha256 FROM evidence_events e
-                 WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.occurred_at < ?3
-                   AND e.id NOT IN (SELECT evidence_id FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2)
-                   AND e.id NOT IN (SELECT evidence_id FROM dream_job_inputs WHERE tenant_id=?1 AND user_id=?2)",
+                 WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+                   AND e.received_at>=?4 AND e.received_at < ?3
+                   AND NOT EXISTS (SELECT 1 FROM dream_evidence_state s
+                     LEFT JOIN dream_jobs j ON j.tenant_id=s.tenant_id AND j.user_id=s.user_id
+                       AND j.id=s.active_job_id
+                     WHERE s.tenant_id=e.tenant_id AND s.user_id=e.user_id AND s.evidence_id=e.id
+                       AND s.status='assigned'
+                       AND (j.id IS NULL OR j.status IN ('queued','running','provider_wait','retryable_failed')))
+                   AND NOT EXISTS (SELECT 1 FROM dream_job_inputs i JOIN dream_jobs j
+                     ON j.tenant_id=i.tenant_id AND j.user_id=i.user_id AND j.id=i.job_id
+                     WHERE i.tenant_id=e.tenant_id AND i.user_id=e.user_id AND i.evidence_id=e.id
+                       AND j.status IN ('queued','running','provider_wait','retryable_failed'))
+                 ORDER BY e.received_at, e.id
+                 LIMIT ?5",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, cutoff_ev], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows = stmt.query_map(
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    cutoff_ev,
+                    effective_at,
+                    RETENTION_BATCH_MAX_OBJECTS as i64
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
             raw_evidence.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         raw_evidence.sort();
         raw_evidence.dedup();
+        let expiring_evidence: HashSet<String> =
+            raw_evidence.iter().map(|(id, _)| id.clone()).collect();
+        // Expiring a source that is the last valid support for an active memory
+        // purges that memory and its derived pages. Otherwise only the expired
+        // source relation is removed and the memory remains supported.
+        for (evidence_id, _) in &raw_evidence {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT m.id FROM memory_evidence me JOIN memories m
+                 ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                 WHERE me.tenant_id=?1 AND me.user_id=?2 AND me.evidence_id=?3 AND m.status='active'
+                   AND (m.valid_until IS NULL OR m.valid_until>?4)
+                   AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                     WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)",
+            )?;
+            let linked = stmt
+                .query_map(
+                    params![scope.tenant_id, scope.user_id, evidence_id, now],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            for memory_id in linked {
+                let other_sources: Vec<String> = {
+                    let mut stmt=tx.prepare(
+                    "SELECT e.id FROM memory_evidence me JOIN evidence_events e
+                     ON e.tenant_id=me.tenant_id AND e.user_id=me.user_id AND e.id=me.evidence_id
+                     WHERE me.tenant_id=?1 AND me.user_id=?2 AND me.memory_id=?3 AND me.evidence_id<>?4
+                       AND e.role='user' AND e.source_kind='user'
+                       AND NOT EXISTS(SELECT 1 FROM suppressed_sources ss WHERE ss.tenant_id=e.tenant_id
+                         AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+                       AND NOT EXISTS(SELECT 1 FROM purge_tombstones pt WHERE pt.tenant_id=e.tenant_id
+                         AND pt.user_id=e.user_id AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)")?;
+                    let rows = stmt.query_map(
+                        params![scope.tenant_id, scope.user_id, memory_id, evidence_id],
+                        |r| r.get::<_, String>(0),
+                    )?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let has_surviving_source = other_sources
+                    .iter()
+                    .any(|source_id| !expiring_evidence.contains(source_id));
+                if !has_surviving_source {
+                    targets.push(memory_id);
+                }
+            }
+        }
+        targets.sort();
+        targets.dedup();
         if targets.is_empty() && raw_evidence.is_empty() {
             return Ok(None);
         }
@@ -739,8 +858,7 @@ impl Store {
         fp_src.push(format!("v{version}"));
         fp_src.sort();
         let fingerprint = sha256_hex(&fp_src.join("\u{0}"));
-        let existing: Option<i64> = self
-            .conn()
+        let existing: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM retention_jobs
                  WHERE tenant_id=?1 AND user_id=?2 AND policy_version=?3 AND batch_fingerprint=?4
@@ -752,28 +870,54 @@ impl Store {
         if existing.is_some() {
             return Ok(None); // 同批次已执行
         }
-        let job_id = Uuid::now_v7().to_string();
-        self.conn_mut().execute(
-            "INSERT INTO retention_jobs
-               (id, tenant_id, user_id, policy_version, batch_fingerprint, status, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,'running',?6,?6)",
-            params![job_id, scope.tenant_id, scope.user_id, version, fingerprint, now],
-        )?;
-        // 提交删除前再次读取当前 policy version（策略取消/收窄 → 旧 job 终止）。
-        let cur_version: i64 = self.conn().query_row(
-            "SELECT policy_version FROM retention_policies WHERE tenant_id=?1 AND user_id=?2",
+        // Revalidate the full policy inside the locked transaction immediately
+        // before applying the selected deletion closure.
+        let current: (i64, String, i64, i64, i64) = tx.query_row(
+            "SELECT policy_version,effective_at,raw_evidence_retention_days,
+                    expired_memory_purge_after_days,enabled
+             FROM retention_policies WHERE tenant_id=?1 AND user_id=?2",
             params![scope.tenant_id, scope.user_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?;
-        if cur_version != version {
-            self.conn_mut().execute(
-                "UPDATE retention_jobs SET status='failed', error_code='POLICY_CHANGED' WHERE id=?1",
-                params![job_id],
-            )?;
+        if current
+            != (
+                version,
+                effective_at.clone(),
+                raw_days,
+                expired_days,
+                enabled,
+            )
+        {
             return Err(StoreError::StateConflict);
         }
-        // 执行闭包（逐对象；同事务）。
-        let tx = self.conn_mut().transaction()?;
+        // Same fingerprint can be observed concurrently by two schedulers; the
+        // unique key plus this in-transaction check makes it a no-op.
+        let already_done: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM retention_jobs WHERE tenant_id=?1 AND user_id=?2
+             AND policy_version=?3 AND batch_fingerprint=?4 AND status='succeeded' LIMIT 1",
+                params![scope.tenant_id, scope.user_id, version, fingerprint],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if already_done.is_some() {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let job_id = Uuid::now_v7().to_string();
+        tx.execute(
+            "INSERT INTO retention_jobs
+               (id,tenant_id,user_id,policy_version,batch_fingerprint,status,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,'running',?6,?6)",
+            params![
+                job_id,
+                scope.tenant_id,
+                scope.user_id,
+                version,
+                fingerprint,
+                now
+            ],
+        )?;
         let mut purged = 0usize;
         for mid in &targets {
             let exists: Option<i64> = tx
@@ -789,7 +933,89 @@ impl Store {
             }
         }
         let mut raw_deleted = 0usize;
+        let target_set: HashSet<String> = targets.iter().cloned().collect();
+        let mut detached_audits: Vec<(String, i64)> = Vec::new();
         for (eid, ev_sha) in &raw_evidence {
+            let exists:bool=tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM evidence_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3)",
+                params![scope.tenant_id,scope.user_id,eid],|r|r.get(0))?;
+            if !exists {
+                raw_deleted += 1;
+                continue;
+            }
+            // Remove expired source links. Memories with another valid source
+            // survive; unique-source active memories were included in targets.
+            let linked: Vec<(String, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT m.id,m.version FROM memory_evidence me JOIN memories m
+                     ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
+                     WHERE me.tenant_id=?1 AND me.user_id=?2 AND me.evidence_id=?3",
+                )?;
+                let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (memory_id, version) in linked {
+                if !target_set.contains(&memory_id) {
+                    tx.execute("DELETE FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3 AND evidence_id=?4",
+                        params![scope.tenant_id,scope.user_id,memory_id,eid])?;
+                    detached_audits.push((memory_id, version));
+                }
+            }
+            let job_ids: Vec<String> = {
+                let mut stmt=tx.prepare("SELECT DISTINCT job_id FROM dream_job_inputs WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3")?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut closure_ids: HashSet<String> = HashSet::from([eid.clone(), ev_sha.clone()]);
+            closure_ids.extend(job_ids.iter().cloned());
+            let candidates: Vec<String> = {
+                let mut stmt=tx.prepare("SELECT DISTINCT candidate_id FROM dream_candidate_evidence WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3")?;
+                let rows =
+                    stmt.query_map(params![scope.tenant_id, scope.user_id, eid], |r| r.get(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            closure_ids.extend(candidates);
+            for job_id in job_ids {
+                tx.execute(
+                    "DELETE FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                    params![scope.tenant_id, scope.user_id, job_id],
+                )?;
+            }
+            tx.execute("DELETE FROM dream_candidate_redecisions WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id,scope.user_id,eid])?;
+            tx.execute("DELETE FROM dream_candidate_evidence WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id,scope.user_id,eid])?;
+            tx.execute("DELETE FROM dream_evidence_state WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id,scope.user_id,eid])?;
+            tx.execute("DELETE FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id,scope.user_id,eid])?;
+            // Clear audit rows whose exact target/detail can identify this L0 closure.
+            let audit_rows: Vec<(String, Option<String>, String)> = {
+                let mut stmt=tx.prepare("SELECT id,target_id,detail_json FROM audit_events WHERE tenant_id=?1 AND user_id=?2")?;
+                let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (audit_id, target, detail) in audit_rows {
+                let detail_ref = serde_json::from_str::<serde_json::Value>(&detail)
+                    .is_ok_and(|v| json_references_any(&v, &closure_ids));
+                if target.as_ref().is_some_and(|id| closure_ids.contains(id)) || detail_ref {
+                    tx.execute(
+                        "DELETE FROM audit_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                        params![scope.tenant_id, scope.user_id, audit_id],
+                    )?;
+                }
+            }
+            for id in &closure_ids {
+                tx.execute(
+                    "DELETE FROM memory_audit WHERE tenant_id=?1 AND user_id=?2 AND record_id=?3",
+                    params![scope.tenant_id, scope.user_id, id],
+                )?;
+            }
             tx.execute(
                 "DELETE FROM evidence_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, eid],
@@ -801,13 +1027,28 @@ impl Store {
             )?;
             raw_deleted += 1;
         }
-        tx.commit()?;
-        self.conn_mut().execute(
-            "UPDATE retention_jobs SET status='succeeded', deleted_counts_json=?3, updated_at=?4 WHERE id=?1 AND status='running'",
-            params![job_id, version,
-                    serde_json::json!({"memories_purged": purged, "raw_evidence_deleted": raw_deleted}).to_string(),
-                    now_rfc3339()?],
+        let counts =
+            serde_json::json!({"memories_purged":purged,"raw_evidence_deleted":raw_deleted});
+        tx.execute(
+            "UPDATE retention_jobs SET status='succeeded',deleted_counts_json=?2,updated_at=?3 WHERE id=?1 AND status='running'",
+            params![job_id,counts.to_string(),now_rfc3339()?],
         )?;
+        tx.commit()?;
+        for (memory_id, version) in detached_audits {
+            self.record_memory_audit_best_effort(
+                scope,
+                &MemoryAuditEntry {
+                    record_id: memory_id,
+                    layer: AuditLayer::L1,
+                    action: AuditAction::Update,
+                    agent_id: None,
+                    task_id: Some(job_id.clone()),
+                    version,
+                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                    request_id: None,
+                },
+            );
+        }
         Ok(Some(serde_json::json!({
             "policy_version": version,
             "memories_purged": purged,
