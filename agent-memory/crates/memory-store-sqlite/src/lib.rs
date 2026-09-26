@@ -71,6 +71,8 @@ pub enum StoreError {
     InvalidPageField,
     #[error("问题不存在或不属于当前 scope")]
     QuestionNotFound,
+    #[error("页面不存在或不属于当前 scope")]
+    PageNotFound,
     #[error("输入已失效（来源版本/状态变化），整批不发布")]
     StaleInput,
     #[error("时间溢出: {0}")]

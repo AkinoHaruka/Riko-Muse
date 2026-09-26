@@ -488,6 +488,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/pages", get(list_pages))
                 .route("/v1/pages/{page_id}", get(get_page))
                 .route("/v1/mental-model/questions", get(list_questions))
+                .route("/v1/resident/page-pins", post(post_page_pin))
+                .route("/v1/resident/page-pins/{page_id}", delete(delete_page_pin))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
@@ -639,8 +641,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::RebuildIndex { config } => {
             let cfg = Config::load(&config)?;
             let mut store = Store::open(&cfg.db_path, &cfg.migrations_dir)?;
-            let (fts, grams) = store.rebuild_index()?;
-            println!("rebuild-index 完成：fts_rows={fts} grams_rows_deleted={grams}");
+            let (fts, grams, pages) = store.rebuild_index()?;
+            println!(
+                "rebuild-index 完成：fts_rows={fts} grams_rows_deleted={grams} page_index_rows={pages}"
+            );
             Ok(())
         }
         Commands::Backup { config, out } => {
@@ -2172,6 +2176,7 @@ fn resident_section_json(
         "items": items,
         "omitted": omitted,
         "conflict_ids": sel.conflict_ids,
+        "stale_pages": sel.stale_pages,
         "truncated": sel.truncated,
     })
 }
@@ -2328,6 +2333,7 @@ async fn post_context_bundle(
             .map(|i| i.memory_id.as_str())
             .chain(selection.conflict_ids.iter().map(|s| s.as_str()))
             .collect();
+        let mut used_chars_retrieved = 0usize;
         let search = {
             let guard = state.store.lock().unwrap();
             guard.search_memories(&scope, query_trim, q_items, false)
@@ -2343,7 +2349,7 @@ async fn post_context_bundle(
                     let entry = format!("- [memory: {}] {}", hit.memory_id, hit.claim);
                     let entry_chars = entry.chars().count();
                     if retrieved_items.len() >= q_items
-                        || (used_chars > 0 && used_chars + entry_chars + 1 > q_chars)
+                        || (used_chars_retrieved > 0 && used_chars_retrieved + entry_chars + 1 > q_chars)
                     {
                         retrieved_omitted.push(serde_json::json!({
                             "memory_id": hit.memory_id,
@@ -2352,7 +2358,7 @@ async fn post_context_bundle(
                         retrieved_truncated = true;
                         continue;
                     }
-                    used_chars += entry_chars + if retrieved_items.is_empty() { 0 } else { 1 };
+                    used_chars_retrieved += entry_chars + if retrieved_items.is_empty() { 0 } else { 1 };
                     if retrieved_text.is_empty() {
                         retrieved_text = entry;
                     } else {
@@ -2368,6 +2374,73 @@ async fn post_context_bundle(
                         "evidence_ids": hit.evidence_refs,
                     }));
                     source_versions.insert(hit.memory_id.clone(), serde_json::json!(hit.version));
+                }
+            }
+            Err(e) => {
+                return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string())
+            }
+        }
+        // 页面通道（D6-6，doc6/04 §3）：page_fts 命中 published 页（get_page 读时
+        // 复核来源）；标 derived=true、列 sources；与 L1 重合按覆盖规则去重。
+        let page_hit_ids = {
+            let guard = state.store.lock().unwrap();
+            guard.page_fts_search(&scope, query_trim, q_items)
+        };
+        match page_hit_ids {
+            Ok(ids) => {
+                let mut covered: std::collections::HashSet<String> =
+                    resident_ids.iter().map(|s| s.to_string()).collect();
+                for i in retrieved_items.iter() {
+                    if let Some(mid) = i.get("memory_id").and_then(|v| v.as_str()) {
+                        covered.insert(mid.to_string());
+                    }
+                }
+                for pid in ids {
+                    if covered.contains(&pid) {
+                        continue; // resident 已含该页。
+                    }
+                    let page = {
+                        let guard = state.store.lock().unwrap();
+                        guard.get_page(&scope, &pid, &now)
+                    };
+                    let Ok(Some(p)) = page else { continue }; // 来源失效 → 不可见
+                    let source_ids: Vec<String> = p.sources.iter().map(|(id, _)| id.clone()).collect();
+                    let uncovered = source_ids.iter().filter(|s| !covered.contains(*s)).count();
+                    let min_needed = if p.document_kind == "mental_model" { 1 } else { 2 };
+                    if uncovered < min_needed {
+                        continue; // doc6/04 §3：未覆盖来源不足 → 跳过文档。
+                    }
+                    let entry = format!("- [page: {}] {}", p.page_id, p.title);
+                    let entry_chars = entry.chars().count();
+                    if retrieved_items.len() >= q_items
+                        || (used_chars_retrieved > 0 && used_chars_retrieved + entry_chars + 1 > q_chars)
+                    {
+                        retrieved_omitted.push(serde_json::json!({"page_id": pid, "reason": "ITEM_LIMIT"}));
+                        retrieved_truncated = true;
+                        continue;
+                    }
+                    used_chars_retrieved += entry_chars + if retrieved_items.is_empty() { 0 } else { 1 };
+                    if retrieved_text.is_empty() {
+                        retrieved_text = entry;
+                    } else {
+                        retrieved_text.push('\n');
+                        retrieved_text.push_str(&entry);
+                    }
+                    // 文档入选覆盖其全部来源（后续相同 L1 不重复出现）。
+                    for s in &source_ids {
+                        covered.insert(s.clone());
+                    }
+                    retrieved_items.push(serde_json::json!({
+                        "kind": "page",
+                        "page_id": p.page_id,
+                        "document_kind": p.document_kind,
+                        "title": p.title,
+                        "derived": true,
+                        "reason": "lexical",
+                        "version": p.version,
+                        "source_memory_ids": p.sources,
+                    }));
+                    source_versions.insert(p.page_id.clone(), serde_json::json!(p.version));
                 }
             }
             Err(e) => {
@@ -2502,6 +2575,72 @@ async fn list_questions(
                 "status": r.status,
                 "updated_at": r.updated_at,
             })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- D6-6：page-pin 路由（doc6/06 §2；仅 published 且来源有效可 pin）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PagePinRequest {
+    page_id: String,
+    idempotency_key: String,
+}
+
+async fn post_page_pin(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<PagePinRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    if req.page_id.is_empty() {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "page_id 不能为空");
+    }
+    let result = {
+        let mut guard = state.store.lock().unwrap();
+        guard.page_pin(&scope, &req.page_id)
+    };
+    match result {
+        Ok(pin_version) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "page_id": req.page_id,
+            "status": "pinned",
+            "pin_version": pin_version,
+        }))
+        .into_response(),
+        Err(StoreError::PageNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "页面不存在、非 published 或来源已失效",
+        ),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn delete_page_pin(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(page_id): AxumPath<String>,
+) -> Response {
+    let mut guard = state.store.lock().unwrap();
+    match guard.page_unpin(&scope, &page_id) {
+        Ok(version) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "page_id": page_id,
+            "status": "unpinned",
+            "pin_version": version,
         }))
         .into_response(),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),

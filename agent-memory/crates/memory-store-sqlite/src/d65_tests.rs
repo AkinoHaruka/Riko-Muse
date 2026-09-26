@@ -350,3 +350,145 @@ fn prompt_output_parsers_strict() {
     );
     assert!(parse_consolidate_output(&five).is_err());
 }
+
+// ---- D6-6：页面 pin / resident 省略 / rebuild 不复活 ----
+
+fn publish_two_source_page(
+    store: &mut Store,
+    scope: &ScopeKey,
+    origin: &Origin,
+    tag: &str,
+    seq_base: i64,
+) -> String {
+    let m1 = remember_one(store, scope, origin, seq_base, &format!("{tag} 来源一"), MemoryKind::Fact);
+    let m2 = remember_one(store, scope, origin, seq_base + 1, &format!("{tag} 来源二"), MemoryKind::Fact);
+    let sources: Vec<(String, i64, String)> = [&m1, &m2]
+        .iter()
+        .map(|mid| {
+            let (v, s): (i64, String) = store
+                .conn()
+                .query_row(
+                    "SELECT version, claim_sha256 FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                    rusqlite::params![scope.tenant_id, scope.user_id, mid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            (mid.to_string(), v, s)
+        })
+        .collect();
+    let req = pages::PublishRequest {
+        scope,
+        document_kind: "topic_page",
+        document_key: &format!("key-{tag}"),
+        question_version: None,
+        question_text: None,
+        title: &format!("{tag} 主题页"),
+        body_md: "页面摘要内容。",
+        generator_version: pages::GENERATE_CONSOLIDATE_V1,
+        input_fingerprint: "fp",
+        sources: &sources,
+        actor_kind: "system",
+    };
+    store.publish_page(&req).unwrap().0
+}
+
+#[test]
+fn page_pin_enters_resident_and_stale_source_omits() {
+    // doc6/06：pin 后页面进 resident；来源失效 → 立即省略并给 STALE_SOURCE。
+    let (mut store, scope, origin) = setup("pagepin");
+    let page_id = publish_two_source_page(&mut store, &scope, &origin, "pp", 101);
+    store.page_pin(&scope, &page_id).unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+    assert!(sel.items.iter().any(|i| i.memory_id == page_id && i.kind == "page"));
+    assert!(sel.text.contains(&format!("[page: {page_id}]")));
+    // 来源失效 → 立即省略 + STALE_SOURCE 原因。
+    let m_forgotten: String = {
+        let (mid, _ver): (String, i64) = store
+            .conn()
+            .query_row(
+                "SELECT memory_id, memory_version FROM page_sources WHERE page_id=?1 LIMIT 1",
+                rusqlite::params![page_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status='forgotten' WHERE id=?1",
+                rusqlite::params![mid],
+            )
+            .unwrap();
+        mid
+    };
+    store.stale_pages_for_memory(&scope, &m_forgotten).unwrap();
+    let sel2 = store.select_resident(&scope, &now, 24, 3000).unwrap();
+    assert!(sel2.items.iter().all(|i| i.memory_id != page_id), "失效页不进正文");
+    assert!(sel2.stale_pages.contains(&page_id), "省略原因 STALE_SOURCE 可见");
+}
+
+#[test]
+fn page_archive_and_rebuild_index_no_revival() {
+    // doc6/06：归档后不再搜索/注入；rebuild 后 stale/archived 不复活。
+    let (mut store, scope, origin) = setup("archive");
+    let page_id = publish_two_source_page(&mut store, &scope, &origin, "arch", 201);
+    let now = crate::now_rfc3339_pub().unwrap();
+    // FTS 命中（published）。
+    assert!(store.page_fts_search(&scope, "摘要", 10).unwrap().contains(&page_id));
+    // 归档（CAS）。
+    let version: i64 = store
+        .conn()
+        .query_row(
+            "SELECT version FROM memory_pages WHERE id=?1",
+            rusqlite::params![page_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(store.page_archive(&scope, &page_id, version).unwrap());
+    assert!(store.page_fts_search(&scope, "摘要", 10).unwrap().is_empty(), "归档即移除索引");
+    // rebuild 只重建 published：归档页不复活。
+    store.rebuild_page_index().unwrap();
+    assert!(store.page_fts_search(&scope, "摘要", 10).unwrap().is_empty());
+    // pin 一页 + forget 一条来源 → 页 stale；rebuild 不复活。
+    let page2 = publish_two_source_page(&mut store, &scope, &origin, "arch2", 301);
+    let mid: String = store
+        .conn()
+        .query_row(
+            "SELECT memory_id FROM page_sources WHERE page_id=?1 LIMIT 1",
+            rusqlite::params![page2],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store
+        .conn()
+        .execute("UPDATE memories SET status='forgotten' WHERE id=?1", rusqlite::params![mid])
+        .unwrap();
+    store.stale_pages_for_memory(&scope, &mid).unwrap();
+    store.rebuild_page_index().unwrap();
+    assert!(
+        !store.page_fts_search(&scope, "arch2", 10).unwrap().contains(&page2),
+        "stale 页 rebuild 后不复活"
+    );
+}
+
+#[test]
+fn page_pin_cross_scope_404_and_unpin_idempotent() {
+    let (mut store, scope, origin) = setup("ppin-iso");
+    let other = {
+        let dir = std::env::temp_dir().join("am-d65-ppin-u2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        store.principal_add("t", "u2", &dir.join("u2.token")).unwrap();
+        let token = std::fs::read_to_string(dir.join("u2.token")).unwrap();
+        store.verify_token(token.trim()).unwrap().unwrap()
+    };
+    let page_id = publish_two_source_page(&mut store, &scope, &origin, "iso", 401);
+    // 跨 scope pin → 404 语义。
+    assert!(matches!(store.page_pin(&other, &page_id), Err(StoreError::PageNotFound)));
+    // 正常 pin → unpin → unpin 幂等。
+    assert_eq!(store.page_pin(&scope, &page_id).unwrap(), 1);
+    assert_eq!(store.page_unpin(&scope, &page_id).unwrap(), 2);
+    assert_eq!(store.page_unpin(&scope, &page_id).unwrap(), 2);
+    // 无行 unpin 返回 0。
+    assert_eq!(store.page_unpin(&scope, "no-such-page").unwrap(), 0);
+}

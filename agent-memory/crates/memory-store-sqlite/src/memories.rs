@@ -877,7 +877,8 @@ impl Store {
     }
 
     /// 从 active 规范表全量重建派生索引（CLI rebuild-index，doc/09）。
-    pub fn rebuild_index(&mut self) -> Result<(u64, u64), StoreError> {
+    /// D6-6 起同时重建页面索引（第三个返回值：published 页数）。
+    pub fn rebuild_index(&mut self) -> Result<(u64, u64, u64), StoreError> {
         let tx = self.conn_mut().transaction()?;
         tx.execute("DELETE FROM memory_fts", [])?;
         let grams = tx.execute("DELETE FROM memory_grams", [])?;
@@ -907,7 +908,9 @@ impl Store {
         }
         Self::clear_index_dirty(&tx)?;
         tx.commit()?;
-        Ok((fts, grams as u64))
+        // D6-6：页面索引同批重建（只 published；stale/archived 不复活；doc6/02 §3）。
+        let (page_count, _) = self.rebuild_page_index()?;
+        Ok((fts, grams as u64, page_count as u64))
     }
 
     /// SQLite 在线一致性备份：VACUUM INTO（停机维护语义见 doc/09）。

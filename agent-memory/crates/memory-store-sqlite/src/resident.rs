@@ -481,6 +481,8 @@ pub struct ResidentSelection {
     pub conflict_ids: Vec<String>,
     /// pin 指向非 active 记忆（correct 产生新 ID 不自动迁移；doc6/03 §4）。
     pub needs_review: Vec<String>,
+    /// pin 的派生文档来源失效（STALE_SOURCE 省略原因；doc6/03 §4）。
+    pub stale_pages: Vec<String>,
     pub truncated: bool,
 }
 
@@ -497,7 +499,11 @@ pub struct SuggestionRow {
 
 /// 渲染一条 resident 条目（doc6/03 §2 视图格式的注入形态）。
 fn render_entry(item: &ResidentItem) -> String {
-    format!("- [memory: {}] {}", item.memory_id, item.claim)
+    if item.kind == "page" {
+        format!("- [page: {}] {}", item.memory_id, item.claim)
+    } else {
+        format!("- [memory: {}] {}", item.memory_id, item.claim)
+    }
 }
 
 impl Store {
@@ -548,6 +554,39 @@ impl Store {
                     version,
                     evidence_ids: Vec::new(),
                 });
+            }
+        }
+        // 1b. 用户 pin 的已发布派生文档（doc6/03 §3 第 2 层）：按 position ASC；
+        // 全部来源仍有效才进正文（get_page 读时复核）；失效 → stale_pages
+        // （doc6/03 §4：来源失效时 resident 立即省略并给原因 STALE_SOURCE）。
+        let mut stale_pages: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn().prepare(
+                "SELECT pp.page_id FROM resident_page_pins pp
+                 JOIN memory_pages pg ON pg.tenant_id=pp.tenant_id AND pg.user_id=pp.user_id
+                    AND pg.id=pp.page_id
+                 WHERE pp.tenant_id=?1 AND pp.user_id=?2 AND pp.enabled=1
+                 ORDER BY pp.position, pp.page_id",
+            )?;
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get::<_, String>(0))?;
+            let pinned_page_ids: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
+            for page_id in pinned_page_ids {
+                match self.get_page(scope, &page_id, now)? {
+                    Some(p) => {
+                        candidate_ids.push(page_id.clone());
+                        items.push(ResidentItem {
+                            memory_id: page_id,
+                            kind: "page".into(),
+                            claim: p.title,
+                            reason: "pinned_page",
+                            version: p.version,
+                            evidence_ids: Vec::new(),
+                        });
+                    }
+                    None => {
+                        stale_pages.push(page_id);
+                    }
+                }
             }
         }
         // 2. 未 pin 的 active instruction（updated_at DESC, id ASC；无固定条数特权）。
@@ -611,6 +650,7 @@ impl Store {
         let mut selection = ResidentSelection {
             conflict_ids,
             needs_review,
+            stale_pages,
             ..Default::default()
         };
         let mut used_chars = 0usize;

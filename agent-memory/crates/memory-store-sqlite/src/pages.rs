@@ -606,20 +606,165 @@ pub fn page_list(
         Ok(n > 0)
     }
 
-    /// 页面是否在 FTS 命中（词法检索扩展点；bundle 页面通道在 D6-6 接线）。
+    /// 页面词法检索（doc6/06）：grams 二元字匹配（与 memory_grams 同法；
+    /// FTS unicode61 对连续 CJK 长 token 不可靠，grams 是本项目中文主通道）。
+    /// 只返回 published 页（读时仍有 get_page 来源复核兜底）。
     pub fn page_fts_search(
         &self,
         scope: &ScopeKey,
         query: &str,
         limit: usize,
     ) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self.conn().prepare(
-            "SELECT p.id FROM page_fts f JOIN memory_pages p ON p.id=f.page_id
-             WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.status='published'
-               AND page_fts MATCH ?3 LIMIT ?4",
+        let grams = cjk_bigrams(query);
+        if grams.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; grams.len()].join(",");
+        let mut bind_values: Vec<String> = vec![scope.tenant_id.clone(), scope.user_id.clone()];
+        bind_values.extend(grams.clone());
+        let sql = format!(
+            "SELECT DISTINCT g.page_id FROM page_grams g
+             JOIN memory_pages p ON p.id=g.page_id AND p.tenant_id=g.tenant_id AND p.user_id=g.user_id
+             WHERE g.tenant_id=?1 AND g.user_id=?2 AND p.status='published'
+               AND g.gram IN ({placeholders})
+             ORDER BY g.page_id LIMIT ?{}",
+            bind_values.len() + 1
+        );
+        bind_values.push((limit as i64).to_string());
+        let mut stmt = self.conn().prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(bind_values.iter().map(|s| s as &dyn rusqlite::ToSql)),
+            |r| r.get(0),
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, query, limit as i64], |r| r.get(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    // ---- 页面 pin（doc6/06 §2 resident_page_pins；doc6/03 §4 pin 后进 resident）----
+
+    /// pin 一页（仅 published 且全部来源有效可 pin）；重 pin 沿原行增 version。
+    pub fn page_pin(&mut self, scope: &ScopeKey, page_id: &str) -> Result<i64, StoreError> {
+        let now = now_rfc3339()?;
+        let tx = self.conn_mut().transaction()?;
+        // 只允许 pin 当前 published 页（doc6/02 §3）。
+        let published: Option<i64> = tx
+            .query_row(
+                "SELECT version FROM memory_pages
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'",
+                params![scope.tenant_id, scope.user_id, page_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if published.is_none() {
+            return Err(StoreError::PageNotFound);
+        }
+        let existing: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT enabled, version FROM resident_page_pins
+                 WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+                params![scope.tenant_id, scope.user_id, page_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let version = match existing {
+            None => {
+                let max: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(position), -1) FROM resident_page_pins
+                     WHERE tenant_id=?1 AND user_id=?2 AND enabled=1",
+                    params![scope.tenant_id, scope.user_id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO resident_page_pins
+                       (tenant_id, user_id, page_id, enabled, position, pinned_at, version)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5, 1)",
+                    params![scope.tenant_id, scope.user_id, page_id, max + 1, now],
+                )?;
+                1
+            }
+            Some((enabled, version)) if enabled == 0 => {
+                let max: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(position), -1) FROM resident_page_pins
+                     WHERE tenant_id=?1 AND user_id=?2 AND enabled=1",
+                    params![scope.tenant_id, scope.user_id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE resident_page_pins SET enabled=1, position=?4, version=?5, pinned_at=?6
+                     WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+                    params![scope.tenant_id, scope.user_id, page_id, max + 1, version + 1, now],
+                )?;
+                version + 1
+            }
+            Some((_, version)) => version, // 已 enabled：幂等
+        };
+        tx.commit()?;
+        Ok(version)
+    }
+
+    /// 解除页面 pin：置 enabled=0 并增版本；无行/已 disabled 幂等。
+    pub fn page_unpin(&mut self, scope: &ScopeKey, page_id: &str) -> Result<i64, StoreError> {
+        let now = now_rfc3339()?;
+        let existing: Option<(i64, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT enabled, version FROM resident_page_pins
+                 WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+                params![scope.tenant_id, scope.user_id, page_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((enabled, version)) = existing else { return Ok(0) };
+        if enabled == 0 {
+            return Ok(version);
+        }
+        self.conn_mut().execute(
+            "UPDATE resident_page_pins SET enabled=0, version=?4
+             WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3",
+            params![scope.tenant_id, scope.user_id, page_id, version + 1],
+        )?;
+        let _ = now;
+        Ok(version + 1)
+    }
+
+    /// rebuild 时从规范表重建页面索引：只 published 页进 FTS/grams
+    /// （doc6/02 §3；stale/archived 不复活——rebuild 后不复活验收）。
+    pub fn rebuild_page_index(&mut self) -> Result<(usize, usize), StoreError> {
+        let tx = self.conn_mut().transaction()?;
+        tx.execute("DELETE FROM page_fts", [])?;
+        tx.execute("DELETE FROM page_grams", [])?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, tenant_id, user_id, title, body_md FROM memory_pages WHERE status='published'",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            let collected: Vec<(String, String, String, String, String)> =
+                rows.collect::<Result<Vec<_>, _>>()?;
+            for (id, tenant, user, title, body) in collected {
+                tx.execute(
+                    "INSERT INTO page_fts (page_id, title, body_md) VALUES (?1, ?2, ?3)",
+                    params![id, title, body],
+                )?;
+                for g in cjk_bigrams(&format!("{title} {body}")) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO page_grams (tenant_id, user_id, page_id, gram)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![tenant, user, id, g],
+                    )?;
+                }
+                inserted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((inserted, 0))
     }
 }
 
