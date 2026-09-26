@@ -381,6 +381,9 @@ impl Store {
              WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.enabled=1
                AND m.status='active'
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
+               AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                               WHERE r.tenant_id=p.tenant_id AND r.user_id=p.user_id
+                                 AND r.memory_id=p.memory_id)
              ORDER BY p.position, p.memory_id",
         )?;
         let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
@@ -542,6 +545,11 @@ impl Store {
                 if status != "active" {
                     // forgotten/superseded/expired：pin 行保留作历史，但不可见；
                     // correct 后旧 pin 不自动迁移，报 needs_review 供用户决策。
+                    needs_review.push(memory_id);
+                    continue;
+                }
+                // D6-9：retired 覆盖在排序前排除（读路径统一门）。
+                if self.retirement_get(scope, &memory_id)?.is_some() {
                     needs_review.push(memory_id);
                     continue;
                 }

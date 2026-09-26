@@ -87,14 +87,18 @@ mod d67_tests;
 #[cfg(test)]
 mod d68_tests;
 #[cfg(test)]
+mod d69_tests;
+#[cfg(test)]
 mod probes;
 pub mod adjudication;
 pub mod consolidation_jobs;
 pub mod dream_jobs;
 pub mod evidence;
 pub mod jobs;
+pub mod lifecycle;
 pub mod memories;
 pub mod pages;
+pub mod purge;
 pub mod resident;
 pub mod semantic_index;
 pub mod soul;

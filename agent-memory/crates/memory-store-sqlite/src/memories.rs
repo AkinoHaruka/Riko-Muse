@@ -388,6 +388,21 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// D6-9：核验「最新真实用户事件」中的逐字指令 quote（retire/restore 共用）。
+    /// 返回 (start_byte, end_byte)。不要求 quote 出现在目标 claim 中（restore 的
+    /// 指令语义与 claim 无关；retire 的 G-13 双向定位仍由调用方加验）。
+    pub fn verify_user_quote_span(
+        &self,
+        scope: &ScopeKey,
+        origin: &Origin,
+        user_evidence_id: &str,
+        quote: &str,
+    ) -> Result<(i64, i64), StoreError> {
+        let (content, _, _) = self.check_latest_user_evidence(scope, origin, user_evidence_id)?;
+        let (s, e) = find_quote_span(&content, quote).ok_or(StoreError::QuoteMismatch)?;
+        Ok((s as i64, e as i64))
+    }
+
     /// GET /v1/memories/{id}。普通读只返回 active；非 active 视为不存在（doc/12 §5）。
     pub fn get_memory(&self, scope: &ScopeKey, memory_id: &str) -> Result<Option<MemoryRow>, StoreError> {
         let row = self
@@ -414,6 +429,15 @@ impl Store {
             return Ok(None);
         };
         if status != "active" {
+            return Ok(None);
+        }
+        // D6-9：retired 覆盖不进入读路径（doc6/09 卡：排序前排除）。
+        let retired: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM memory_retirements WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+            |r| r.get(0),
+        )?;
+        if retired > 0 {
             return Ok(None);
         }
         Ok(Some(MemoryRow {
@@ -625,6 +649,9 @@ impl Store {
                         "SELECT kind, claim, status, version FROM memories
                          WHERE tenant_id=? AND user_id=? AND id=? AND {status_clause}
                            AND (valid_until IS NULL OR valid_until > ?)
+                           AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                                           WHERE r.tenant_id=memories.tenant_id AND r.user_id=memories.user_id
+                                             AND r.memory_id=memories.id)
                          ORDER BY updated_at DESC"
                     ),
                     params![scope.tenant_id, scope.user_id, id, now],

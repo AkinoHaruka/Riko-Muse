@@ -6,11 +6,11 @@ use serde::Serialize;
 /// 协议版本：HTTP v1 语义不变（doc/12）。DSH 适配器握手依据。
 pub const PROTOCOL_VERSION: u32 = 1;
 /// 数据库模式版本：随迁移文件递增（0001→1，…，0004→4，0005→5，0006→6，
-/// 0007→7 Dream，0008→8 语义索引，0009→9 语义裁决）。worker 按作业行
+/// 0007→7 Dream，0008→8 语义索引，0009→9 语义裁决，0010→10 生命周期治理）。worker 按作业行
 /// prompt_version/admission_version 分别选提示词与准入规则。0005 起新增表
 /// （doc6/02）：0005 soul/resident/audit/receipts；0006 派生知识文档、问题目录、
 /// 整理作业与页面索引；历史迁移 0001—0004 冻结不改。
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；

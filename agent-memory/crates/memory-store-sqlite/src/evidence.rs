@@ -123,6 +123,17 @@ impl Store {
             }
             return Err(StoreError::EventConflict);
         }
+        // D6-9：purge 墓碑（按 scope+content sha，无正文）阻止已删除事件经 spool
+        // 重放复活（doc6/02 §7）；suppressed_sources 只覆盖 forget，purge 后行已删。
+        let tombstoned: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM purge_tombstones
+             WHERE tenant_id=?1 AND user_id=?2 AND source_kind='evidence' AND source_id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, content_hash],
+            |r| r.get(0),
+        )?;
+        if tombstoned > 0 {
+            return Err(StoreError::EventConflict); // 已被 purge 的内容不得重放复活
+        }
 
         let id = Uuid::now_v7().to_string();
         tx.execute(

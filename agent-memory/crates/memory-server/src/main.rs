@@ -20,7 +20,7 @@ use memory_contract::{
     COMPOSE_MAX_ITEMS_DEFAULT, EVIDENCE_CONTENT_MAX_BYTES, HOST_ID_MAX_CHARS, PROTOCOL_VERSION,
     SCHEMA_VERSION, SEARCH_QUERY_MAX_CHARS,
 };
-use memory_domain::{MemoryKind, Origin, ScopeKey};
+use memory_domain::{find_quote_span, MemoryKind, Origin, ScopeKey};
 use memory_store_sqlite::{
     CandidateDetail, ComposeResult, FlushOutcome, IngestOutcome, JobDoctorStats, RememberOutcome,
     SearchHit, Store, StoreError,
@@ -111,6 +111,57 @@ enum Commands {
     ReindexSemantic {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// D6-9：退休一条记忆（可逆；须最新用户事件 quote 双向定位）
+    Retire {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] memory_id: String,
+        #[arg(long)] expected_version: i64,
+        #[arg(long)] evidence_id: String,
+        #[arg(long)] quote: String,
+    },
+    /// D6-9：恢复一条退休记忆（须最新用户事件 quote 定位）
+    Restore {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] memory_id: String,
+        #[arg(long)] evidence_id: String,
+        #[arg(long)] quote: String,
+    },
+    /// D6-9：purge 第一阶段 preview（只读业务记忆；写确认元数据）
+    PurgePreview {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] memory_id: String,
+        /// 幂等键（confirm 须带同键；重复 confirm 只取回无正文结果）
+        #[arg(long)] idempotency_key: String,
+    },
+    /// D6-9：purge 第二阶段 confirm（消费 token 并执行闭包）
+    PurgeConfirm {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] token: String,
+        #[arg(long)] idempotency_key: String,
+    },
+    /// D6-9：设置 retention 策略（可信 CLI；默认 0=关闭）
+    RetentionPolicy {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long, default_value_t = 0)] raw_days: i64,
+        #[arg(long, default_value_t = 0)] expired_days: i64,
+        #[arg(long, default_value_t = false)] enabled: bool,
+    },
+    /// D6-9：执行一轮 retention 清理（无 LLM；复用 purge 闭包）
+    RetentionRun {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
     },
     /// SQLite 在线一致性备份（VACUUM INTO）
     Backup {
@@ -592,6 +643,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/memories/{memory_id}", get(get_memory))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
+                .route("/v1/memories/{memory_id}/retire", post(retire_memory))
+                .route("/v1/memories/{memory_id}/restore", post(restore_memory))
                 .route("/v1/context/compose", post(compose_context))
                 .route("/v1/soul", get(get_soul).put(put_soul))
                 .route("/v1/soul/revisions", get(list_soul_revisions))
@@ -780,6 +833,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
             let n = store.semantic_reindex_all(cfg.embedding_model.as_deref().unwrap())?;
             println!("reindex-semantic 完成：入队 {n} 个对象（worker 将按当前版本生成向量）");
+            Ok(())
+        }
+        Commands::Retire { config, tenant, user, memory_id, expected_version, evidence_id, quote } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let origin = Origin { host_id: "cli".into(), agent_id: "admin".into(), session_id: "cli".into() };
+            // Rust 核逐字 span（最新用户事件）+ 目标 claim 双向定位（G-13 同法）。
+            store.verify_user_quote_span(&scope, &origin, &evidence_id, &quote)
+                .map_err(|e| format!("quote 核验失败: {e}"))?;
+            let claim_ok = store.get_memory(&scope, &memory_id)
+                .map_err(|e| e.to_string())?
+                .map(|m| find_quote_span(&m.claim, &quote).is_some())
+                .unwrap_or(false);
+            if !claim_ok {
+                return Err("目标含糊：quote 未定位到该记忆 claim".into());
+            }
+            let req = memory_store_sqlite::lifecycle::RetireRequest {
+                expected_version,
+                actor_kind: "user",
+                reason_code: Some("user_request".to_string()),
+                user_evidence_id: Some(evidence_id),
+            };
+            let retired = store.retire_memory(&scope, &memory_id, &req).map_err(|e| e.to_string())?;
+            println!("retire 完成：memory_id={memory_id} retired={retired}");
+            Ok(())
+        }
+        Commands::Restore { config, tenant, user, memory_id, evidence_id, quote } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let origin = Origin { host_id: "cli".into(), agent_id: "admin".into(), session_id: "cli".into() };
+            store.verify_user_quote_span(&scope, &origin, &evidence_id, &quote)
+                .map_err(|e| format!("quote 核验失败: {e}"))?;
+            let restored = store.restore_memory(&scope, &memory_id, "user").map_err(|e| e.to_string())?;
+            println!("restore 完成：memory_id={memory_id} restored={restored}");
+            Ok(())
+        }
+        Commands::PurgePreview { config, tenant, user, memory_id, idempotency_key } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let (token, preview) = store
+                .purge_preview(&scope, &memory_id, &idempotency_key)
+                .map_err(|e| e.to_string())?;
+            // 明文 token 只输出一次（确认后即弃；库中仅存哈希）。
+            println!("preview token（一次性，15 分钟内有效）：{token}");
+            println!("{}", serde_json::to_string_pretty(&preview).map_err(|e| e.to_string())?);
+            Ok(())
+        }
+        Commands::PurgeConfirm { config, tenant, user, token, idempotency_key } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let out = store.purge_confirm(&scope, &token, &idempotency_key).map_err(|e| e.to_string())?;
+            println!("purge confirm 完成：job_id={} deleted={}", out.job_id, out.deleted);
+            Ok(())
+        }
+        Commands::RetentionPolicy { config, tenant, user, raw_days, expired_days, enabled } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let v = store.retention_set_policy(&scope, raw_days, expired_days, enabled).map_err(|e| e.to_string())?;
+            println!("retention 策略已设置：version={v} raw_days={raw_days} expired_days={expired_days} enabled={enabled}");
+            Ok(())
+        }
+        Commands::RetentionRun { config, tenant, user } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            match store.retention_run(&scope).map_err(|e| e.to_string())? {
+                Some(r) => println!("retention 完成：{}", serde_json::to_string(&r).map_err(|e| e.to_string())?),
+                None => println!("retention 无操作（策略未配置/关闭或本批次已执行）"),
+            }
             Ok(())
         }
     }
@@ -3323,6 +3450,15 @@ struct ForgetRequestBody {
     target_quote: String,
 }
 
+/// D6-9：restore 请求（同 retire 的证据核验；无版本 CAS）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreRequestBody {
+    origin: OriginDto,
+    user_evidence_id: String,
+    target_quote: String,
+}
+
 async fn correct_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
@@ -3411,6 +3547,113 @@ async fn forget_memory(
             err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件")
         }
         Err(StoreError::AmbiguousTarget) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::AmbiguousTarget, "含糊请求：需明确遗忘动词与目标原话"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+// ---- D6-9：retire / restore（doc6/02 §7、doc6/12）----
+
+async fn retire_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(memory_id): AxumPath<String>,
+    body: Result<Json<ForgetRequestBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let origin = match validate_origin(body.origin) {
+        Ok(o) => o,
+        Err((_c, m)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, m),
+    };
+    {
+        // Rust 核：最新真实用户事件中的逐字指令 span + 目标 claim 含该 quote
+        //（G-13 同法：带 ID 的泛称"退休"不得误伤未被指认的记忆）。
+        let guard = state.store.lock().unwrap();
+        if guard.verify_user_quote_span(&scope, &origin, &body.user_evidence_id, &body.target_quote).is_err() {
+            return err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件或 quote 非逐字");
+        }
+        let claim_ok = guard
+            .get_memory(&scope, &memory_id)
+            .ok()
+            .flatten()
+            .map(|m| find_quote_span(&m.claim, &body.target_quote).is_some())
+            .unwrap_or(false);
+        if !claim_ok {
+            return err(&req_id.0, StatusCode::CONFLICT, ErrorCode::AmbiguousTarget, "目标含糊：quote 未定位到该记忆 claim");
+        }
+    }
+    let req = memory_store_sqlite::lifecycle::RetireRequest {
+        expected_version: body.expected_version,
+        actor_kind: "user",
+        reason_code: Some("user_request".to_string()),
+        user_evidence_id: Some(body.user_evidence_id),
+    };
+    match state.store.lock().unwrap().retire_memory(&scope, &memory_id, &req) {
+        Ok(true) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "memory_id": memory_id,
+            "status": "retired"
+        }))
+        .into_response(),
+        Ok(false) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "memory_id": memory_id,
+            "status": "retired",
+            "already_retired": true
+        }))
+        .into_response(),
+        Err(StoreError::MemoryNotFound) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "记忆不存在或非 active"),
+        Err(StoreError::VersionConflict) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::VersionConflict, "版本冲突，请重读当前版本"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn restore_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(memory_id): AxumPath<String>,
+    body: Result<Json<RestoreRequestBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidJson, "请求不是合法 JSON")
+        }
+        Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "字段缺失、类型错误或含未知字段"),
+    };
+    let origin = match validate_origin(body.origin) {
+        Ok(o) => o,
+        Err((_c, m)) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, m),
+    };
+    {
+        // Rust 核：最新真实用户事件中的逐字指令 span（restore 指令与 claim 无关）。
+        let guard = state.store.lock().unwrap();
+        if guard.verify_user_quote_span(&scope, &origin, &body.user_evidence_id, &body.target_quote).is_err() {
+            return err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StaleUserEvidence, "引用的用户证据不是该会话最新用户事件或 quote 非逐字");
+        }
+    }
+    match state.store.lock().unwrap().restore_memory(&scope, &memory_id, "user") {
+        Ok(true) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "memory_id": memory_id,
+            "status": "active"
+        }))
+        .into_response(),
+        Ok(false) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "memory_id": memory_id,
+            "status": "active",
+            "was_not_retired": true
+        }))
+        .into_response(),
+        Err(StoreError::MemoryNotFound) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "记忆不存在、非 active、已到期或无有效证据"),
         Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }
