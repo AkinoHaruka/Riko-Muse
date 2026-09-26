@@ -545,6 +545,84 @@ impl Store {
     }
 }
 
+impl Store {
+/// 页面列表（CLI/HTTP 审阅；默认只 published，可看 stale/archived）。
+/// 不做来源逐页复核（show/读取接口才复核），列表标 status 供审阅。
+pub fn page_list(
+        &self,
+        scope: &ScopeKey,
+        statuses: &[&str],
+        limit: usize,
+    ) -> Result<Vec<PageRow>, StoreError> {
+        let status_clause = if statuses.is_empty() {
+            "status IN ('published','stale','archived')".to_string()
+        } else {
+            let list = statuses.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+            format!("status IN ({list})")
+        };
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT id, document_kind, document_key, question_version, question_text,
+                    title, body_md, status, version, generator_version, input_fingerprint, updated_at
+             FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND {status_clause}
+             ORDER BY updated_at DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, limit as i64], |r| {
+            Ok(PageRow {
+                page_id: r.get(0)?,
+                document_kind: r.get(1)?,
+                document_key: r.get(2)?,
+                question_version: r.get(3)?,
+                question_text: r.get(4)?,
+                title: r.get(5)?,
+                body_md: r.get(6)?,
+                status: r.get(7)?,
+                version: r.get(8)?,
+                generator_version: r.get(9)?,
+                input_fingerprint: r.get(10)?,
+                updated_at: r.get(11)?,
+                sources: Vec::new(),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 用户/管理员归档页面（doc6/06 §2 POST /v1/pages/{id}/archive 的存储层）：
+    /// CAS；同事务移除索引；归档保留 revision 但不再搜索/注入。
+    pub fn page_archive(
+        &mut self,
+        scope: &ScopeKey,
+        page_id: &str,
+        expected_version: i64,
+    ) -> Result<bool, StoreError> {
+        let tx = self.conn_mut().transaction()?;
+        let n = tx.execute(
+            "UPDATE memory_pages SET status='archived', updated_at=?4
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+               AND status='published' AND version=?5",
+            params![scope.tenant_id, scope.user_id, page_id, now_rfc3339()?, expected_version],
+        )?;
+        remove_page_index_tx(&tx, scope, page_id)?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// 页面是否在 FTS 命中（词法检索扩展点；bundle 页面通道在 D6-6 接线）。
+    pub fn page_fts_search(
+        &self,
+        scope: &ScopeKey,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT p.id FROM page_fts f JOIN memory_pages p ON p.id=f.page_id
+             WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.status='published'
+               AND page_fts MATCH ?3 LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, query, limit as i64], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
 /// 移除一页的 FTS/grams 索引行（同事务；doc6/02 §8.1）。
 fn remove_page_index_tx(
     tx: &rusqlite::Transaction<'_>,

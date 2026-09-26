@@ -79,6 +79,21 @@ enum Commands {
         #[command(subcommand)]
         action: ResidentAction,
     },
+    /// 问题目录管理（doc6/05 §2、doc6/06 §2；可信 CLI，模型不可改）
+    Questions {
+        #[command(subcommand)]
+        action: QuestionsAction,
+    },
+    /// 派生知识文档审阅与归档（doc6/05 §5）
+    Pages {
+        #[command(subcommand)]
+        action: PagesAction,
+    },
+    /// 整理作业管理（doc6/05 §5；管理员显式 enqueue 属自定义触发）
+    Consolidate {
+        #[command(subcommand)]
+        action: ConsolidateAction,
+    },
     /// 只读诊断：迁移、principals、索引状态（不修复数据）
     Doctor {
         #[arg(long)]
@@ -226,6 +241,109 @@ enum ResidentAction {
 }
 
 #[derive(Subcommand)]
+enum QuestionsAction {
+    /// 列出问题（含 archived；默认全部）
+    List {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] status: Option<String>,
+    },
+    /// 登记问题（key 1—64 个 [a-z0-9_]；正文 1—200 标量；key 须不存在）
+    Add {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] key: String,
+        #[arg(long)] text: String,
+    },
+    /// 修改问题正文（CAS；旧画像同事务立即 stale）
+    Update {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] key: String,
+        #[arg(long)] text: String,
+        #[arg(long)] expected_version: i64,
+    },
+    /// 归档问题（用户"删除"首版行为；旧画像同事务 stale）
+    Archive {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] key: String,
+        #[arg(long)] expected_version: i64,
+    },
+    /// 重新启用（按新版本重新生成）
+    Reactivate {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] key: String,
+        #[arg(long)] expected_version: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum PagesAction {
+    /// 列出页面（默认 published；可看 stale/archived）
+    List {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] status: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 显示单页（读时复核来源；失效页不显示正文）
+    Show {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] page_id: String,
+    },
+    /// 归档页面（CAS；保留 revision，不再搜索/注入）
+    Archive {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] page_id: String,
+        #[arg(long)] expected_version: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConsolidateAction {
+    /// 显式入队一次整理（自定义触发；doc6/05 §2）。mental_model 按已登记问题
+    /// 文本词法选输入；topic_page 按 key 词法选输入（≥2 条）。
+    Enqueue {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] kind: String,
+        #[arg(long)] key: String,
+        /// 覆盖检索词；缺省 mental_model 用问题正文、topic_page 用 key
+        #[arg(long)] query: Option<String>,
+    },
+    /// 列出整理作业（诊断）
+    Status {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] status: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 重试一个 dead/终态作业（显式完整 job ID）
+    Retry {
+        #[arg(long)] config: PathBuf,
+        #[arg(long)] tenant: String,
+        #[arg(long)] user: String,
+        #[arg(long)] job_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum PrincipalAction {
     Add {
         #[arg(long)]
@@ -367,6 +485,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/resident", get(get_resident))
                 .route("/v1/resident/suggestions", get(get_resident_suggestions))
                 .route("/v1/context/bundle", post(post_context_bundle))
+                .route("/v1/pages", get(list_pages))
+                .route("/v1/pages/{page_id}", get(get_page))
+                .route("/v1/mental-model/questions", get(list_questions))
                 .layer(middleware::from_fn_with_state(state.clone(), request_pipeline))
                 .with_state(state);
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
@@ -473,6 +594,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Soul { action } => {
             run_soul_action(action)?;
+            Ok(())
+        }
+        Commands::Questions { action } => {
+            run_questions_action(action)?;
+            Ok(())
+        }
+        Commands::Pages { action } => {
+            run_pages_action(action)?;
+            Ok(())
+        }
+        Commands::Consolidate { action } => {
+            run_consolidate_action(action)?;
             Ok(())
         }
         Commands::Resident { action } => {
@@ -757,6 +890,262 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             }
             atomic_write_file(&out, &md)?;
             println!("已导出 {} 条 pinned 项到 {}", rows_len, out.display());
+            Ok(())
+        }
+    }
+}
+
+// ---- D6-5：问题目录 / pages / consolidate 本机 CLI（doc6/05 §2/§5、doc6/06 §2）----
+
+/// 整理入队的输入选择（doc6/05 §2）：词法检索有界 20 条 active L1，
+/// fingerprint 由排序后的 (id,version) 序列哈希（输入漂移即新指纹）。
+fn select_consolidation_inputs(
+    store: &Store,
+    scope: &ScopeKey,
+    query: &str,
+) -> Result<Vec<(String, i64, String)>, String> {
+    let (hits, _) = store
+        .search_memories(scope, query, 20, false)
+        .map_err(|e| e.to_string())?;
+    let mut inputs: Vec<(String, i64, String)> = Vec::new();
+    for hit in hits {
+        let (v, s) = store
+            .memory_version_sha(scope, &hit.memory_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("记忆 {} 读取失败", hit.memory_id))?;
+        inputs.push((hit.memory_id, v, s));
+    }
+    Ok(inputs)
+}
+
+fn run_questions_action(action: QuestionsAction) -> Result<(), String> {
+    match action {
+        QuestionsAction::List { config, tenant, user, status } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let rows = store.question_list(&scope, status.as_deref()).map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("（问题目录为空——doc6/05：首版默认空，Dream 不生成画像）");
+                return Ok(());
+            }
+            println!("{:<28} {:<8} {:<10} {:<22} {}", "key", "version", "status", "updated_at", "text");
+            for r in rows {
+                println!("{:<28} {:<8} {:<10} {:<22} {}", r.question_key, r.version, r.status, r.updated_at, r.question_text);
+            }
+            Ok(())
+        }
+        QuestionsAction::Add { config, tenant, user, key, text } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let v = store.question_add(&scope, &key, &text, "user_cli").map_err(|e| match e {
+                StoreError::InvalidQuestionKey => "问题键须为 1—64 个 ASCII [a-z0-9_]".into(),
+                StoreError::InvalidQuestionText => "问题正文须 1—200 个 Unicode 标量字符".into(),
+                StoreError::StateConflict => "该问题键已存在（add 要求 key 不存在）".into(),
+                other => other.to_string(),
+            })?;
+            println!("已登记问题 {key} version={v}");
+            Ok(())
+        }
+        QuestionsAction::Update { config, tenant, user, key, text, expected_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let v = store.question_update(&scope, &key, &text, expected_version, "user_cli").map_err(|e| match e {
+                StoreError::QuestionNotFound => "问题不存在或不属于当前 scope".into(),
+                other => other.to_string(),
+            })?;
+            println!("已更新问题 {key} version={v}（旧画像已立即 stale）");
+            Ok(())
+        }
+        QuestionsAction::Archive { config, tenant, user, key, expected_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let v = store.question_archive(&scope, &key, expected_version, "user_cli").map_err(|e| e.to_string())?;
+            println!("已归档问题 {key} version={v}（旧画像已立即 stale）");
+            Ok(())
+        }
+        QuestionsAction::Reactivate { config, tenant, user, key, expected_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let v = store.question_reactivate(&scope, &key, expected_version, "user_cli").map_err(|e| e.to_string())?;
+            println!("已重新启用问题 {key} version={v}（按新版本与当前有效 L1 重新生成）");
+            Ok(())
+        }
+    }
+}
+
+fn run_pages_action(action: PagesAction) -> Result<(), String> {
+    match action {
+        PagesAction::List { config, tenant, user, status, limit } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            if !(1..=100).contains(&limit) {
+                return Err("limit 必须 1～100".into());
+            }
+            let statuses: Vec<&str> = match status.as_deref() {
+                None => vec![],
+                Some(s) => s.split(',').map(str::trim).collect(),
+            };
+            let rows = store.page_list(&scope, &statuses, limit).map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("（无页面）");
+                return Ok(());
+            }
+            println!("{:<40} {:<14} {:<24} {:<10} {:<8} {:<22} {}", "page_id", "kind", "key", "status", "version", "updated_at", "title");
+            for r in rows {
+                println!("{:<40} {:<14} {:<24} {:<10} {:<8} {:<22} {}", r.page_id, r.document_kind, r.document_key, r.status, r.version, r.updated_at, r.title);
+            }
+            Ok(())
+        }
+        PagesAction::Show { config, tenant, user, page_id } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
+            match store.get_page(&scope, &page_id, &now).map_err(|e| e.to_string())? {
+                None => Err(format!("页面 {page_id} 不存在、非 published 或来源已失效（读时复核）")),
+                Some(p) => {
+                    println!("page_id: {}", p.page_id);
+                    println!("kind/key: {}/{}", p.document_kind, p.document_key);
+                    println!("version: {} generator: {}", p.version, p.generator_version);
+                    println!("sources: {:?}", p.sources);
+                    println!("---");
+                    println!("{}", p.body_md);
+                    Ok(())
+                }
+            }
+        }
+        PagesAction::Archive { config, tenant, user, page_id, expected_version } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let ok = store.page_archive(&scope, &page_id, expected_version).map_err(|e| e.to_string())?;
+            if ok {
+                println!("已归档 {page_id}（revision 保留；不再搜索/注入）");
+            } else {
+                return Err("归档未生效：页面不存在、非 published 或版本不符（409 语义）".into());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
+    match action {
+        ConsolidateAction::Enqueue { config, tenant, user, kind, key, query } => {
+            if !matches!(kind.as_str(), "mental_model" | "topic_page") {
+                return Err("kind 必须是 mental_model/topic_page".into());
+            }
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            // mental_model：问题必须已登记且 active（doc6/05 §2 空目录跳过画像）。
+            let question_version = if kind == "mental_model" {
+                let q = store
+                    .question_list(&scope, Some("active"))
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|q| q.question_key == key)
+                    .ok_or_else(|| format!("问题 {key} 未登记或非 active——先 mental-model questions add"))?;
+                Some(q.version)
+            } else {
+                None
+            };
+            let search_query = query.unwrap_or_else(|| {
+                if kind == "mental_model" {
+                    store
+                        .question_list(&scope, Some("active"))
+                        .ok()
+                        .and_then(|rows| rows.into_iter().find(|q| q.question_key == key))
+                        .map(|q| q.question_text)
+                        .unwrap_or_else(|| key.clone())
+                } else {
+                    key.clone()
+                }
+            });
+            let inputs = select_consolidation_inputs(&store, &scope, &search_query)?;
+            if kind == "topic_page" && inputs.len() < 2 {
+                return Err(format!("主题页至少需要 2 条 active 来源（当前 {} 条）；doc6/05 §2 不满足不生成", inputs.len()));
+            }
+            if kind == "mental_model" && inputs.is_empty() {
+                return Err("没有相关 active L1 来源；不生成画像".into());
+            }
+            let parts: Vec<String> = inputs.iter().map(|(id, v, _)| format!("{id}:{v}")).collect();
+            let part_refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            let fingerprint = memory_store_sqlite::soul::receipt_hash(&part_refs);
+            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
+            let generator = if kind == "mental_model" {
+                memory_store_sqlite::pages::GENERATE_MENTAL_MODEL_V1
+            } else {
+                memory_store_sqlite::pages::GENERATE_CONSOLIDATE_V1
+            };
+            let job = store
+                .consolidation_enqueue(
+                    &scope, &kind, &key, question_version, generator, &fingerprint, &inputs, &now,
+                )
+                .map_err(|e| e.to_string())?;
+            println!(
+                "已入队整理作业 {}（kind={kind} key={key} 输入 {} 条 status={}）",
+                job.id,
+                inputs.len(),
+                job.status
+            );
+            println!("注意：模型调用由 D6-7 Dream runner 接通后启动；当前作业停在 queued 属预期");
+            Ok(())
+        }
+        ConsolidateAction::Status { config, tenant, user, status, limit } => {
+            let cfg = Config::load(&config)?;
+            let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            if !(1..=100).contains(&limit) {
+                return Err("limit 必须 1～100".into());
+            }
+            let rows = store.consolidation_list(&scope, status.as_deref(), limit).map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("（无整理作业）");
+                return Ok(());
+            }
+            println!("{:<40} {:<14} {:<24} {:<12} {:<6} {:<22} {}", "job_id", "kind", "key", "status", "gen", "updated_at", "error");
+            for r in rows {
+                println!(
+                    "{:<40} {:<14} {:<24} {:<12} {:<6} {:<22} {}",
+                    r.id,
+                    r.document_kind,
+                    r.document_key,
+                    r.status,
+                    r.claim_generation,
+                    r.updated_at,
+                    r.error_code.unwrap_or_else(|| "-".into())
+                );
+            }
+            Ok(())
+        }
+        ConsolidateAction::Retry { config, tenant, user, job_id } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey { tenant_id: tenant, user_id: user };
+            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
+            let job = store
+                .consolidation_get(&scope, &job_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("作业 {job_id} 不存在或不属于当前 scope"))?;
+            if job.status != "dead" && job.status != "stale_input" {
+                return Err(format!("仅 dead/stale_input 作业可 retry；当前 {}", job.status));
+            }
+            let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
+            let ok = store
+                .consolidation_requeue(&scope, &job_id, &now)
+                .map_err(|e| e.to_string())?;
+            if ok {
+                println!("作业 {job_id} 已重新排队（冻结输入不变）");
+            } else {
+                return Err("重试未生效".into());
+            }
             Ok(())
         }
     }
@@ -2004,6 +2393,119 @@ async fn post_context_bundle(
         "source_versions": source_versions,
     }))
     .into_response()
+}
+
+// ---- D6-5：GET /v1/pages、GET /v1/pages/{id}、GET /v1/mental-model/questions（只读审阅）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PagesListQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+fn page_json(p: &memory_store_sqlite::pages::PageRow) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "page",
+        "page_id": p.page_id,
+        "document_kind": p.document_kind,
+        "document_key": p.document_key,
+        "question_version": p.question_version,
+        "title": p.title,
+        "body_md": p.body_md,
+        "status": p.status,
+        "version": p.version,
+        "generator_version": p.generator_version,
+        "sources": p.sources.iter().map(|(id, v)| serde_json::json!({"memory_id": id, "version": v})).collect::<Vec<_>>(),
+        "updated_at": p.updated_at,
+    })
+}
+
+async fn list_pages(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<PagesListQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "limit 必须 1～100");
+    }
+    let statuses: Vec<&str> = match query.status.as_deref() {
+        None => vec![],
+        Some(s) => s.split(',').map(str::trim).collect(),
+    };
+    for s in &statuses {
+        if !matches!(*s, "published" | "stale" | "archived") {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "status 只能是 published/stale/archived");
+        }
+    }
+    let guard = state.store.lock().unwrap();
+    match guard.page_list(&scope, &statuses, limit) {
+        Ok(rows) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "pages": rows.iter().map(page_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+async fn get_page(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(page_id): AxumPath<String>,
+) -> Response {
+    let now = match memory_store_sqlite::now_rfc3339_pub() {
+        Ok(t) => t,
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    let guard = state.store.lock().unwrap();
+    match guard.get_page(&scope, &page_id, &now) {
+        Ok(Some(p)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "page": page_json(&p),
+        }))
+        .into_response(),
+        // 跨 scope/失效/不存在一律 404（不泄露存在性；doc6/06 §2）。
+        Ok(None) => err(&req_id.0, StatusCode::NOT_FOUND, ErrorCode::NotFound, "页面不存在或已失效"),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionsListQuery {
+    status: Option<String>,
+}
+
+async fn list_questions(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<QuestionsListQuery>,
+) -> Response {
+    if let Some(s) = query.status.as_deref() {
+        if !matches!(s, "active" | "archived") {
+            return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "status 只能是 active/archived");
+        }
+    }
+    let guard = state.store.lock().unwrap();
+    match guard.question_list(&scope, query.status.as_deref()) {
+        Ok(rows) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "questions": rows.iter().map(|r| serde_json::json!({
+                "question_key": r.question_key,
+                "question_text": r.question_text,
+                "version": r.version,
+                "status": r.status,
+                "updated_at": r.updated_at,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    }
 }
 
 /// GET /v1/jobs（doc4/04 §1）：scope 内分页作业列表，默认 dead，不返回正文。

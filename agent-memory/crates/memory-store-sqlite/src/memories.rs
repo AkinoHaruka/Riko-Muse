@@ -427,6 +427,24 @@ impl Store {
         Ok(claim)
     }
 
+    /// 读取 (version, claim_sha256)（整理入队固化输入用）；跨 scope/不存在 None。
+    pub fn memory_version_sha(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<(i64, String)>, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT version, claim_sha256 FROM memories
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// 搜索实现（doc/13 §6）。返回 hits 与 index_degraded。
     pub fn search_memories(
         &self,

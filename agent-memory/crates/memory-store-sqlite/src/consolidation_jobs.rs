@@ -261,6 +261,21 @@ impl Store {
         Ok(n as i64)
     }
 
+    /// 显式重试（CLI；仅 dead/stale_input）：回 queued，冻结输入不变。
+    pub fn consolidation_requeue(
+        &mut self,
+        scope: &ScopeKey,
+        job_id: &str,
+        run_after: &str,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn_mut().execute(
+            "UPDATE consolidation_jobs SET status='queued', run_after=?4, error_code=NULL, updated_at=?5
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status IN ('dead','stale_input')",
+            params![scope.tenant_id, scope.user_id, job_id, run_after, now_rfc3339()?],
+        )?;
+        Ok(n > 0)
+    }
+
     /// 读取单 job（scope 内）。
     pub fn consolidation_get(
         &self,
