@@ -11,8 +11,8 @@ target/
 dist/
 node_modules/
 # DSH Git-subdirectory bundles load prebuilt Host code from dist/.
-!riko-app-api/dist/
-!riko-app-api/dist/**
+!riko-app-bridge/dist/
+!riko-app-bridge/dist/**
 *.db
 *.db-wal
 *.db-shm

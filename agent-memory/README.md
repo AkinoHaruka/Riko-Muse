@@ -86,7 +86,7 @@ TypeScript 适配器（Cordis 插件与 DSH bundle）。D6 child/hook 闭环曾�
 
 运行时行为：事件先落本地 spool（`spoolDir/events.jsonl`，追加 + fsync，100 MiB 上限）再异步发送；内核离线时 DSH 对话不受影响，恢复后启动重放按幂等键重发（同键返回既有 evidence_id）。D6 还提供稳定 Agent Soul/Resident 注入、受限 Dream child 读取与 Rust 裁决、来源校验的主题页整理。
 
-Riko-App HTTP Bridge 是独立 DSH bundle，源码位于仓库根目录的 `riko-app-api/`，不属于本记忆适配器。它的模型设置接口映射到 DSH `settings`、`credentials` 和 `llm.discoverModels`：密钥只写入 DSH credentials，不由 Bridge 回读。Android 设置页已接入提供商密钥写入/删除、自定义 OpenAI/Anthropic 兼容提供商和模型发现；部署前应先按 `../doc-handoff/21-DSH-0.2适配.md` 核对当前生产 Bridge 版本。
+Riko-App HTTP Bridge 是独立 DSH bundle，源码位于仓库根目录的 `riko-app-bridge/`，不属于本记忆适配器。它的模型设置接口映射到 DSH `settings`、`credentials` 和 `llm.discoverModels`：密钥只写入 DSH credentials，不由 Bridge 回读。Android 设置页已接入提供商密钥写入/删除、自定义 OpenAI/Anthropic 兼容提供商和模型发现；部署前应先按 `../doc-handoff/21-DSH-0.2适配.md` 核对当前生产 Bridge 版本。
 
 ## 安全边界
 

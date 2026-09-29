@@ -5,7 +5,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AkinoHaruka/Riko-Memory.git",
-    "directory": "riko-app-api"
+    "directory": "riko-app-bridge"
   },
   "type": "module",
   "main": "dist/index.js",
@@ -15,14 +15,14 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist", "riko-app-api.patch.yml", "README.md"],
+  "files": ["dist", "riko-app-bridge.patch.yml", "README.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "npm run build && node --test \"tests/*.test.mjs\""
   },
   "license": "Apache-2.0",
-  "dsh": { "bundle": { "patch": "./riko-app-api.patch.yml" } },
+  "dsh": { "bundle": { "patch": "./riko-app-bridge.patch.yml" } },
   "peerDependencies": {
     "@deepseek-ai/dsh-api-session-controller": "^0.2.0-rc.1",
     "@deepseek-ai/dsh-host-webserver": "^0.2.0-rc.1",

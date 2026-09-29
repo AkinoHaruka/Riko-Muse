@@ -7,13 +7,13 @@
 From this repository checkout:
 
 ```text
-corepack pnpm dsh plugin --profile <profile> add ./riko-app-api
+corepack pnpm dsh plugin --profile <profile> add ./riko-app-bridge
 ```
 
 After this package is published to the repository's default branch, install it from GitHub with:
 
 ```text
-corepack pnpm dsh plugin --profile <profile> add github:AkinoHaruka/Riko-Memory#path:/riko-app-api
+corepack pnpm dsh plugin --profile <profile> add github:AkinoHaruka/Riko-Memory#path:/riko-app-bridge
 ```
 
 The bundle inserts a profile-level Host plugin. It does not modify the Riko Memory adapter or its preset patch. The plugin remains disabled until both required environment variables are configured in the DSH process or its home `.env` file:

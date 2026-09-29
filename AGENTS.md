@@ -14,7 +14,7 @@
 
 ```
 当前基线：main（每次开工现场核对 branch、HEAD、status；不要依赖文档中的旧 SHA）
-DSH 适配：官方本地 clone 已更新到 `0.2.0-rc.1 / 4878cdabd87d4041bdaff61d04c966883b9fd07a`；Riko Memory bundle `0.5.1` 已发布，本地拆分后的 adapter 版本为 `0.5.2`、尚未发布。隔离 profile 安装与配置组合曾通过，完整插件激活/内核连接未验证。Riko-App Bridge 已拆分为根目录独立包 `riko-app-api/`，生产主机尚未更新；证据见 `doc-handoff/21-DSH-0.2适配.md`
+DSH 适配：官方本地 clone 已更新到 `0.2.0-rc.1 / 4878cdabd87d4041bdaff61d04c966883b9fd07a`；Riko Memory bundle `0.5.1` 已发布，本地拆分后的 adapter 版本为 `0.5.2`、尚未发布。隔离 profile 安装与配置组合曾通过，完整插件激活/内核连接未验证。Riko-App Bridge 已拆分为根目录独立包 `riko-app-bridge/`，生产主机尚未更新；证据见 `doc-handoff/21-DSH-0.2适配.md`
 v1（doc/ 卡 0–6）、v2（doc2/ 卡 V2-0…V2-6）、doc4（D4-0…D4-7）、doc5（D5-0…D5-6）：已交付；已验证档位见 doc-handoff/README.md
 现有内核 schema 13（迁移 0001—0013）；`0001`—`0013` 均冻结，新增迁移须从 `0014` 顺序递增；D5 新作业 extract_v3/admit_v2，历史版本按作业行冻结
 remember 直写内容护栏按用户决定全部解除；保留 scope、最新用户证据、逐字 span、幂等与审计（doc-handoff/12）
@@ -28,7 +28,7 @@ D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DS
 | 路径 | 性质 |
 |---|---|
 | `agent-memory/` | 记忆内核唯一实现目录：`crates/`（Rust）、`migrations/`、`adapters/dsh/`（仅记忆适配器）、`config.example.toml`、`README.md` |
-| `riko-app-api/` | 独立 DSH Host bundle：Riko-App HTTP Bridge；不属于记忆插件，单独构建、测试与安装 |
+| `riko-app-bridge/` | 独立 DSH Host bundle：Riko-App HTTP Bridge；不属于记忆插件，单独构建、测试与安装 |
 | `doc/` | v1 规范：目标、数据模型、HTTP v1、算法契约、任务卡 |
 | `doc2/` | v2 施工规范（官方 DSH 源码事实 + 修复任务卡 + 运行手册） |
 | `doc5/` | doc5 记忆质量规则（产品决定与施工规范，已实施；未跟踪） |
