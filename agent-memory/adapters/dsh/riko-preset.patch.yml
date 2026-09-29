@@ -1,0 +1,79 @@
+# Riko Memory bundle: insert a separate Riko Agent preset based on DSH Minimal.
+# Minimal remains unchanged; source composition checked against DSH 0.2.0-rc.1 at 4878cdabd87d4041bdaff61d04c966883b9fd07a.
+- insert:
+    - id: preset-riko
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: riko
+        name: Riko
+        description: Riko Memory-enabled preset based on Minimal.
+        order: 4
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a helpful software engineer assistant.
+              complete: true
+              includeRuntimeContext: false
+          - id: persistent-shell
+            name: cordis:group
+            group: true
+            isolate:
+              terminals: true
+            config:
+              - id: pty
+                name: '@deepseek-ai/dsh-terminal'
+              - id: terminal-bash
+                name: '@deepseek-ai/dsh-terminal-bash'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 300000
+              - id: persistent-bash
+                name: '@deepseek-ai/dsh-tool-bash-persistent'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a bash shell
+                    * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+                    * Network access depends on the task environment. Prefer configured mirrors/proxies when they are available.
+                    * State is persistent across command calls and discussions with the user.
+                    * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+                    * Please avoid commands that may produce a very large amount of output.
+                    * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+              - id: terminal-pwsh
+                name: '@deepseek-ai/dsh-terminal-bash'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  shellDialect: pwsh
+                  timeoutMs: 300000
+              - id: persistent-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a PowerShell shell
+                    * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+                    * You don't have access to the internet via this tool.
+                    * State is persistent across command calls and discussions with the user.
+                    * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
+                    * Please avoid commands that may produce a very large amount of output.
+                    * Please run long lived commands in the background, e.g. 'Start-Job' or 'Start-Process'.
+          - id: agent-memory
+            name: '@agent-memory/dsh-adapter'
+            disabled: !!js "!(process.env.AGENT_MEMORY_TOKEN_FILE && process.env.AGENT_MEMORY_SPOOL_DIR && process.env.AGENT_MEMORY_HOST_ID)"
+            config:
+              memoryUrl: http://127.0.0.1:8791
+              userTokenFile: !!js process.env.AGENT_MEMORY_TOKEN_FILE
+              spoolDir: !!js process.env.AGENT_MEMORY_SPOOL_DIR
+              hostId: !!js process.env.AGENT_MEMORY_HOST_ID
+              contextBundleEnabled: true
+              requireContextBundle: false
+              agentName: riko
+    - id: riko-app-api
+      name: '@agent-memory/dsh-adapter/mobile-api'
+      disabled: !!js "!(process.env.RIKO_APP_API_TOKEN_FILE && process.env.RIKO_APP_SESSION_REGISTRY_FILE)"
+      config:
+        apiTokenFile: !!js process.env.RIKO_APP_API_TOKEN_FILE
+        sessionRegistryFile: !!js process.env.RIKO_APP_SESSION_REGISTRY_FILE

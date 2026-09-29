@@ -1,25 +1,25 @@
-# Agent Memory（memoryd）
+# Riko-Memory（memoryd）
 
-Rust 优先的通用 Agent 长期记忆内核：同一用户的多 Agent 共享同一份长期记忆，不同用户严格隔离。设计契约见 `../doc/`（v1 冻结：`../doc/10-开发冻结规范.md`；实现契约：`../doc/11`～`15`）。
+Rust 优先的通用 Agent 长期记忆内核：同一用户的多个 Agent 默认共享长期记忆，不同用户由服务端身份令牌严格隔离。本仓库包含可运行实现；D6 产品与施工规范见 `../doc6/`，实施证据见 `../doc-handoff/`。
 
-**状态（分层，勿混为一类。更新：2026-09-25 晚，doc5 记忆质量规则实施后，详见 `../doc-handoff/09-D5交付记录.md`）：**
+**验证状态（更新：2026-09-29；验证档位分开记录）：**
 
 | 层 | 状态 |
 |---|---|
-| HTTP 协议验证（curl 实测 + 单测） | ✅ 本机 Windows 实测（doc5 后 `cargo test --workspace` 68 测试全绿 + 真实 curl 冒烟：版本/健康/remember 高风险窄门 409/201） |
-| DSH 实际运行（官方 clone 真实宿主闭环） | ✅ doc4 改动已在真实 DSH 宿主复验（`../doc-handoff/08` §1）；**doc5 的准入版本改动未在真实 DSH 闭环跑过**（本机确定性测试 + 临时库覆盖） |
-| 模型真实连通 | ✅ v2 提取链路实测（SiliconFlow Qwen3.5-4B，见 `../doc-handoff/05`）；**doc5 阶段未运行真实模型（用户暂停），extract_v3/admit_v2 的真实模型行为未验证** |
-| 构建安装部署 | ⚠️ 本机构建通过（cargo/tsc）；迁移 0004 已在 schema 3 真实文件副本演练通过（`d5rehearsal`，原库未动）；真实用户库（dana/realtest）未升级，未做安装分发 |
+| Rust 确定性检查 | ✅ 当前工作区 `cargo fmt --all -- --check`、`cargo test --workspace`、`cargo build --workspace` 通过；schema 13 |
+| DSH 宿主 | ✅ D6-11—D6-15 在官方 DSH + 固定响应中验证 Dream child、Rust receipt、主题页创建/更新；DSH 0.2 bundle 安装与配置预览通过，插件完整激活和 memoryd 连接未验证 |
+| 真实模型 | ⚠️ 有历史小样本，见 `../doc-handoff/16`—`19`；D6-11—D6-15 新 child 流程、总体写入/召回质量及回答利用率未验收 |
+| Android 模型设置 | ⚠️ 本地 Bridge API、模拟器 debug APK 与确定性接口测试已完成；生产 DSH 主机是否部署新路由未验证 |
+| 部署与用户数据 | ⚠️ dana/realtest 未升级；生产 DSH bridge 未因本地代码改动而更新 |
 
-## 记忆质量规则（doc5，2026-09-25 起生效）
+## 记忆行为
 
-新作业固定 `extract_v3` 提取 + `admit_v2` 准入（作业行两列持久化，worker 按列分派；未知版本确定性立即 dead）；历史作业保持原 Prompt + `admit_v1`，行为冻结。要点：
+自动提取的新作业使用 `extract_v3` + `admit_v2`；历史作业按其持久化版本继续处理。未知版本会确定性失败。自动准入规则要求单命题、可定位的用户原文，并将不符合规则的候选留在 `held`，而非自动激活。
 
-- 一候选一命题、最短连续原文；宽 quote、可剥离口语前缀、缺主语片段、第三人、健康敏感、未来/短期状态、凭据一律不自动 active（详见 `../doc5/03` 固定顺序与 reason 表）。
-- `memory_remember` 直写：凭据永不 active（409）；时间性内容暂不支持永久保存（409）；健康/第三人内容需用户在最新一条消息中直接说「请记住：<原话>」才可 active；普通偏好沿既有路径。`source_class=user_explicit` 表示可逐字定位到用户直接陈述，**不等于用户明确要求持久保存**。
-- 召回契约不变：instruction 独立名额至多 2，fact/preference 仅按词法命中注入（离线探针见 `../doc5/05` 与交付记录 §7）。
+- `memory_remember` 是显式直写接口：内容按请求和证据原文创建为 active 记忆，不设凭据、健康、第三人、时间性或命题数量的内容类别限制。服务端仍验证用户 scope、最新用户证据、逐字 quote、幂等、审计和遗忘抑制。调用者应按应用自身的隐私策略决定哪些内容适合保存。
+- 召回时 instruction 最多有 2 个独立名额；fact/preference 等其他记忆按词法相关性召回。所有注入受条数和字符预算限制。
 
-队列可靠性契约（作业状态机、公平领取、崩溃恢复、服务端分窗、人工 skip）见 `../doc4/02—04`。
+作业队列支持租约恢复、代际隔离、按实际序列化字节分窗和显式跳过 dead 作业。
 
 ## 快速开始（Windows 本机已验证）
 
@@ -35,7 +35,7 @@ cargo run -p memory-server --bin memoryd -- principal add \
 cargo run -p memory-server --bin memoryd -- serve --config config.toml
 
 # 4. 检查
-curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":4,...}
+  curl http://127.0.0.1:8791/v1/version    # {"protocol_version":1,"schema_version":13,...}
 curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"ready|degraded"}
 ```
 
@@ -76,42 +76,42 @@ curl http://127.0.0.1:8791/v1/health     # {"status":"ok","db":"ready","index":"
 
 ## DSH 适配器（`adapters/dsh/`）
 
-TypeScript 薄适配器（Cordis 插件），按官方 `deepseek-harness@477b4f4`（0.1.7-rc.2）源码事实重写并通过对真实 DSH lib 类型的 `tsc` 检查（宿主事实核对路径：`packages/core/agent-loop`、`packages/llm/llm-deepseek/src/serialize.ts`、`packages/session/session-format-v3-to-v4/src/message-sources.ts`）：
+TypeScript 适配器（Cordis 插件与 DSH bundle）。D6 child/hook 闭环曾在官方 DSH `477b4f4` 固定响应环境中验证；bundle peer 与配置兼容已在 `0.2.0-rc.1` 验证。当前版本的完整插件激活和 memoryd 连接仍未验证：
 
 - Cordis 插件形状：导出 `name`/`inject`/`apply(ctx, config)`；`inject: [tools]`，sessionQuery 软探测；
 - `ctx.on('session/event', ...)`：`event.time` 为 Unix 毫秒数；`user/message` 的 `data` 即 `UserMessage`；
 - `ctx.on('agent/pre-step', ...)`：waterfall `await next()` 后按 compose 结果追加注入消息；
-- 注入 source 用 producer 自有 kind `{kind:'agent-memory', form:'recall'}`——**v4 会话格式已退役 `kind:'plugin'`**（`doc2/04` 相应表述已过时，以官方源码为准）；
+- 注入 source 用 producer 自有 kind `{kind:'agent-memory', form:'recall'}`；
 - `defineTool` 五个 `memory_*` 工具，输出固定 JSON 对象 `{ok,data?,error?}`。
 
-运行时行为：事件先落本地 spool（`spoolDir/events.jsonl`，追加 + fsync，100 MiB 上限）再异步发送；内核离线时 DSH 对话不受影响，恢复后启动重放按幂等键重发（同键返回既有 evidence_id）。详见 `../doc2/03`、`../doc2/04`。
+运行时行为：事件先落本地 spool（`spoolDir/events.jsonl`，追加 + fsync，100 MiB 上限）再异步发送；内核离线时 DSH 对话不受影响，恢复后启动重放按幂等键重发（同键返回既有 evidence_id）。D6 还提供稳定 Agent Soul/Resident 注入、受限 Dream child 读取与 Rust 裁决、来源校验的主题页整理。
+
+Riko-App Bridge 由同一 bundle 的 `riko-app-api` Host 插件提供。模型设置接口映射到 DSH `settings`、`credentials` 和 `llm.discoverModels`：密钥只写入 DSH credentials，不由 Bridge 回读。Android 设置页已接入提供商密钥写入/删除、自定义 OpenAI/Anthropic 兼容提供商和模型发现；部署前应先按 `../doc-handoff/21-DSH-0.2适配.md` 核对当前生产 Bridge 版本。
 
 ## 安全边界
 
 - 请求正文不接受 `tenant_id/user_id`；scope 只由 Bearer 令牌在服务端解析。
-- 令牌与模型密钥严禁写入仓库、配置或日志；模型密钥经 `model_key_file` 读取。
+- 令牌与模型密钥不得写入仓库或日志；模型密钥经 `model_key_file` 读取。
 - 首版只监听 loopback；一个 DSH 进程服务一名配置用户（多用户进程需 DSH 可信身份接口，v1 不开放）。
-- 自动 `active` 仅限用户明确直接陈述（`extract_v1` 确定性窄规则）；推断与敏感内容一律 `held`。
+- 自动提取只有通过当前版本的准入规则才会创建 active 记忆；直写 API 按上述语义处理，不替调用方做内容敏感度决策。
 
 ## 目录
 
 - `crates/memory-contract`：协议常量、错误码、v1 版本化默认限额
 - `crates/memory-domain`：ScopeKey、状态机、`normalize_v1`、claim 哈希（纯 Rust）
 - `crates/memory-store-sqlite`：迁移、principals、evidence、memories、jobs、索引事务
-- `crates/memory-extract`：`extract_v1` Prompt、模型协议、候选准入规则 1–7
+- `crates/memory-extract`：版本化提取 Prompt、模型协议与候选准入策略
 - `crates/memory-recall`：词法（latin tokens / CJK bigrams）、RRF
 - `crates/memory-server`：`memoryd` 二进制（CLI + HTTP + worker）
 - `adapters/dsh`：DSH TypeScript 薄适配器
-- `migrations/0001_init.sql`：规范库蓝图（schema 1，已发布、checksum 固定，禁止回改）
-- `migrations/0002_prompt_version.sql`：schema 2——`extraction_jobs.prompt_version`（doc2/05 §3）；
-  旧库启动时自动有序升级，旧作业回填 `extract_v1`。**升级前先用 `memoryd backup` 备份**。
+- `migrations/0001_init.sql`—`0013_topic_page_description.sql`：当前 schema 13；`0001`—`0013` 均冻结，后续迁移从 `0014` 开始。**升级任何用户库前先做只读快照并按交接手册演练**。
 
 ## 已验证与未验证
 
-**已验证（本机 Windows，26 个单测 + curl 实测 + 官方 DSH headless 真实闭环，2026-09-25）**：双用户令牌隔离与轮换；L0 幂等/冲突；Agent A→B 跨 Agent 记忆闭环（remember/search/compose，含 DSH 宿主内注入可见性）；中文 grams 与英文 FTS 双路检索；纠错/遗忘/版本锁/幂等/抑制复活（DSH 宿主内多步工具回路）；flush 幂等与作业状态；重启恢复；**spool 离线重放（停内核→落盘→恢复→同键幂等重放）**；rebuild-index/backup/doctor；非 loopback 拒绝。
+**已验证（本机 Windows）**：核心 HTTP、隔离与生命周期路径有历史 curl/固定响应证据；D6-11—D6-15 当前检查为 `cargo fmt --all -- --check`、`cargo test --workspace`、`cargo build --workspace` 通过，官方 DSH 固定响应验证 Dream child 提取/裁决、页面创建/更新与索引回归。完整证据和验证边界见 `../doc-handoff/20-D6-11-15交付记录.md`。
 
-**已验证补充（真实模型，2026-09-25）**：提取 worker 真实模型生成有证据的 active 记忆（claim 为用户原话逐字片段，usage 持久化）；DSH 真实模型会话注入召回并被正确使用（经本地协议转换装置，模型=SiliconFlow Qwen3.5-4B）。
+**历史真实模型样本**：曾用 SiliconFlow、OpenRouter 与 Gemini 进行提取、召回和 Dream/embedding 探针；结果、失败和请求量分开记录在 `../doc-handoff/16`—`19`。这些小样本不代表新 D6 child 流程或整体记忆质量通过。
 
-**未验证**：真实模型下的批量提取质量、多窗口长历史、限速；插件 HMR 卸载后工具消失；其他操作系统。one-shot headless 模式下 assistant/tool 事件捕获受退出竞态影响（用户事件不受影响），headless 无 sessionQuery、缺口对账不运行。
+**未验证**：D6 新 Dream child 的真实模型质量、整体记忆写入/召回与回答利用率、全量 E01—E25、规模性能、当前 DSH 0.2 插件完整激活与生产 Bridge 部署、用户库升级及其他操作系统。one-shot headless 模式下 assistant/tool 事件捕获受退出竞态影响（用户事件不受影响），headless 无 sessionQuery、缺口对账不运行。
 
 **不声称**：EverOS/Hindsight 的基准成绩、SOTA 准确率、生产多租户能力。首版只报告上述本机实测行为。
