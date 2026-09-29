@@ -130,10 +130,24 @@ pub enum Admission {
 pub enum ExtractError {
     #[error("模型响应不是合法 JSON")]
     BadJson,
-    #[error("模型调用失败: {0}")]
+    #[error("模型调用传输失败")]
     Transport(String),
+    #[error("模型端点返回 HTTP {0}")]
+    HttpStatus(u16),
     #[error("模型超时")]
     Timeout,
+}
+
+impl ExtractError {
+    /// Stable diagnostic safe to persist; excludes response bodies and request details.
+    pub fn safe_error_code(&self) -> String {
+        match self {
+            Self::BadJson => "MODEL_BAD_RESPONSE".into(),
+            Self::Transport(_) => "MODEL_TRANSPORT".into(),
+            Self::HttpStatus(status) => format!("MODEL_HTTP_{status}"),
+            Self::Timeout => "MODEL_TIMEOUT".into(),
+        }
+    }
 }
 
 /// 一次成功调用的模型输出（doc2/05 §2：usage 有则记录，无则 NULL 不估算）。
@@ -737,6 +751,25 @@ pub fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_error_codes_are_safe_and_keep_http_status() {
+        assert_eq!(
+            ExtractError::HttpStatus(429).safe_error_code(),
+            "MODEL_HTTP_429"
+        );
+        assert_eq!(
+            ExtractError::HttpStatus(401).safe_error_code(),
+            "MODEL_HTTP_401"
+        );
+        assert_eq!(
+            ExtractError::Transport("url contains token=secret".into()).safe_error_code(),
+            "MODEL_TRANSPORT"
+        );
+        assert!(!ExtractError::Transport("token=secret".into())
+            .to_string()
+            .contains("secret"));
+    }
 
     fn ev(content: &str) -> WindowEvent {
         WindowEvent {

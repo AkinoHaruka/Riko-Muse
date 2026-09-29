@@ -16,6 +16,7 @@ use crate::{now_rfc3339, Store, StoreError};
 
 /// generator/Prompt 版本（doc6/05 §3）：修改 Prompt 必须新建版本；旧 job 按保存版本分派。
 pub const GENERATE_CONSOLIDATE_V1: &str = "consolidate_v1";
+pub const GENERATE_CONSOLIDATE_V2: &str = "consolidate_v2";
 pub const GENERATE_MENTAL_MODEL_V1: &str = "mental_model_v1";
 
 pub const QUESTION_TEXT_MAX_CHARS: usize = 200;
@@ -52,6 +53,7 @@ pub struct PageRow {
     pub question_version: Option<i64>,
     pub question_text: Option<String>,
     pub title: String,
+    pub description: String,
     pub body_md: String,
     pub status: String,
     pub version: i64,
@@ -320,7 +322,16 @@ impl Store {
     /// published（旧版留 revisions）；同事务更新 FTS/grams。任一来源失效 →
     /// StaleInput 整批不发布（doc6/05 §4：不做部分发布）。
     pub fn publish_page(&mut self, req: &PublishRequest<'_>) -> Result<(String, i64), StoreError> {
-        self.publish_page_inner(req, false)
+        self.publish_page_inner(req, "", false)
+    }
+
+    /// Versioned topic-page publish with a searchable descriptive sentence.
+    pub fn publish_page_with_description(
+        &mut self,
+        req: &PublishRequest<'_>,
+        description: &str,
+    ) -> Result<(String, i64), StoreError> {
+        self.publish_page_inner(req, description, false)
     }
 
     /// DSH runner submit 重放专用：同一冻结输入、输出和来源集合已发布时
@@ -329,18 +340,30 @@ impl Store {
         &mut self,
         req: &PublishRequest<'_>,
     ) -> Result<(String, i64), StoreError> {
-        self.publish_page_inner(req, true)
+        self.publish_page_inner(req, "", true)
+    }
+
+    pub fn publish_page_with_description_idempotent(
+        &mut self,
+        req: &PublishRequest<'_>,
+        description: &str,
+    ) -> Result<(String, i64), StoreError> {
+        self.publish_page_inner(req, description, true)
     }
 
     fn publish_page_inner(
         &mut self,
         req: &PublishRequest<'_>,
+        description: &str,
         idempotent_replay: bool,
     ) -> Result<(String, i64), StoreError> {
         if req.title.is_empty() || req.title.chars().count() > PAGE_TITLE_MAX_CHARS {
             return Err(StoreError::InvalidPageField);
         }
         if req.body_md.is_empty() || req.body_md.chars().count() > PAGE_BODY_MAX_CHARS {
+            return Err(StoreError::InvalidPageField);
+        }
+        if description.chars().count() > 240 {
             return Err(StoreError::InvalidPageField);
         }
         if req.sources.is_empty() {
@@ -383,12 +406,13 @@ impl Store {
             let same_page: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM memory_pages
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'
-                   AND title=?4 AND body_md=?5 AND generator_version=?6 AND input_fingerprint=?7)",
+                   AND title=?4 AND description=?5 AND body_md=?6 AND generator_version=?7 AND input_fingerprint=?8)",
                 params![
                     req.scope.tenant_id,
                     req.scope.user_id,
                     id,
                     req.title,
+                    description,
                     req.body_md,
                     req.generator_version,
                     req.input_fingerprint
@@ -422,14 +446,14 @@ impl Store {
         }
         let (page_id, new_version, previous) = match &existing {
             Some((id, v)) => {
-                let prev: Option<(String, String, i64)> = tx
+                let prev: Option<(String, String, String, i64)> = tx
                     .query_row(
-                        "SELECT title, body_md, version FROM memory_pages WHERE id=?1",
+                        "SELECT title, description, body_md, version FROM memory_pages WHERE id=?1",
                         params![id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?;
-                (id.clone(), v + 1, prev.map(|(t, b, _)| (t, b)))
+                (id.clone(), v + 1, prev.map(|(t, d, b, _)| (t, d, b)))
             }
             None => (Uuid::now_v7().to_string(), 1, None),
         };
@@ -438,14 +462,15 @@ impl Store {
             // CAS 推进页面行并替换来源（doc6/05 §4：旧版留 revisions 供查证）。
             tx.execute(
                 "UPDATE memory_pages
-                 SET title=?4, body_md=?5, status='published', version=?6,
-                     generator_version=?7, input_fingerprint=?8, updated_at=?9
+                 SET title=?4, description=?5, body_md=?6, status='published', version=?7,
+                     generator_version=?8, input_fingerprint=?9, updated_at=?10
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![
                     req.scope.tenant_id,
                     req.scope.user_id,
                     page_id,
                     req.title,
+                    description,
                     req.body_md,
                     new_version,
                     req.generator_version,
@@ -460,10 +485,10 @@ impl Store {
         } else {
             tx.execute(
                 "INSERT INTO memory_pages
-                   (id, tenant_id, user_id, document_kind, document_key, question_version,
-                    question_text, title, body_md, status, version, generator_version,
+                    (id, tenant_id, user_id, document_kind, document_key, question_version,
+                    question_text, title, description, body_md, status, version, generator_version,
                     input_fingerprint, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'published', 1, ?10, ?11, ?12, ?12)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'published', 1, ?11, ?12, ?13, ?13)",
                 params![
                     page_id,
                     req.scope.tenant_id,
@@ -473,6 +498,7 @@ impl Store {
                     req.question_version,
                     req.question_text,
                     req.title,
+                    description,
                     req.body_md,
                     req.generator_version,
                     req.input_fingerprint,
@@ -508,8 +534,9 @@ impl Store {
             "INSERT INTO page_revisions
                (tenant_id, user_id, page_id, version, document_kind, document_key,
                 question_version, question_text, previous_title, new_title,
-                previous_body_md, new_body_md, source_ids_json, generator_version, actor_kind, changed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                previous_description, new_description, previous_body_md, new_body_md,
+                source_ids_json, generator_version, actor_kind, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 req.scope.tenant_id,
                 req.scope.user_id,
@@ -519,9 +546,11 @@ impl Store {
                 req.document_key,
                 req.question_version,
                 req.question_text,
-                previous.as_ref().map(|(t, _)| t.clone()),
+                previous.as_ref().map(|(t, _, _)| t.clone()),
                 req.title,
-                previous.as_ref().map(|(_, b)| b.clone()),
+                previous.as_ref().map(|(_, d, _)| d.clone()),
+                description,
+                previous.as_ref().map(|(_, _, b)| b.clone()),
                 req.body_md,
                 sources_json,
                 req.generator_version,
@@ -536,10 +565,10 @@ impl Store {
             params![req.scope.tenant_id, req.scope.user_id, page_id],
         )?;
         tx.execute(
-            "INSERT INTO page_fts (page_id, title, body_md) VALUES (?1, ?2, ?3)",
-            params![page_id, req.title, req.body_md],
+            "INSERT INTO page_fts (page_id, title, description, body_md) VALUES (?1, ?2, ?3, ?4)",
+            params![page_id, req.title, description, req.body_md],
         )?;
-        for g in cjk_bigrams(&format!("{} {}", req.title, req.body_md)) {
+        for g in cjk_bigrams(&format!("{} {} {}", req.title, description, req.body_md)) {
             tx.execute(
                 "INSERT OR IGNORE INTO page_grams (tenant_id, user_id, page_id, gram) VALUES (?1, ?2, ?3, ?4)",
                 params![req.scope.tenant_id, req.scope.user_id, page_id, g],
@@ -576,7 +605,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, document_kind, document_key, question_version, question_text,
-                        title, body_md, status, version, generator_version, input_fingerprint, updated_at
+                        title, description, body_md, status, version, generator_version, input_fingerprint, updated_at
                  FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, page_id],
                 |r| {
@@ -587,12 +616,13 @@ impl Store {
                         question_version: r.get(3)?,
                         question_text: r.get(4)?,
                         title: r.get(5)?,
-                        body_md: r.get(6)?,
-                        status: r.get(7)?,
-                        version: r.get(8)?,
-                        generator_version: r.get(9)?,
-                        input_fingerprint: r.get(10)?,
-                        updated_at: r.get(11)?,
+                        description: r.get(6)?,
+                        body_md: r.get(7)?,
+                        status: r.get(8)?,
+                        version: r.get(9)?,
+                        generator_version: r.get(10)?,
+                        input_fingerprint: r.get(11)?,
+                        updated_at: r.get(12)?,
                         sources: Vec::new(),
                     })
                 },
@@ -608,7 +638,10 @@ impl Store {
             "SELECT s.memory_id, s.memory_version, s.claim_sha256, m.status, m.version, m.claim_sha256,
                     m.valid_until,
                     EXISTS (SELECT 1 FROM memory_retirements r
-                            WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                            WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id),
+                    EXISTS (SELECT 1 FROM purge_jobs pj
+                            WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
+                              AND pj.status IN ('pending','running'))
              FROM page_sources s JOIN memories m
                ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id AND m.id=s.memory_id
              WHERE s.tenant_id=?1 AND s.user_id=?2 AND s.page_id=?3",
@@ -623,14 +656,16 @@ impl Store {
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, bool>(7)?,
+                r.get::<_, bool>(8)?,
             ))
         })?;
         for row in rows {
-            let (mid, ver, sha, status, cur_ver, cur_sha, valid_until, retired) = row?;
+            let (mid, ver, sha, status, cur_ver, cur_sha, valid_until, retired, purging) = row?;
             if status != "active"
                 || cur_ver != ver
                 || cur_sha != sha
                 || retired
+                || purging
                 || valid_until.as_deref().is_some_and(|until| until <= now)
             {
                 return Ok(None); // 来源失效 → 不可见（doc6/05 §4）
@@ -695,7 +730,7 @@ impl Store {
         let now = now_rfc3339()?;
         let mut stmt = self.conn().prepare(&format!(
             "SELECT id, document_kind, document_key, question_version, question_text,
-                    title, body_md, status, version, generator_version, input_fingerprint, updated_at
+                    title, description, body_md, status, version, generator_version, input_fingerprint, updated_at
              FROM memory_pages p WHERE tenant_id=?1 AND user_id=?2 AND {status_clause}
                AND EXISTS (SELECT 1 FROM page_sources ps
                  WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
@@ -718,12 +753,13 @@ impl Store {
                     question_version: r.get(3)?,
                     question_text: r.get(4)?,
                     title: r.get(5)?,
-                    body_md: r.get(6)?,
-                    status: r.get(7)?,
-                    version: r.get(8)?,
-                    generator_version: r.get(9)?,
-                    input_fingerprint: r.get(10)?,
-                    updated_at: r.get(11)?,
+                    description: r.get(6)?,
+                    body_md: r.get(7)?,
+                    status: r.get(8)?,
+                    version: r.get(9)?,
+                    generator_version: r.get(10)?,
+                    input_fingerprint: r.get(11)?,
+                    updated_at: r.get(12)?,
                     sources: Vec::new(),
                 })
             },
@@ -805,7 +841,10 @@ impl Store {
                      AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
                        OR (m.valid_until IS NOT NULL AND m.valid_until<=?{})
                        OR EXISTS (SELECT 1 FROM memory_retirements r
-                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                       OR EXISTS (SELECT 1 FROM purge_jobs pj
+                           WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
+                             AND pj.status IN ('pending','running'))))
              ORDER BY g.page_id LIMIT ?{}",
             grams.len() + 3,
             grams.len() + 4
@@ -838,7 +877,10 @@ impl Store {
                        AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
                          OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
                          OR EXISTS (SELECT 1 FROM memory_retirements r
-                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                         OR EXISTS (SELECT 1 FROM purge_jobs pj
+                           WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
+                             AND pj.status IN ('pending','running'))))",
                 params![scope.tenant_id, scope.user_id, page_id, now],
                 |r| r.get(0),
             )
@@ -928,7 +970,7 @@ impl Store {
         let mut inserted = 0usize;
         {
             let mut stmt = tx.prepare(
-                "SELECT p.id, p.tenant_id, p.user_id, p.title, p.body_md FROM memory_pages p
+                    "SELECT p.id, p.tenant_id, p.user_id, p.title, p.description, p.body_md FROM memory_pages p
                  WHERE p.status='published'
                    AND EXISTS (SELECT 1 FROM page_sources ps
                      WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
@@ -938,7 +980,10 @@ impl Store {
                        AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
                          OR (m.valid_until IS NOT NULL AND m.valid_until<=?1)
                          OR EXISTS (SELECT 1 FROM memory_retirements r
-                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
+                           WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                         OR EXISTS (SELECT 1 FROM purge_jobs pj
+                           WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
+                             AND pj.status IN ('pending','running'))))",
             )?;
             let rows = stmt.query_map(params![now], |r| {
                 Ok((
@@ -947,16 +992,17 @@ impl Store {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?;
-            let collected: Vec<(String, String, String, String, String)> =
+            let collected: Vec<(String, String, String, String, String, String)> =
                 rows.collect::<Result<Vec<_>, _>>()?;
-            for (id, tenant, user, title, body) in collected {
+            for (id, tenant, user, title, description, body) in collected {
                 tx.execute(
-                    "INSERT INTO page_fts (page_id, title, body_md) VALUES (?1, ?2, ?3)",
-                    params![id, title, body],
+                    "INSERT INTO page_fts (page_id, title, description, body_md) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, title, description, body],
                 )?;
-                for g in cjk_bigrams(&format!("{title} {body}")) {
+                for g in cjk_bigrams(&format!("{title} {description} {body}")) {
                     tx.execute(
                         "INSERT OR IGNORE INTO page_grams (tenant_id, user_id, page_id, gram)
                          VALUES (?1, ?2, ?3, ?4)",

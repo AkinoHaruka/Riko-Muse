@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{now_rfc3339, Store, StoreError};
 
 pub const ADJUDICATE_V1: &str = memory_contract::ADJUDICATION_VERSION_V1;
+pub const ADJUDICATE_V2: &str = memory_contract::ADJUDICATION_VERSION_V2;
 
 /// adjudicate_v1 system prompt（doc6/09 §5）。版本独立：修改必须新建版本常量。
 pub const ADJUDICATE_V1_PROMPT: &str = "你是记忆裁决器。给你若干候选记忆（含 candidate_id、kind、claim、逐字 quote）\
@@ -22,6 +23,13 @@ pub const ADJUDICATE_V1_PROMPT: &str = "你是记忆裁决器。给你若干候�
 只输出 JSON：{\"results\":[{\"candidate_id\":\"\",\"durability\":\"\",\"action\":\"\",\"reason_code\":\"\",\
 \"target_memory_id\":null,\"expected_target_version\":null,\"model_confidence\":0.0,\"valid_until\":null}]}，\
 reason_code/target_memory_id/expected_target_version/model_confidence/valid_until 可为 null。";
+
+/// D6-13 读取辅助版；输入仍由 Rust 冻结并校验，历史 adjudicate_v1 行继续分派 V1。
+pub const ADJUDICATE_V2_PROMPT: &str = "你是记忆裁决器。你会收到冻结候选和 Rust 召回的 target。\
+只使用输入中明确给出的 target ID/version；如果 semantic_search_complete=false，不得把候选判为 create，必须 defer。\
+如果读取信息不完整、工具失败或证据不足，动作必须为 defer，不能把失败解释成无匹配。\
+embedding/词法近邻只是候选，不代表相同事实；判断同一 claim、同一方面状态更新、不同主体/方面、冲突或互补。\
+动作与输出字段必须遵守 adjudicate_v1 schema，Rust 独立核验并原子提交。";
 
 /// 裁决作业行。
 #[derive(Debug, Clone)]
@@ -501,13 +509,13 @@ impl Store {
         complete_dream_generation: Option<i64>,
         proposals: &[AdjudicationProposal],
     ) -> Result<AdjudicationApplyOutcome, StoreError> {
-        let (status, gen, dream_job_id): (String, i64, String) = self
+        let (status, gen, dream_job_id, adjudication_version): (String, i64, String, String) = self
             .conn()
             .query_row(
-                "SELECT status, claim_generation, dream_job_id FROM adjudication_jobs
+                "SELECT status, claim_generation, dream_job_id, adjudication_version FROM adjudication_jobs
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, job_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
             .ok_or(StoreError::JobNotFound)?;
@@ -601,6 +609,26 @@ impl Store {
                 .iter()
                 .map(|candidate| candidate.candidate_id.as_str())
                 .collect();
+            if adjudication_version == ADJUDICATE_V2 {
+                for candidate_id in &expected {
+                    let searched: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM dream_read_search_receipts
+                         WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3 AND generation=?4
+                           AND operation='memory' AND candidate_id=?5 AND semantic_complete=1)",
+                        params![
+                            scope.tenant_id,
+                            scope.user_id,
+                            dream_job_id,
+                            dream_generation,
+                            candidate_id
+                        ],
+                        |r| r.get(0),
+                    )?;
+                    if !searched {
+                        return Err(StoreError::DreamSearchIncomplete);
+                    }
+                }
+            }
             let mut actual = std::collections::HashSet::new();
             if proposals.len() != expected.len()
                 || proposals.iter().any(|proposal| {
@@ -800,6 +828,7 @@ impl Store {
                                  VALUES (?1,?2,?3,1,NULL,?4,NULL,'active','system',?5,'dream_adjudicate',?6)",
                                 params![scope.tenant_id, scope.user_id, mid, claim, p.candidate_id, now],
                             )?;
+                            Store::reindex_memory_in_tx(&tx, scope, &mid, &claim, true)?;
                             Self::commit_candidate_tx(&tx, scope, &p.candidate_id)?;
                             record("applied", &Some(mid), "created", &mut outcome)?;
                         }
@@ -890,7 +919,7 @@ impl Store {
                             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .optional()?;
-                    let Some((cur_v, _old_claim, _cur_kind)) = cur else {
+                    let Some((cur_v, old_claim, _cur_kind)) = cur else {
                         record("rejected", &None, "target_not_active", &mut outcome)?;
                         continue;
                     };
@@ -906,6 +935,8 @@ impl Store {
                          WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND version=?5",
                         params![scope.tenant_id, scope.user_id, target, now, expected_v],
                     )?;
+                    Store::reindex_memory_in_tx(&tx, scope, &target, &old_claim, false)?;
+                    crate::Store::stale_vectors_in_tx(&tx, scope, "memory", &target)?;
                     l1_audits.push((target.clone(), expected_v + 1));
                     l2_deletes.extend(crate::pages::stale_pages_for_memory_tx(
                         &tx, scope, &target, &now,
@@ -938,6 +969,7 @@ impl Store {
                          VALUES (?1,?2,?3,1,NULL,?4,NULL,'active','system',?5,'dream_adjudicate',?6)",
                         params![scope.tenant_id, scope.user_id, new_id, claim, p.candidate_id, now],
                     )?;
+                    Store::reindex_memory_in_tx(&tx, scope, &new_id, &claim, true)?;
                     tx.execute(
                         "INSERT INTO memory_relations (tenant_id, user_id, from_memory_id, to_memory_id, kind, created_at)
                          VALUES (?1,?2,?3,?4,'supersedes',?5)",
@@ -972,6 +1004,77 @@ impl Store {
                 }
                 _ => {
                     record("rejected", &None, "unknown_action", &mut outcome)?;
+                }
+            }
+        }
+        // Persist semantic index work in the same transaction as L1 creation,
+        // update, or evidence attachment. A process crash after adjudication
+        // must not leave an applied memory without its durable index job.
+        let semantic_model_id: Option<String> = tx.query_row(
+            "SELECT embedding_model_id FROM adjudication_jobs
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            params![scope.tenant_id, scope.user_id, job_id],
+            |row| row.get(0),
+        )?;
+        if let Some(model_id) = semantic_model_id {
+            let mut indexed = std::collections::HashSet::new();
+            for (_, application_status, memory_id, _) in &outcome.rows {
+                let Some(memory_id) = memory_id else {
+                    continue;
+                };
+                if application_status != "applied" || !indexed.insert(memory_id.as_str()) {
+                    continue;
+                }
+                let fingerprint: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT m.version,m.claim_sha256 FROM memories m
+                         WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3 AND m.status='active'
+                           AND (m.valid_until IS NULL OR m.valid_until>?4)
+                           AND NOT EXISTS (SELECT 1 FROM memory_retirements r
+                             WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                           AND NOT EXISTS (SELECT 1 FROM purge_jobs p
+                             WHERE p.tenant_id=m.tenant_id AND p.user_id=m.user_id AND p.target_id=m.id
+                               AND p.status IN ('pending','running'))",
+                        params![scope.tenant_id, scope.user_id, memory_id, now],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((version, content_sha256)) = fingerprint else {
+                    continue;
+                };
+                let semantic_job_id = Uuid::now_v7().to_string();
+                let inserted = tx.execute(
+                    "INSERT INTO semantic_jobs
+                       (id,tenant_id,user_id,object_kind,object_id,source_version,content_sha256,
+                        model_id,status,attempts,run_after,claim_generation,created_at,updated_at)
+                     VALUES (?1,?2,?3,'memory',?4,?5,?6,?7,'queued',0,?8,0,?8,?8)
+                     ON CONFLICT DO NOTHING",
+                    params![
+                        semantic_job_id,
+                        scope.tenant_id,
+                        scope.user_id,
+                        memory_id,
+                        version,
+                        content_sha256,
+                        model_id,
+                        now
+                    ],
+                )?;
+                if inserted == 0 {
+                    tx.execute(
+                        "UPDATE semantic_jobs SET source_version=?6,content_sha256=?7,updated_at=?8
+                         WHERE tenant_id=?1 AND user_id=?2 AND object_kind='memory' AND object_id=?3
+                           AND model_id=?4 AND status IN ('queued','retryable_failed','provider_wait')",
+                        params![
+                            scope.tenant_id,
+                            scope.user_id,
+                            memory_id,
+                            model_id,
+                            version,
+                            content_sha256,
+                            now
+                        ],
+                    )?;
                 }
             }
         }

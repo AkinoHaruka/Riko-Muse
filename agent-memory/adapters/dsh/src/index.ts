@@ -11,6 +11,8 @@ import { readFileSync } from "node:fs";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Session, SessionEvent, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
 import { DreamRunner } from "./dream-runner.js";
+import { currentDreamChildBinding } from "./dream-scope.js";
+import { buildDreamReadTools } from "./dream-tools.js";
 import type { PreStepPayload } from "./recall.js";
 import { makeBundleHook, makePreStepHook, makeSoulAssembleHook } from "./recall.js";
 import { MemoryClient } from "./client.js";
@@ -72,7 +74,6 @@ class AgentMemoryPlugin {
       writeTimeoutMs: this.cfg.writeTimeoutMs,
       composeTimeoutMs: this.cfg.composeTimeoutMs,
       soulTimeoutMs: this.cfg.soulTimeoutMs,
-      bundleTimeoutMs: this.cfg.bundleTimeoutMs,
     });
     this.spool = new Spool(this.cfg.spoolDir, this.cfg.spoolLimitBytes);
     this.pipeline = new EventPipeline(
@@ -126,6 +127,27 @@ class AgentMemoryPlugin {
         return hook(payload, next);
       }) as never);
     }
+
+    // AsyncLocalStorage tags only the exact child created by DreamRunner.
+    // Install read-only tools in that child agent scope before its first prompt;
+    // ordinary tools remain filtered by SubagentStartRequest.toolFilter.
+    (this.ctx as { on: (name: string, cb: unknown) => unknown }).on(
+      "agent/created",
+      async (payload: { agent: { id: string; session?: { header?: { origin?: string; parentSession?: unknown } }; ctx: unknown } }) => {
+        const binding = currentDreamChildBinding();
+        const child = payload.agent;
+        if (!binding || String(child.session?.header?.origin) !== "subagent"
+          || child.session?.header?.parentSession === undefined
+          || binding.parentAgentId === String(child.id)) return;
+        const scoped = child.ctx as { tools?: { register(definition: unknown): () => void } };
+        if (!scoped.tools || typeof scoped.tools.register !== "function") {
+          throw new Error("agent-memory: DSH Dream child 没有 scoped tools.register；拒绝以全局工具替代");
+        }
+        for (const tool of buildDreamReadTools(this.client, binding, String(child.id))) {
+          scoped.tools.register(tool);
+        }
+      },
+    );
 
     if (this.cfg.toolsEnabled) {
       const tools = buildMemoryTools({
@@ -194,7 +216,7 @@ class AgentMemoryPlugin {
 
   /** 注册 agent/pre-step：bundle 的 resident/retrieved 前插（doc6/06 §3）。 */
   private registerBundlePreStep(): void {
-    const hook = makeBundleHook(this.client, this.logger, this.cfg.bundleTimeoutMs, this.cfg.agentName);
+    const hook = makeBundleHook(this.client, this.logger, this.cfg.agentName);
     this.ctx.on("agent/pre-step" as never, (async (payload: PreStepPayload, next: () => Promise<never>) => {
       return hook(payload, next);
     }) as never);

@@ -10,7 +10,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// prompt_version/admission_version 分别选提示词与准入规则。0005 起新增表
 /// （doc6/02）：0005 soul/resident/audit/receipts；0006 派生知识文档、问题目录、
 /// 整理作业与页面索引；历史迁移 0001—0004 冻结不改。
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
@@ -33,6 +33,7 @@ pub const ADMISSION_VERSION_V2: &str = "admit_v2";
 /// D6-8（doc6/09 §3）：新 Dream 作业专用准入/裁决版本；admit_v1/v2 冻结不改。
 pub const ADMISSION_VERSION_V3: &str = "admit_v3";
 pub const ADJUDICATION_VERSION_V1: &str = "adjudicate_v1";
+pub const ADJUDICATION_VERSION_V2: &str = "adjudicate_v2";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----
 /// 自动上下文默认最多 5 条原子记忆。
@@ -74,8 +75,6 @@ pub const RRF_K: f64 = 60.0;
 // ---- D6-8 语义支路与裁决（doc6/04 §2、doc6/09）----
 /// 查询向量支路单 scope 就绪向量扫描上限；超过报 limit_exceeded 只做词法。
 pub const SEMANTIC_SCAN_LIMIT: usize = 10000;
-/// 实时 query embedding 超时（doc6/04 §2）。
-pub const QUERY_EMBEDDING_TIMEOUT_MS: u64 = 800;
 /// 裁决候选召回的混合 top-K（doc6/09 §4.2 初值）。
 pub const ADJUDICATE_RECALL_TOP_K: usize = 20;
 /// 旧 Held candidate 进入新裁决的最低新证据 claim cosine 相关度。
@@ -184,3 +183,5 @@ pub struct VersionResponse {
 /// 已交付能力（doc6/06 §1）：D6-1/D6-2 soul 存储与接口；D6-3 resident/bundle。
 pub const CAPABILITY_SOUL_V1: &str = "soul_v1";
 pub const CAPABILITY_CONTEXT_BUNDLE_V1: &str = "context_bundle_v1";
+/// Job-scoped read tools for the isolated DSH Dream child (D6-12).
+pub const CAPABILITY_DREAM_SCOPED_READ_V1: &str = "dream_scoped_read_v1";

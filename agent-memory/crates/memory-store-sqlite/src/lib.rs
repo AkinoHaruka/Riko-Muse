@@ -75,6 +75,10 @@ pub enum StoreError {
     InvalidQuestionText,
     #[error("页面字段不合法（title 1—80、正文 1—1200、来源非空）")]
     InvalidPageField,
+    #[error("Dream 子 Agent 已达到本 job 的只读调用预算")]
+    DreamReadBudgetExceeded,
+    #[error("Dream adjudication 未完成每个候选的语义搜索")]
+    DreamSearchIncomplete,
     #[error("问题不存在或不属于当前 scope")]
     QuestionNotFound,
     #[error("页面不存在或不属于当前 scope")]
@@ -99,6 +103,7 @@ mod d68_tests;
 mod d69_tests;
 pub mod diagnostics;
 pub mod dream_jobs;
+pub mod dream_read;
 pub mod evidence;
 pub mod jobs;
 pub mod lifecycle;

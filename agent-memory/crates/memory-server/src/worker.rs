@@ -111,9 +111,9 @@ mod tests {
         let (store, scope) = setup("promote");
         let state = AppState {
             store: store.clone(),
-            dream_enabled: false,
             embedding: None,
             rerank: None,
+            semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
         };
         {
@@ -216,9 +216,9 @@ mod tests {
         let (store, scope) = setup("badjson");
         let state = AppState {
             store: store.clone(),
-            dream_enabled: false,
             embedding: None,
             rerank: None,
+            semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
         };
         let ev = {
@@ -674,9 +674,9 @@ mod tests {
         let (store, scope) = setup("dispatch");
         let state = AppState {
             store: store.clone(),
-            dream_enabled: false,
             embedding: None,
             rerank: None,
+            semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
         };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
@@ -850,9 +850,9 @@ mod tests {
         let (store, scope) = setup("admver");
         let state = AppState {
             store: store.clone(),
-            dream_enabled: false,
             embedding: None,
             rerank: None,
+            semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
         };
         for session in ["s_old", "s_new"] {
@@ -1077,7 +1077,7 @@ impl ExtractModel for OpenAiCompatibleClient {
             return Err(ExtractError::Timeout);
         }
         if !status.is_success() {
-            return Err(ExtractError::Transport(format!("模型端点返回 {status}")));
+            return Err(ExtractError::HttpStatus(status.as_u16()));
         }
         // 有界读取正文（流式累积，超限即失败，不静默截断）。
         use futures_util::StreamExt;
@@ -1423,6 +1423,7 @@ async fn process_job_inner<M: ExtractModel>(
                 ExtractError::Timeout => "MODEL_TIMEOUT",
                 ExtractError::BadJson => "BAD_JSON",
                 ExtractError::Transport(_) => "MODEL_UNAVAILABLE",
+                ExtractError::HttpStatus(_) => "MODEL_HTTP_ERROR",
             };
             match guard.fail_job(&job.id, job.claim_generation, attempts, code) {
                 Ok(FailOutcome::Retryable { .. }) => {}

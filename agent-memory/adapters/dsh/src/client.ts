@@ -1,6 +1,7 @@
 /**
  * Rust 内核 HTTP 客户端（doc/12 协议 v1）。
- * 令牌只在内存中持有；compose/write 超时来自插件配置；日志不输出令牌与正文。
+ * 令牌只在内存中持有；compose/write/Soul 超时来自插件配置，bundle 跟随调用方取消且无固定延迟预算；
+ * 日志不输出令牌与正文。
  * 错误分类（doc2/03 §3）：unauthorized(401) / permanent(400,409) / offline(网络、超时、429、5xx)。
  */
 
@@ -12,7 +13,6 @@ export interface ClientConfig {
   writeTimeoutMs: number;
   composeTimeoutMs: number;
   soulTimeoutMs: number;
-  bundleTimeoutMs: number;
 }
 
 export interface ApiResult {
@@ -32,9 +32,12 @@ function classify(status: number): FailureClass {
 export class MemoryClient {
   constructor(private readonly cfg: ClientConfig) {}
 
-  private async post(path: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<ApiResult> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  private async post(path: string, body: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<ApiResult> {
+    const ctrl = timeoutMs === undefined ? undefined : new AbortController();
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : undefined;
+    const requestSignal = signal && ctrl
+      ? AbortSignal.any([signal, ctrl.signal])
+      : signal ?? ctrl?.signal;
     try {
       const res = await fetch(`${this.cfg.baseUrl}${path}`, {
         method: "POST",
@@ -43,14 +46,14 @@ export class MemoryClient {
           authorization: `Bearer ${this.cfg.token}`,
         },
         body: JSON.stringify(body),
-        signal: signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal,
+        signal: requestSignal,
       });
       const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
       return { status: res.status, body: json, requestId: json.request_id as string | undefined, failure: classify(res.status) };
     } catch {
       return { status: 0, body: undefined, failure: "offline" };
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -116,6 +119,10 @@ export class MemoryClient {
     return this.post("/v1/dream/runner/failure", request, this.cfg.writeTimeoutMs, signal);
   }
 
+  dreamRead(jobId: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
+    return this.post(`/v1/dream/jobs/${encodeURIComponent(jobId)}/read`, request, this.cfg.writeTimeoutMs, signal);
+  }
+
   compose(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
     return this.post("/v1/context/compose", request, this.cfg.composeTimeoutMs, signal);
   }
@@ -127,7 +134,8 @@ export class MemoryClient {
 
   /** POST /v1/context/bundle（doc6/06 §2）：resident + retrieved 分段与诊断。 */
   contextBundle(request: Record<string, unknown>, signal?: AbortSignal): Promise<ApiResult> {
-    return this.post("/v1/context/bundle", request, this.cfg.bundleTimeoutMs, signal);
+    // Query embedding 已受 memoryd 的 provider timeout 保护；这里不另设 bundle 延迟预算。
+    return this.post("/v1/context/bundle", request, undefined, signal);
   }
 
   search(request: Record<string, unknown>): Promise<ApiResult> {

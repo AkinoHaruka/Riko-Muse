@@ -18,7 +18,7 @@ import type { UserMessage } from "@deepseek-ai/dsh-llm";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { PreStepDecision } from "@deepseek-ai/dsh-agent";
 import type { MemoryClient } from "./client.js";
-import type { Logger } from "./events.js";
+import { isSubagentSessionHeader, type Logger } from "./events.js";
 
 declare module "@deepseek-ai/dsh-llm" {
   interface MessageSourceMap {
@@ -67,6 +67,7 @@ function alreadyInjected(decision: PreStepDecision): boolean {
 export function makePreStepHook(client: MemoryClient, logger: Logger, composeTimeoutMs: number) {
   return async function preStep(payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision> {
     const decision = await next();
+    if (isSubagentSessionHeader(payload.agent.session.header)) return decision;
     if (decision.kind !== "enter" || payload.signal.aborted) return decision;
     if (alreadyInjected(decision)) return decision;
     const query = latestOriginalUserText(payload.messages);
@@ -121,21 +122,27 @@ function wrapData(kind: string, text: string): string {
  * 取消；超时/离线/取消不注入、不缓存旧正文（删除/改版下一步生效）；空正文
  * 不产生空 section。
  */
+/** 部署级稳定 agent ID（doc6/03 §1）；空则回退会话 ID（人格按会话隔离）。 */
 export function makeSoulAssembleHook(
   client: MemoryClient,
   logger: Logger,
   soulTimeoutMs: number,
   disabled: () => boolean,
-  /** 部署级稳定 agent ID（doc6/03 §1）；空则回退会话 ID（人格按会话隔离）。 */
   agentName: string,
 ) {
   return async function soulAssemble(
     assembly: { sections: Array<Record<string, unknown>> },
-    context: { agent?: { id?: unknown }; signal?: AbortSignal },
+    context: {
+      agent?: { id?: unknown; session?: { header?: { origin?: unknown; parentSession?: unknown } } };
+      signal?: AbortSignal;
+    },
     next: () => Promise<{ sections: Array<Record<string, unknown>> }>,
   ): Promise<{ sections: Array<Record<string, unknown>> }> {
     void assembly;
     const result = await next();
+    // DSH assembles system prompt before pre-step. Exclude child sessions here,
+    // before the first request, so a Dream child never receives user Soul.
+    if (isSubagentSessionHeader(context.agent?.session?.header)) return result;
     if (disabled()) return result;
     if (result.sections.some((s) => s.name === SOUL_SECTION_NAME)) return result;
     const fallback = context.agent?.id === undefined ? "" : String(context.agent.id);
@@ -167,13 +174,12 @@ export function makeSoulAssembleHook(
 /**
  * D6 v6：`agent/pre-step` bundle 前插 hook（doc6/06 §3）。
  * 空 query 仍取 resident；resident/retrieved 非空正文各成一条独立、有来源的
- * user-role 消息前插在原始用户正文之前；超时/离线跳过注入；同 decision 去重。
+ * user-role 消息前插在原始用户正文之前；离线跳过注入，跟随 DSH signal 取消；同 decision 去重。
  */
+/** 部署级稳定 agent ID（doc6/03 §1）；空则回退会话 ID。 */
 export function makeBundleHook(
   client: MemoryClient,
   logger: Logger,
-  bundleTimeoutMs: number,
-  /** 部署级稳定 agent ID（doc6/03 §1）；空则回退会话 ID。 */
   agentName: string,
 ) {
   return async function bundlePreStep(
@@ -181,53 +187,45 @@ export function makeBundleHook(
     next: () => Promise<PreStepDecision>,
   ): Promise<PreStepDecision> {
     const decision = await next();
+    if (isSubagentSessionHeader(payload.agent.session.header)) return decision;
     if (decision.kind !== "enter" || payload.signal.aborted) return decision;
     if (alreadyInjected(decision)) return decision;
     const query = latestOriginalUserText(payload.messages);
     const agentId = agentName || String(payload.agent.id);
     try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), bundleTimeoutMs);
-      const onParentAbort = () => ctrl.abort();
-      payload.signal.addEventListener("abort", onParentAbort, { once: true });
-      try {
-        const r = await client.contextBundle(
-          {
-            agent_id: agentId,
-            query,
-            // 预算用服务端默认（24/3000/8/2400，doc6/01 §4）；需要收窄再由配置加。
-          },
-          ctrl.signal,
-        );
-        if (r.failure !== "ok" || r.status !== 200) {
-          logger.warn(`bundle 跳过注入 status=${r.status} request_id=${r.requestId ?? "?"}`);
-          return decision;
-        }
-        const body = (r.body ?? {}) as { resident?: { text?: string }; retrieved?: { text?: string } };
-        const messages: UserMessage[] = [];
-        if (body.resident?.text) {
-          messages.push(
-            createUserMessage({
-              content: [{ type: "text", text: wrapData("resident", body.resident.text) }],
-              source: { kind: PLUGIN_KIND, form: "resident" },
-            }),
-          );
-        }
-        if (body.retrieved?.text) {
-          messages.push(
-            createUserMessage({
-              content: [{ type: "text", text: wrapData("retrieved", body.retrieved.text) }],
-              source: { kind: PLUGIN_KIND, form: "retrieved" },
-            }),
-          );
-        }
-        if (messages.length === 0) return decision; // 空结果不加占位（doc6/11 §5）
-        // 前插：记忆上下文在原始用户正文之前（doc6/11 §2）；原消息对象不改写。
-        return { ...decision, messages: [...messages, ...decision.messages] };
-      } finally {
-        clearTimeout(timer);
-        payload.signal.removeEventListener("abort", onParentAbort);
+      const r = await client.contextBundle(
+        {
+          agent_id: agentId,
+          query,
+          // 预算用服务端默认（24/3000/8/2400，doc6/01 §4）；需要收窄再由配置加。
+        },
+        payload.signal,
+      );
+      if (r.failure !== "ok" || r.status !== 200) {
+        logger.warn(`bundle 跳过注入 status=${r.status} request_id=${r.requestId ?? "?"}`);
+        return decision;
       }
+      const body = (r.body ?? {}) as { resident?: { text?: string }; retrieved?: { text?: string } };
+      const messages: UserMessage[] = [];
+      if (body.resident?.text) {
+        messages.push(
+          createUserMessage({
+            content: [{ type: "text", text: wrapData("resident", body.resident.text) }],
+            source: { kind: PLUGIN_KIND, form: "resident" },
+          }),
+        );
+      }
+      if (body.retrieved?.text) {
+        messages.push(
+          createUserMessage({
+            content: [{ type: "text", text: wrapData("retrieved", body.retrieved.text) }],
+            source: { kind: PLUGIN_KIND, form: "retrieved" },
+          }),
+        );
+      }
+      if (messages.length === 0) return decision; // 空结果不加占位（doc6/11 §5）
+      // 前插：记忆上下文在原始用户正文之前（doc6/11 §2）；原消息对象不改写。
+      return { ...decision, messages: [...messages, ...decision.messages] };
     } catch (error) {
       logger.warn(`bundle 跳过注入: ${error instanceof Error ? error.message : String(error)}`);
       return decision;

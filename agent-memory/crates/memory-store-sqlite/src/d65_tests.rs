@@ -185,6 +185,107 @@ fn publish_page_and_read_path_source_validation() {
 }
 
 #[test]
+fn topic_page_description_is_persisted_indexed_and_part_of_v2_vector_fingerprint() {
+    // D6-14：description 参与主题页检索、索引重建和 v2 embedding 输入指纹。
+    let (mut store, scope, origin) = setup("description");
+    let memory_id = remember_one(
+        &mut store,
+        &scope,
+        &origin,
+        1,
+        "我在QuartzBay负责Rust服务端",
+        MemoryKind::Fact,
+    );
+    let request = pages::PublishRequest {
+        scope: &scope,
+        document_kind: "topic_page",
+        document_key: "work-profile",
+        question_version: None,
+        question_text: None,
+        title: "工作经历",
+        body_md: "负责服务端开发。",
+        generator_version: pages::GENERATE_CONSOLIDATE_V2,
+        input_fingerprint: "description-fingerprint-v1",
+        sources: &[source_of(&store, &scope, &memory_id)],
+        actor_kind: "system",
+    };
+    let (page_id, version) = store
+        .publish_page_with_description(&request, "QuartzBay Rust 服务端工作经历")
+        .unwrap();
+    let page = store
+        .get_page(&scope, &page_id, &crate::now_rfc3339_pub().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.description, "QuartzBay Rust 服务端工作经历");
+    assert!(store
+        .page_fts_search(&scope, "quartzbay", 10)
+        .unwrap()
+        .contains(&page_id));
+
+    let (fingerprint_version, fingerprint) = store
+        .semantic_object_fingerprint(&scope, "page", &page_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fingerprint_version, version);
+    let embedding_text = crate::semantic_index::semantic_index_page_text(
+        &page.title,
+        &page.description,
+        &page.body_md,
+    );
+    assert_eq!(
+        fingerprint,
+        crate::semantic_index::content_sha256_hex(&embedding_text)
+    );
+
+    store
+        .conn_mut()
+        .execute(
+            "DELETE FROM page_fts WHERE page_id=?1",
+            rusqlite::params![page_id],
+        )
+        .unwrap();
+    store.rebuild_page_index().unwrap();
+    assert!(store
+        .page_fts_search(&scope, "quartzbay", 10)
+        .unwrap()
+        .contains(&page_id));
+}
+
+#[test]
+fn page_with_purge_pending_source_is_hidden_from_search_reads_and_vector_indexing() {
+    let (mut store, scope, origin) = setup("purge-pending-page");
+    let page_id = publish_two_source_page(&mut store, &scope, &origin, "purge-pending", 401);
+    let memory_id: String = store
+        .conn()
+        .query_row(
+            "SELECT memory_id FROM page_sources WHERE tenant_id=?1 AND user_id=?2 AND page_id=?3 LIMIT 1",
+            rusqlite::params![scope.tenant_id, scope.user_id, page_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO purge_jobs
+               (id,tenant_id,user_id,operation,target_id,status,created_at,updated_at)
+             VALUES ('pending-purge','t','u','purge_memory',?1,'pending',?2,?2)",
+            rusqlite::params![memory_id, now],
+        )
+        .unwrap();
+
+    assert!(store.get_page(&scope, &page_id, &now).unwrap().is_none());
+    assert!(!store
+        .page_fts_search(&scope, "摘要", 10)
+        .unwrap()
+        .contains(&page_id));
+    assert!(store
+        .semantic_object_fingerprint(&scope, "page", &page_id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn source_invalidation_on_forget_and_correct() {
     // doc6/05 §4/§5：forget/correct 后引用页立即 stale 且不可见。
     let (mut store, scope, origin) = setup("invalidate");

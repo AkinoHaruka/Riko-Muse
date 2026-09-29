@@ -71,7 +71,7 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(applied, 11);
+    assert_eq!(applied, 13);
     assert_eq!(
         store
             .dream_live_runner_count("9999-01-01T00:00:00Z")
@@ -1476,4 +1476,122 @@ fn retention_does_not_purge_expired_memory_used_by_recoverable_dream_job() {
         residual_evidence, 0,
         "terminal Dream 的冻结输入随 purge 闭包删除"
     );
+}
+
+#[test]
+fn adjudication_commit_atomically_enqueues_semantic_index_job() {
+    let (mut store, scope, origin) = setup("adjudication-semantic-enqueue");
+    let text = "我周末喜欢去天文馆观星";
+    let evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            text,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let dream = store
+        .dream_trigger(
+            &scope,
+            "manual",
+            "semantic-enqueue",
+            Some("a"),
+            Some("dsh"),
+            Some("s"),
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .dream_runner_heartbeat(&scope, "runner", "dsh", "a", "[\"chat\"]", 120)
+        .unwrap();
+    let running = store
+        .dream_runner_claim(&scope, "runner", &crate::now_rfc3339_pub().unwrap(), 120)
+        .unwrap()
+        .unwrap();
+    let (start_byte, end_byte) = crate::dream_jobs::locate_quote_span(text, text).unwrap();
+    store
+        .dream_submit_candidates(
+            &scope,
+            &dream.id,
+            running.dream_job.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[crate::dream_jobs::DreamProposal {
+                kind: "preference".into(),
+                claim: text.into(),
+                quote: text.into(),
+                evidence_id: evidence,
+                start_byte,
+                end_byte,
+                status: "candidate".into(),
+                reason_code: None,
+                occurred_at: None,
+            }],
+        )
+        .unwrap();
+    let (candidate, spans) = store
+        .dream_accepted_candidates(&scope, &dream.id)
+        .unwrap()
+        .remove(0);
+    let candidate_input = crate::adjudication::AdjudicationCandidate {
+        candidate_id: candidate.candidate_id.clone(),
+        kind: candidate.kind,
+        claim: candidate.claim,
+        quote: candidate.quote,
+        status: "candidate".into(),
+        evidence_id: spans[0].0.clone(),
+        start_byte: spans[0].1,
+        end_byte: spans[0].2,
+    };
+    store
+        .adjudication_create(
+            &scope,
+            &dream.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("gemini-embedding-001"),
+            &[candidate_input],
+            &[],
+        )
+        .unwrap();
+    let adjudication_running = store
+        .dream_runner_claim(&scope, "runner", &crate::now_rfc3339_pub().unwrap(), 120)
+        .unwrap()
+        .unwrap();
+    let adjudication = adjudication_running.adjudication_job.unwrap();
+    let applied = store
+        .adjudication_apply_and_complete(
+            &scope,
+            &adjudication.id,
+            adjudication.claim_generation,
+            adjudication_running.dream_job.claim_generation,
+            &[crate::adjudication::AdjudicationProposal {
+                candidate_id: candidate.candidate_id,
+                durability: "durable".into(),
+                action: "create".into(),
+                reason_code: Some("new_durable_preference".into()),
+                target_memory_id: None,
+                expected_target_version: None,
+                model_confidence: Some(0.9),
+                valid_until: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(applied.applied, 1);
+    let memory_id = applied.rows[0].2.as_ref().unwrap();
+    let queued: (String, String, i64) = store
+        .conn()
+        .query_row(
+            "SELECT status,model_id,source_version FROM semantic_jobs
+             WHERE tenant_id=?1 AND user_id=?2 AND object_kind='memory' AND object_id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, memory_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(queued, ("queued".into(), "gemini-embedding-001".into(), 1));
 }

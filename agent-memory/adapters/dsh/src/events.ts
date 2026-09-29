@@ -47,13 +47,18 @@ export interface GapChecker {
   readEvent(sessionId: string, seq: number): Promise<unknown>;
 }
 
-/** L0 只接收顶层宿主会话；子 Agent 与 fork 会话不是用户原始证据。 */
+/** Child sessions are isolated from the user's ordinary memory context as well as L0 capture. */
+export function isSubagentSessionHeader(
+  header: { origin?: unknown; parentSession?: unknown } | undefined,
+): boolean {
+  return header?.origin === "subagent" || header?.parentSession !== undefined;
+}
+
+/** L0 only accepts top-level host sessions; child/fork sessions are not user evidence. */
 export function isCapturableSessionHeader(
   header: { origin?: unknown; parentSession?: unknown } | undefined,
 ): boolean {
-  return header !== undefined
-    && header.origin !== "subagent"
-    && header.parentSession === undefined;
+  return header !== undefined && !isSubagentSessionHeader(header);
 }
 
 const QUEUE_MAX_ENTRIES = 1024;

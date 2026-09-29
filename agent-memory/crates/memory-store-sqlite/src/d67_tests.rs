@@ -1,7 +1,7 @@
 //! D6-7 固定响应验收测试（doc6/08 卡内要求：以固定模型 response 验证
 //! trigger/job/input/receipt 原子链路；不判断语义质量，真实模型不在本卡）。
 
-use crate::dream_jobs::{locate_quote_span, DREAM_EXTRACT_V1};
+use crate::dream_jobs::{locate_quote_span, DREAM_EXTRACT_V2};
 use crate::{Store, StoreError};
 use memory_domain::{MemoryKind, Origin, ScopeKey};
 
@@ -61,7 +61,7 @@ fn dream_trigger_snapshot_idempotent_and_freezes_inputs() {
         .dream_trigger(&scope, "manual", "k1", Some("agent-a"), None, None)
         .unwrap()
         .unwrap();
-    assert_eq!(job.extract_version, DREAM_EXTRACT_V1);
+    assert_eq!(job.extract_version, DREAM_EXTRACT_V2);
     assert_eq!(job.status, "queued");
     // 同 key 重放：返回原 job（幂等 coalesce）。
     let replay = store

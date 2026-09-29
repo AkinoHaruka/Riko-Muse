@@ -568,7 +568,7 @@ struct Config {
     listen_addr: String,
     db_path: PathBuf,
     migrations_dir: PathBuf,
-    /// Auto Dream 默认启用；关停只取消自动触发与领取，不删除已持久作业。
+    /// Auto Dream 定时调度默认启用；关闭只停止自动触发，不禁用显式任务的 runner。
     #[serde(default)]
     dream: DreamConfig,
     /// OpenAI 兼容提取端点（http://host:port/path）。未配置则不启动提取 worker。
@@ -592,8 +592,10 @@ struct Config {
     embedding_key_file: Option<PathBuf>,
     /// 预期向量维度（配置给出；响应维度不符即失败）。
     embedding_dimensions: Option<usize>,
-    /// embeddings 请求超时秒数（默认 30；实时 query embedding 另受 800ms 总预算约束）。
+    /// embeddings provider 请求超时秒数（默认 30；查询路径不另设延迟预算）。
     embedding_timeout_secs: Option<u64>,
+    /// 在线 query 向量召回的余弦相似度下限（含边界；默认 0.3）。
+    semantic_min_similarity: Option<f32>,
     /// 专用 rerank endpoint（Jina/Cohere 兼容形状）；不配 reranker 时保留 RRF 顺序。
     rerank_endpoint: Option<String>,
     rerank_model: Option<String>,
@@ -634,17 +636,25 @@ impl Config {
                 self.listen_addr
             ));
         }
+        if let Some(floor) = self.semantic_min_similarity {
+            if !floor.is_finite() || !(0.0..=1.0).contains(&floor) {
+                return Err("semantic_min_similarity 必须是 0 到 1 之间的有限数值".into());
+            }
+        }
         Ok(self.clone())
     }
 }
 
+const DEFAULT_SEMANTIC_MIN_SIMILARITY: f32 = 0.3;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
-    dream_enabled: bool,
     /// D6-8：embedding/reranker 客户端（未配置为 None，语义支路降级）。
     embedding: Option<Arc<embedding::EmbeddingClient>>,
     rerank: Option<Arc<embedding::RerankClient>>,
+    /// Query-time semantic candidate floor; Dream scans intentionally do not use it.
+    semantic_min_similarity: f32,
     /// recency 模式（doc6/04 §3.1：linear|exponential|none，默认 linear）。
     recency_mode: &'static str,
 }
@@ -728,9 +738,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let state = AppState {
                 store: Arc::new(Mutex::new(store)),
-                dream_enabled: cfg.dream.enabled,
                 embedding: embedding_client.clone(),
                 rerank: rerank_client.clone(),
+                semantic_min_similarity: cfg
+                    .semantic_min_similarity
+                    .unwrap_or(DEFAULT_SEMANTIC_MIN_SIMILARITY),
                 recency_mode: match cfg.recency_mode.as_deref() {
                     Some("none") => "none",
                     Some("exponential") => "exponential",
@@ -892,6 +904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/v1/dream/jobs", get(list_dream_jobs))
                 .route("/v1/dream/jobs/{job_id}", get(get_dream_job))
+                .route("/v1/dream/jobs/{job_id}/read", post(dream_scoped_read))
                 .route("/v1/resident/page-pins", post(post_page_pin))
                 .route("/v1/resident/page-pins/{page_id}", delete(delete_page_pin))
                 .layer(middleware::from_fn_with_state(
@@ -1127,14 +1140,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|(is_missing, name)| is_missing.then_some(name))
             .collect::<Vec<_>>();
             let readiness = if !cfg.dream.enabled {
-                "disabled".to_string()
+                "scheduler_disabled".to_string()
             } else if missing.is_empty() {
                 "ready".to_string()
             } else {
                 format!("missing_{}", missing.join(","))
             };
             println!(
-                "dream.enabled={} dream_readiness={} chat={} embedding={} runner={}",
+                "dream.auto_enabled={} dream_readiness={} chat={} embedding={} runner={}",
                 cfg.dream.enabled,
                 readiness,
                 if chat_ready { "configured" } else { "missing" },
@@ -2043,7 +2056,7 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
             let generator = if kind == "mental_model" {
                 memory_store_sqlite::pages::GENERATE_MENTAL_MODEL_V1
             } else {
-                memory_store_sqlite::pages::GENERATE_CONSOLIDATE_V1
+                memory_store_sqlite::pages::GENERATE_CONSOLIDATE_V2
             };
             let (job, dream) = store
                 .consolidation_enqueue_manual_dream(
@@ -3899,24 +3912,32 @@ async fn post_context_bundle(
                 .unwrap_or_default()
         };
         page_index_status = "ok";
-        // ---- 通道 3/4：向量（embedding 已配置才启用；query embedding 800ms 预算，
-        // doc6/04 §2）。ready 总数达上限 → limit_exceeded 只做词法。----
+        // ---- 通道 3/4：向量（embedding 已配置才启用；等待 provider 按配置超时或
+        // 调用方取消，不另设查询延迟预算）。ready 总数达上限 → limit_exceeded 只做词法。----
         let mut mem_vec: Vec<String> = Vec::new();
         let mut page_vec: Vec<String> = Vec::new();
         if let Some(emb) = &state.embedding {
             let qtexts = vec![query_trim.to_string()];
-            let fut = emb.embed(&qtexts);
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(memory_contract::QUERY_EMBEDDING_TIMEOUT_MS),
-                fut,
-            )
-            .await
-            {
-                Ok(Ok(vs)) if !vs.is_empty() => {
+            match emb.embed(&qtexts).await {
+                Ok(vs) if !vs.is_empty() => {
                     let qv = &vs[0];
                     let guard = state.store.lock().unwrap();
-                    let scan_m = guard.semantic_scan(&scope, "memory", emb.model_id(), qv, lane_k);
-                    let scan_p = guard.semantic_scan(&scope, "page", emb.model_id(), qv, lane_k);
+                    let scan_m = guard.semantic_scan_with_floor(
+                        &scope,
+                        "memory",
+                        emb.model_id(),
+                        qv,
+                        lane_k,
+                        state.semantic_min_similarity,
+                    );
+                    let scan_p = guard.semantic_scan_with_floor(
+                        &scope,
+                        "page",
+                        emb.model_id(),
+                        qv,
+                        lane_k,
+                        state.semantic_min_similarity,
+                    );
                     match (scan_m, scan_p) {
                         (Ok((mh, mc)), Ok((ph, pc))) => {
                             if mc >= memory_contract::SEMANTIC_SCAN_LIMIT
@@ -3934,19 +3955,12 @@ async fn post_context_bundle(
                         }
                     }
                 }
-                Ok(Ok(_)) => {
+                Ok(_) => {
                     semantic_status = "unavailable";
                 } // 空向量
-                Ok(Err(e)) => {
+                Err(e) => {
                     semantic_status = "unavailable";
                     eprintln!("[bundle] query embedding 失败: {e}");
-                }
-                Err(_) => {
-                    semantic_status = "unavailable"; // 800ms 超时，降级词法
-                    eprintln!(
-                        "[bundle] query embedding 超时（{}ms）",
-                        memory_contract::QUERY_EMBEDDING_TIMEOUT_MS
-                    );
                 }
             }
         }
@@ -4161,7 +4175,16 @@ async fn post_context_bundle(
                     if uncovered < min_needed {
                         continue; // doc6/04 §3：未覆盖来源不足 → 跳过文档。
                     }
-                    let entry = format!("- [page: {}] {}", p.page_id, p.title);
+                    let entry = format!(
+                        "- [page: {}] {}{}",
+                        p.page_id,
+                        p.title,
+                        if p.description.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", p.description)
+                        }
+                    );
                     let entry_chars = entry.chars().count();
                     if retrieved_items.len() >= q_items
                         || (used_chars_retrieved > 0
@@ -4189,6 +4212,7 @@ async fn post_context_bundle(
                         "page_id": p.page_id,
                         "document_kind": p.document_kind,
                         "title": p.title,
+                        "description": p.description,
                         "derived": true,
                         "reason": channel_of(key, &rrf),
                         "version": p.version,
@@ -4251,6 +4275,7 @@ fn page_json(p: &memory_store_sqlite::pages::PageRow) -> serde_json::Value {
         "document_key": p.document_key,
         "question_version": p.question_version,
         "title": p.title,
+        "description": p.description,
         "body_md": p.body_md,
         "status": p.status,
         "version": p.version,
@@ -4621,7 +4646,7 @@ async fn dream_runner_heartbeat(
         || req.capabilities.iter().any(|c| {
             !matches!(
                 c.as_str(),
-                "chat" | "dream_v1" | "adjudicate_v1" | "consolidate_v1"
+                "chat" | "dream_v1" | "adjudicate_v1" | "consolidate_v1" | "dream_scoped_read_v1"
             )
         })
     {
@@ -4678,10 +4703,6 @@ async fn dream_runner_claim(
             )
         }
     };
-    if !state.dream_enabled {
-        return Json(serde_json::json!({"request_id": req_id.0, "status": "disabled"}))
-            .into_response();
-    }
     if state.embedding.is_none() {
         return Json(serde_json::json!({"request_id": req_id.0, "status": "missing_embedding"}))
             .into_response();
@@ -4713,6 +4734,29 @@ async fn dream_runner_claim(
     };
     if !has_chat {
         return Json(serde_json::json!({"request_id": req_id.0, "status": "missing_chat"}))
+            .into_response();
+    }
+    let has_scoped_read = {
+        let guard = state.store.lock().unwrap();
+        match guard.dream_runner_has_capability(
+            &scope,
+            &req.runner_id,
+            "dream_scoped_read_v1",
+            &now,
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                return err(
+                    &req_id.0,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                    &e.to_string(),
+                )
+            }
+        }
+    };
+    if !has_scoped_read {
+        return Json(serde_json::json!({"request_id": req_id.0, "status": "missing_dream_read"}))
             .into_response();
     }
     let mut claim = {
@@ -4762,15 +4806,22 @@ async fn dream_runner_claim(
         if let Err(failure) = prep {
             let mut guard = state.store.lock().unwrap();
             match failure {
-                dream_worker::FreezeError::EmbeddingUnavailable => {
+                dream_worker::FreezeError::EmbeddingUnavailable { error_code } => {
                     let _ = guard.dream_provider_wait(
                         &scope,
                         &work.dream_job.id,
                         work.dream_job.claim_generation,
-                        "EMBEDDING_UNAVAILABLE",
-                        Some(5),
+                        &error_code,
+                        Some(dream_worker::PROVIDER_RECHECK_SECS),
                     );
-                    return Json(serde_json::json!({"request_id": req_id.0, "status": "waiting", "reason": "missing_embedding"})).into_response();
+                    return Json(serde_json::json!({
+                        "request_id": req_id.0,
+                        "status": "waiting",
+                        "reason": "embedding_provider_unavailable",
+                        "error_code": error_code,
+                        "retry_after_secs": dream_worker::PROVIDER_RECHECK_SECS,
+                    }))
+                    .into_response();
                 }
                 dream_worker::FreezeError::StaleInput => {
                     let _ = guard.dream_stale_input(
@@ -4857,6 +4908,8 @@ async fn dream_runner_claim(
                 "dream_generation": work.dream_job.claim_generation,
                 "adjudication_job_id": adjudication_job.id,
                 "adjudication_generation": adjudication_job.claim_generation,
+                "adjudication_version": adjudication_job.adjudication_version,
+                "semantic_search_complete": adjudication_job.embedding_model_id.is_some(),
                 "candidates": candidates.iter().map(|c| serde_json::json!({
                     "candidate_id": c.candidate_id, "kind": c.kind, "claim": c.claim,
                     "quote": c.quote, "status": c.status, "evidence_id": c.evidence_id,
@@ -4953,10 +5006,12 @@ async fn dream_runner_claim(
         return Json(serde_json::json!({"request_id":req_id.0,"status":"claimed","work":data}))
             .into_response();
     }
-    let inputs = {
+    let (frozen_evidence, legacy_inputs) = if work.dream_job.extract_version
+        == memory_store_sqlite::dream_jobs::DREAM_EXTRACT_V1
+    {
         let guard = state.store.lock().unwrap();
         match guard.dream_frozen_inputs(&scope, &work.dream_job.id) {
-            Ok(rows) => rows,
+            Ok(rows) => (Vec::new(), rows),
             Err(e) => {
                 return err(
                     &req_id.0,
@@ -4965,6 +5020,12 @@ async fn dream_runner_claim(
                     &e.to_string(),
                 )
             }
+        }
+    } else {
+        let guard = state.store.lock().unwrap();
+        match guard.dream_read_manifest(&scope,&req.runner_id,&work.dream_job.id,work.dream_job.claim_generation) {
+            Ok(manifest) => (manifest.evidence.iter().map(|(id,role,seq)|serde_json::json!({"evidence_id":id,"role":role,"event_seq":seq})).collect::<Vec<_>>(), Vec::new()),
+            Err(e) => return dream_read_error(&req_id.0,e),
         }
     };
     Json(serde_json::json!({
@@ -4978,7 +5039,8 @@ async fn dream_runner_claim(
             "purpose": work.dream_job.purpose,
             "extract_version": work.dream_job.extract_version,
             "input_fingerprint": work.dream_job.input_fingerprint,
-            "inputs": inputs.iter().map(|(id,role,content)| serde_json::json!({"evidence_id":id,"role":role,"content":content})).collect::<Vec<_>>(),
+            "frozen_evidence": frozen_evidence,
+            "inputs": legacy_inputs.iter().map(|(id,role,content)|serde_json::json!({"evidence_id":id,"role":role,"content":content})).collect::<Vec<_>>(),
         }
     })).into_response()
 }
@@ -5135,7 +5197,8 @@ async fn dream_runner_failure(
                 "runner 不持有当前 Dream claim",
             );
         }
-        let terminal = if let Some(id) = req.adjudication_job_id.as_deref() {
+        let deterministic_failure = req.error_code == "BAD_CHILD_OUTPUT";
+        if let Some(id) = req.adjudication_job_id.as_deref() {
             let Some(generation) = req.adjudication_generation else {
                 return err(
                     &req_id.0,
@@ -5144,25 +5207,25 @@ async fn dream_runner_failure(
                     "缺少 adjudication generation",
                 );
             };
-            let attempts = guard
-                .adjudication_get(&scope, id)
-                .ok()
-                .flatten()
-                .map(|j| j.attempts)
-                .unwrap_or(0);
-            let terminal = attempts >= memory_contract::JOB_MAX_ATTEMPTS as i64;
             let _ = guard.adjudication_finish(
                 &scope,
                 id,
                 generation,
-                if terminal { "dead" } else { "provider_wait" },
+                if deterministic_failure {
+                    "dead"
+                } else {
+                    "provider_wait"
+                },
                 Some(&req.error_code),
                 None,
                 None,
                 None,
-                if terminal { None } else { Some(5) },
+                if deterministic_failure {
+                    None
+                } else {
+                    Some(dream_worker::PROVIDER_RECHECK_SECS)
+                },
             );
-            terminal
         } else if let Some(id) = req.consolidation_job_id.as_deref() {
             let Some(generation) = req.consolidation_generation else {
                 return err(
@@ -5172,30 +5235,19 @@ async fn dream_runner_failure(
                     "缺少 consolidation generation",
                 );
             };
-            let attempts = guard
-                .consolidation_get(&scope, id)
-                .ok()
-                .flatten()
-                .map(|j| j.attempts)
-                .unwrap_or(0);
-            let terminal = attempts >= memory_contract::JOB_MAX_ATTEMPTS as i64;
-            if terminal {
+            if deterministic_failure {
                 let _ = guard.consolidation_dead(&scope, id, generation, &req.error_code);
             } else {
-                let _ =
-                    guard.consolidation_retryable_fail(&scope, id, generation, &req.error_code, 5);
+                let _ = guard.consolidation_retryable_fail(
+                    &scope,
+                    id,
+                    generation,
+                    &req.error_code,
+                    dream_worker::PROVIDER_RECHECK_SECS as u64,
+                );
             }
-            terminal
-        } else {
-            let attempts = guard
-                .dream_get(&scope, &req.dream_job_id)
-                .ok()
-                .flatten()
-                .map(|j| j.attempts)
-                .unwrap_or(0);
-            attempts >= memory_contract::JOB_MAX_ATTEMPTS as i64
-        };
-        if terminal {
+        }
+        if deterministic_failure {
             guard.dream_dead(
                 &scope,
                 &req.dream_job_id,
@@ -5208,7 +5260,7 @@ async fn dream_runner_failure(
                 &req.dream_job_id,
                 req.dream_generation,
                 &req.error_code,
-                Some(5),
+                Some(dream_worker::PROVIDER_RECHECK_SECS),
             )
         }
     };
@@ -5343,7 +5395,13 @@ async fn dream_runner_candidates(
     match dream_worker::runner_submit_candidates(&state, &scope, &job, &proposals).await {
         Ok((accepted,rejected)) => Json(serde_json::json!({"request_id":req_id.0,"status":"submitted","accepted":accepted,"rejected":rejected})).into_response(),
         Err(dream_worker::FreezeError::StaleInput) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "Dream 输入已失效"),
-        Err(dream_worker::FreezeError::EmbeddingUnavailable) => Json(serde_json::json!({"request_id":req_id.0,"status":"waiting","reason":"missing_embedding"})).into_response(),
+        Err(dream_worker::FreezeError::EmbeddingUnavailable { error_code }) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "status": "waiting",
+            "reason": "embedding_provider_unavailable",
+            "error_code": error_code,
+            "retry_after_secs": dream_worker::PROVIDER_RECHECK_SECS,
+        })).into_response(),
         Err(dream_worker::FreezeError::Store(StoreError::StaleClaim)) => err(&req_id.0, StatusCode::CONFLICT, ErrorCode::StateConflict, "Dream generation 已失效"),
         Err(dream_worker::FreezeError::Store(e)) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
@@ -5490,16 +5548,67 @@ async fn dream_runner_adjudication(
                 "adjudication 输出必须覆盖每个冻结候选且不得重复",
             )
         }
-        Err(StoreError::StaleInput) => {
-            let _ = guard.adjudication_finish(&scope,&job_id,req.generation,"stale_input",Some("INPUT_DRIFT"),None,None,None,None);
-            let _ = guard.dream_stale_input(&scope,&adj.dream_job_id,req.dream_generation,"ADJUDICATION_INPUT_DRIFT");
-            err(&req_id.0,StatusCode::CONFLICT,ErrorCode::StateConflict,"adjudication 冻结输入已失效")
+        Err(StoreError::DreamSearchIncomplete) => {
+            let _ = guard.adjudication_finish(&scope,&job_id,req.generation,"dead",Some("DREAM_SEARCH_REQUIRED"),None,None,None,None);
+            let _ = guard.dream_dead(&scope,&adj.dream_job_id,req.dream_generation,"DREAM_SEARCH_REQUIRED");
+            err(&req_id.0,StatusCode::UNPROCESSABLE_ENTITY,ErrorCode::InvalidField,
+                "adjudicate_v2 必须对每个冻结候选完成语义搜索后才能提交")
         }
-        Err(StoreError::StaleClaim) => err(&req_id.0,StatusCode::CONFLICT,ErrorCode::StateConflict,"adjudication generation 已失效"),
+        Err(StoreError::StaleInput) => {
+            let _ = guard.adjudication_finish(
+                &scope,
+                &job_id,
+                req.generation,
+                "stale_input",
+                Some("INPUT_DRIFT"),
+                None,
+                None,
+                None,
+                None,
+            );
+            let _ = guard.dream_stale_input(
+                &scope,
+                &adj.dream_job_id,
+                req.dream_generation,
+                "ADJUDICATION_INPUT_DRIFT",
+            );
+            err(
+                &req_id.0,
+                StatusCode::CONFLICT,
+                ErrorCode::StateConflict,
+                "adjudication 冻结输入已失效",
+            )
+        }
+        Err(StoreError::StaleClaim) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "adjudication generation 已失效",
+        ),
         Err(e) => {
-            let _ = guard.adjudication_finish(&scope,&job_id,req.generation,"dead",Some("APPLY_FAILED"),None,None,None,None);
-            let _ = guard.dream_dead(&scope,&adj.dream_job_id,req.dream_generation,"ADJUDICATION_APPLY_FAILED");
-            err(&req_id.0,StatusCode::INTERNAL_SERVER_ERROR,ErrorCode::Internal,&e.to_string())
+            let _ = guard.adjudication_finish(
+                &scope,
+                &job_id,
+                req.generation,
+                "dead",
+                Some("APPLY_FAILED"),
+                None,
+                None,
+                None,
+                None,
+            );
+            let _ = guard.dream_dead(
+                &scope,
+                &adj.dream_job_id,
+                req.dream_generation,
+                "ADJUDICATION_APPLY_FAILED",
+            );
+            err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                &e.to_string(),
+            )
         }
     }
 }
@@ -5573,7 +5682,25 @@ async fn dream_runner_publish_page(
         .get("body_md")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    if req.output.as_object().is_none_or(|o| o.len() != 2) || title.is_empty() || body_md.is_empty()
+    let description = req
+        .output
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let page_v2 = job.generator_version == memory_store_sqlite::pages::GENERATE_CONSOLIDATE_V2
+        && job.document_kind == "topic_page";
+    let known_version = page_v2
+        || ((job.generator_version == memory_store_sqlite::pages::GENERATE_CONSOLIDATE_V1
+            || job.generator_version == memory_store_sqlite::pages::GENERATE_MENTAL_MODEL_V1)
+            && !page_v2);
+    if !known_version
+        || req
+            .output
+            .as_object()
+            .is_none_or(|o| o.len() != if page_v2 { 3 } else { 2 })
+        || title.is_empty()
+        || body_md.is_empty()
+        || (page_v2 && (description.is_empty() || description.chars().count() > 240))
     {
         let _ = guard.consolidation_dead(&scope, &job_id, req.generation, "BAD_PAGE_OUTPUT");
         let _ = guard.dream_dead(
@@ -5668,7 +5795,36 @@ async fn dream_runner_publish_page(
         // background Dream work is recorded as the allowed system actor.
         actor_kind: "system",
     };
-    let (page_id, page_version) = match guard.publish_page_idempotent(&request) {
+    let publish_result = if page_v2 {
+        let compared = guard
+            .dream_page_search_ready(
+                &scope,
+                &req.dream_job_id,
+                req.dream_generation,
+                &job.document_key,
+            )
+            .unwrap_or(false);
+        if !compared {
+            let _ =
+                guard.consolidation_dead(&scope, &job_id, req.generation, "PAGE_COMPARE_REQUIRED");
+            let _ = guard.dream_dead(
+                &scope,
+                &req.dream_job_id,
+                req.dream_generation,
+                "PAGE_COMPARE_REQUIRED",
+            );
+            return err(
+                &req_id.0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::InvalidField,
+                "consolidate_v2 必须先完成语义搜索；若已有有效同 key 页面，还必须读取其冻结版本",
+            );
+        }
+        guard.publish_page_with_description_idempotent(&request, description)
+    } else {
+        guard.publish_page_idempotent(&request)
+    };
+    let (page_id, page_version) = match publish_result {
         Ok(v) => v,
         Err(StoreError::StaleInput) => {
             let _ = guard.consolidation_stale_input(&scope, &job_id, req.generation);
@@ -5903,6 +6059,481 @@ async fn get_dream_job(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal,
             &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DreamScopedReadRequest {
+    runner_id: String,
+    dream_generation: i64,
+    operation: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    ids: Option<Vec<String>>,
+    #[serde(default)]
+    candidate_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn dream_read_error(req_id: &str, error: StoreError) -> Response {
+    match error {
+        StoreError::StaleClaim => err(
+            req_id,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "Dream runner lease 或 generation 已失效",
+        ),
+        StoreError::StaleInput => err(
+            req_id,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "Dream 读取目标版本已变化；不得继续使用旧内容",
+        ),
+        StoreError::JobNotFound
+        | StoreError::EvidenceNotFound
+        | StoreError::MemoryNotFound
+        | StoreError::PageNotFound => err(
+            req_id,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "读取目标不存在、超出本 job 范围或已失效",
+        ),
+        StoreError::InvalidPageField => err(
+            req_id,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "Dream 读取参数超出限制",
+        ),
+        StoreError::DreamReadBudgetExceeded => err(
+            req_id,
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "Dream 子 Agent 已达到本 job 的 32 次只读调用预算",
+        ),
+        other => err(
+            req_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &other.to_string(),
+        ),
+    }
+}
+
+/// One bounded, read-only endpoint for the DSH Dream child. Authentication
+/// scope comes from Bearer middleware; runner/job/generation are additionally
+/// checked in SQLite before each read and again when search results are frozen.
+async fn dream_scoped_read(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(job_id): AxumPath<String>,
+    body: Result<Json<DreamScopedReadRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "Dream read 请求字段非法",
+            )
+        }
+    };
+    if req.runner_id.trim().is_empty()
+        || req.runner_id.chars().count() > 256
+        || req.dream_generation <= 0
+    {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "runner_id/generation 非法",
+        );
+    }
+    let limit = req.limit.unwrap_or(8);
+    if !(1..=10).contains(&limit) {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "limit 必须为 1—10",
+        );
+    }
+    let ids = req.ids.unwrap_or_default();
+    if ids.len() > 20
+        || ids
+            .iter()
+            .any(|id| id.is_empty() || id.chars().count() > 128)
+    {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "ids 最多 20 个，每个 1—128 字符",
+        );
+    }
+    if req
+        .candidate_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.chars().count() > 128)
+    {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "candidate_id 非法",
+        );
+    }
+    let query = req.query.unwrap_or_default().trim().to_string();
+    if query.chars().count() > 512 {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "query 最多 512 个 Unicode 标量字符",
+        );
+    }
+
+    let budget = state.store.lock().unwrap().dream_consume_read_budget(
+        &scope,
+        &req.runner_id,
+        &job_id,
+        req.dream_generation,
+    );
+    if let Err(error) = budget {
+        return dream_read_error(&req_id.0, error);
+    }
+
+    match req.operation.as_str() {
+        "manifest" => {
+            let guard = state.store.lock().unwrap();
+            match guard.dream_read_manifest(&scope, &req.runner_id, &job_id, req.dream_generation) {
+                Ok(manifest) => Json(serde_json::json!({
+                    "request_id": req_id.0,
+                    "manifest": {
+                        "job_id": manifest.job_id,
+                        "purpose": manifest.purpose,
+                        "status": manifest.status,
+                        "generation": manifest.generation,
+                        "input_fingerprint": manifest.input_fingerprint,
+                        "frozen_evidence": manifest.evidence.iter().map(|(id,role,seq)| serde_json::json!({"evidence_id":id,"role":role,"event_seq":seq})).collect::<Vec<_>>(),
+                    },
+                })).into_response(),
+                Err(e) => dream_read_error(&req_id.0, e),
+            }
+        }
+        "evidence" => {
+            if ids.is_empty() || !query.is_empty() {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "evidence 需要 ids，不接受 query",
+                );
+            }
+            let guard = state.store.lock().unwrap();
+            match guard.dream_read_evidence(&scope, &req.runner_id, &job_id, req.dream_generation, &ids) {
+                Ok(rows) => Json(serde_json::json!({
+                    "request_id": req_id.0,
+                    "evidence": rows.iter().map(|e| serde_json::json!({"evidence_id":e.evidence_id,"role":e.role,"event_seq":e.event_seq,"content":e.content})).collect::<Vec<_>>(),
+                    "returned": rows.len(),
+                })).into_response(),
+                Err(e) => dream_read_error(&req_id.0, e),
+            }
+        }
+        "search_memories" => {
+            if query.is_empty() || !ids.is_empty() {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "search_memories 需要 query，不接受 ids",
+                );
+            }
+            let live = {
+                let guard = state.store.lock().unwrap();
+                match guard.dream_runner_owns(&scope, &req.runner_id, &job_id, req.dream_generation)
+                {
+                    Ok(true) => true,
+                    Ok(false) => return dream_read_error(&req_id.0, StoreError::StaleClaim),
+                    Err(e) => return dream_read_error(&req_id.0, e),
+                }
+            };
+            if !live {
+                return dream_read_error(&req_id.0, StoreError::StaleClaim);
+            }
+            let (lexical, index_degraded) = match state
+                .store
+                .lock()
+                .unwrap()
+                .search_memories(&scope, &query, 20, false)
+            {
+                Ok(result) => result,
+                Err(e) => return dream_read_error(&req_id.0, e),
+            };
+            let mut semantic_ids = Vec::new();
+            let mut semantic_status = "disabled";
+            if let Some(embedding) = &state.embedding {
+                match embedding.embed(&[query.clone()]).await {
+                    Ok(vectors) if !vectors.is_empty() => {
+                        let vector = &vectors[0];
+                        let scan = state.store.lock().unwrap().semantic_scan_with_floor(
+                            &scope,
+                            "memory",
+                            embedding.model_id(),
+                            vector,
+                            20,
+                            state.semantic_min_similarity,
+                        );
+                        match scan {
+                            Ok((hits, ready)) if ready < memory_contract::SEMANTIC_SCAN_LIMIT => {
+                                semantic_ids = hits.into_iter().map(|(id, _)| id).collect();
+                                semantic_status = "ok";
+                            }
+                            Ok(_) => semantic_status = "limit_exceeded",
+                            Err(_) => semantic_status = "unavailable",
+                        }
+                    }
+                    Ok(_) | Err(_) => semantic_status = "unavailable",
+                }
+            }
+            let mut info = std::collections::HashMap::new();
+            {
+                let guard = state.store.lock().unwrap();
+                for hit in &lexical {
+                    if let Ok(Some(memory)) = guard.get_memory(&scope, &hit.memory_id) {
+                        info.insert(hit.memory_id.clone(), memory);
+                    }
+                }
+                for id in &semantic_ids {
+                    if !info.contains_key(id) {
+                        if let Ok(Some(memory)) = guard.get_memory(&scope, id) {
+                            info.insert(id.clone(), memory);
+                        }
+                    }
+                }
+            }
+            let mut ranks: std::collections::HashMap<String, Vec<u32>> =
+                std::collections::HashMap::new();
+            for (i, hit) in lexical.iter().enumerate() {
+                if info.contains_key(&hit.memory_id) {
+                    ranks
+                        .entry(hit.memory_id.clone())
+                        .or_default()
+                        .push(i as u32 + 1);
+                }
+            }
+            for (i, id) in semantic_ids.iter().enumerate() {
+                if info.contains_key(id) {
+                    ranks.entry(id.clone()).or_default().push(i as u32 + 1);
+                }
+            }
+            let mut ordered: Vec<(String, f64)> = ranks
+                .iter()
+                .map(|(id, r)| (id.clone(), memory_recall::rrf_score(r)))
+                .collect();
+            ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ordered.truncate(limit);
+            let candidates: Vec<(String, i64, String)> = ordered
+                .iter()
+                .filter_map(|(id, _)| {
+                    info.get(id)
+                        .map(|m| (id.clone(), m.version, m.claim.clone()))
+                })
+                .collect();
+            let accepted = match state.store.lock().unwrap().dream_snapshot_memories(
+                &scope,
+                &req.runner_id,
+                &job_id,
+                req.dream_generation,
+                &candidates,
+            ) {
+                Ok(ids) => ids.into_iter().collect::<std::collections::HashSet<_>>(),
+                Err(e) => return dream_read_error(&req_id.0, e),
+            };
+            let items = ordered.into_iter().filter(|(id,_)| accepted.contains(id)).filter_map(|(id,score)| info.get(&id).map(|m| serde_json::json!({
+                "memory_id":id,"version":m.version,"kind":m.kind,"claim":m.claim,"score":score,
+                "matched_by": {"lexical": lexical.iter().any(|h| h.memory_id == id), "semantic": semantic_ids.contains(&id)},
+            }))).collect::<Vec<_>>();
+            if let Err(e) = state.store.lock().unwrap().dream_record_search(
+                &scope,
+                &req.runner_id,
+                &job_id,
+                req.dream_generation,
+                "memory",
+                req.candidate_id.as_deref(),
+                &query,
+                semantic_status == "ok",
+                items.len(),
+            ) {
+                return dream_read_error(&req_id.0, e);
+            }
+            Json(serde_json::json!({"request_id":req_id.0,"items":items,"lexical_status":if index_degraded{"index_degraded"}else{"ok"},"semantic_status":semantic_status,"complete":semantic_status=="ok"})).into_response()
+        }
+        "search_pages" => {
+            if query.is_empty() || !ids.is_empty() {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "search_pages 需要 query，不接受 ids",
+                );
+            }
+            match state.store.lock().unwrap().dream_runner_owns(
+                &scope,
+                &req.runner_id,
+                &job_id,
+                req.dream_generation,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return dream_read_error(&req_id.0, StoreError::StaleClaim),
+                Err(e) => return dream_read_error(&req_id.0, e),
+            }
+            let now = match memory_store_sqlite::now_rfc3339_pub() {
+                Ok(v) => v,
+                Err(e) => return dream_read_error(&req_id.0, e),
+            };
+            let lexical = match state
+                .store
+                .lock()
+                .unwrap()
+                .page_fts_search(&scope, &query, 20)
+            {
+                Ok(v) => v,
+                Err(e) => return dream_read_error(&req_id.0, e),
+            };
+            let mut semantic_ids = Vec::new();
+            let mut semantic_status = "disabled";
+            if let Some(embedding) = &state.embedding {
+                match embedding.embed(&[query.clone()]).await {
+                    Ok(vectors) if !vectors.is_empty() => {
+                        match state.store.lock().unwrap().semantic_scan_with_floor(
+                            &scope,
+                            "page",
+                            embedding.model_id(),
+                            &vectors[0],
+                            20,
+                            state.semantic_min_similarity,
+                        ) {
+                            Ok((hits, ready)) if ready < memory_contract::SEMANTIC_SCAN_LIMIT => {
+                                semantic_ids = hits.into_iter().map(|(id, _)| id).collect();
+                                semantic_status = "ok";
+                            }
+                            Ok(_) => semantic_status = "limit_exceeded",
+                            Err(_) => semantic_status = "unavailable",
+                        }
+                    }
+                    Ok(_) | Err(_) => semantic_status = "unavailable",
+                }
+            }
+            let mut ids_order = lexical.clone();
+            ids_order.extend(semantic_ids.iter().cloned());
+            ids_order.sort();
+            ids_order.dedup();
+            let mut pages = std::collections::HashMap::new();
+            for id in &ids_order {
+                if let Ok(Some(page)) = state.store.lock().unwrap().get_page(&scope, id, &now) {
+                    pages.insert(id.clone(), page);
+                }
+            }
+            let mut ranks: std::collections::HashMap<String, Vec<u32>> =
+                std::collections::HashMap::new();
+            for (i, id) in lexical.iter().enumerate() {
+                if pages.contains_key(id) {
+                    ranks.entry(id.clone()).or_default().push(i as u32 + 1);
+                }
+            }
+            for (i, id) in semantic_ids.iter().enumerate() {
+                if pages.contains_key(id) {
+                    ranks.entry(id.clone()).or_default().push(i as u32 + 1);
+                }
+            }
+            let mut ordered: Vec<(String, f64)> = ranks
+                .iter()
+                .map(|(id, r)| (id.clone(), memory_recall::rrf_score(r)))
+                .collect();
+            ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ordered.truncate(limit);
+            let candidates: Vec<(String, i64)> = ordered
+                .iter()
+                .filter_map(|(id, _)| pages.get(id).map(|p| (id.clone(), p.version)))
+                .collect();
+            let accepted = match state.store.lock().unwrap().dream_snapshot_pages(
+                &scope,
+                &req.runner_id,
+                &job_id,
+                req.dream_generation,
+                &candidates,
+            ) {
+                Ok(v) => v.into_iter().collect::<std::collections::HashSet<_>>(),
+                Err(e) => return dream_read_error(&req_id.0, e),
+            };
+            let items=ordered.into_iter().filter(|(id,_)|accepted.contains(id)).filter_map(|(id,score)|pages.get(&id).map(|p|serde_json::json!({"page_id":id,"version":p.version,"document_kind":p.document_kind,"document_key":p.document_key,"title":p.title,"description":p.description,"score":score,"matched_by":{"lexical":lexical.contains(&id),"semantic":semantic_ids.contains(&id)}}))).collect::<Vec<_>>();
+            if let Err(e) = state.store.lock().unwrap().dream_record_search(
+                &scope,
+                &req.runner_id,
+                &job_id,
+                req.dream_generation,
+                "page",
+                None,
+                &query,
+                semantic_status == "ok",
+                items.len(),
+            ) {
+                return dream_read_error(&req_id.0, e);
+            }
+            Json(serde_json::json!({"request_id":req_id.0,"items":items,"semantic_status":semantic_status,"complete":semantic_status=="ok"})).into_response()
+        }
+        "get_memory" => {
+            if ids.len() != 1 || !query.is_empty() {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "get_memory 需要一个 id",
+                );
+            }
+            let guard = state.store.lock().unwrap();
+            match guard.dream_memory_snapshot_valid(&scope,&req.runner_id,&job_id,req.dream_generation,&ids[0]) {
+                Ok(true)=>match guard.get_memory(&scope,&ids[0]){Ok(Some(m))=>Json(serde_json::json!({"request_id":req_id.0,"memory":{"memory_id":m.memory_id,"version":m.version,"kind":m.kind,"claim":m.claim,"evidence_refs":m.evidence_refs}})).into_response(),Ok(None)=>dream_read_error(&req_id.0,StoreError::StaleInput),Err(e)=>dream_read_error(&req_id.0,e)},
+                Ok(false)=>dream_read_error(&req_id.0,StoreError::MemoryNotFound),Err(e)=>dream_read_error(&req_id.0,e),
+            }
+        }
+        "get_page" => {
+            if ids.len() != 1 || !query.is_empty() {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "get_page 需要一个 id",
+                );
+            }
+            let guard = state.store.lock().unwrap();
+            match guard.dream_read_page_detail(
+                &scope,
+                &req.runner_id,
+                &job_id,
+                req.dream_generation,
+                &ids[0],
+            ) {
+                Ok(Some(page)) => {
+                    Json(serde_json::json!({"request_id":req_id.0,"page":page_json(&page)}))
+                        .into_response()
+                }
+                Ok(None) => dream_read_error(&req_id.0, StoreError::PageNotFound),
+                Err(e) => dream_read_error(&req_id.0, e),
+            }
+        }
+        _ => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "operation 必须是 manifest/evidence/search_memories/get_memory/search_pages/get_page",
         ),
     }
 }
@@ -6609,6 +7240,7 @@ async fn version() -> impl IntoResponse {
         capabilities: vec![
             memory_contract::CAPABILITY_SOUL_V1,
             memory_contract::CAPABILITY_CONTEXT_BUNDLE_V1,
+            memory_contract::CAPABILITY_DREAM_SCOPED_READ_V1,
         ],
     })
 }
@@ -6674,5 +7306,176 @@ migrations_dir = "migrations"
         let disabled: Config =
             toml::from_str(&format!("{BASE}\n[dream]\nenabled = false\n")).unwrap();
         assert!(!disabled.dream.enabled);
+    }
+
+    #[test]
+    fn semantic_similarity_floor_defaults_and_validates_range() {
+        let default: Config = toml::from_str(BASE).unwrap();
+        assert_eq!(default.semantic_min_similarity, None);
+        assert!(default.validate().is_ok());
+
+        for floor in [0.0, 0.3, 1.0] {
+            let configured: Config =
+                toml::from_str(&format!("{BASE}\nsemantic_min_similarity = {floor}\n")).unwrap();
+            assert!(
+                configured.validate().is_ok(),
+                "floor {floor} should be valid"
+            );
+        }
+
+        for floor in [-0.1, 1.1] {
+            let configured: Config =
+                toml::from_str(&format!("{BASE}\nsemantic_min_similarity = {floor}\n")).unwrap();
+            assert!(
+                configured.validate().is_err(),
+                "floor {floor} should be rejected"
+            );
+        }
+
+        let non_finite: Config =
+            toml::from_str(&format!("{BASE}\nsemantic_min_similarity = nan\n")).unwrap();
+        assert!(
+            non_finite.validate().is_err(),
+            "non-finite floor should be rejected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dream_runner_config_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use memory_domain::Origin;
+
+    #[tokio::test]
+    async fn disabling_auto_dream_does_not_block_an_explicit_manual_job() {
+        let disabled: Config = toml::from_str(
+            r#"
+listen_addr = "127.0.0.1:8791"
+db_path = "memory.db"
+migrations_dir = "migrations"
+[dream]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.dream.enabled);
+
+        let mut store =
+            Store::open_in_memory(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations"))
+                .unwrap();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-memory-manual-dream-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let token_path = temp_dir.join("principal.token");
+        store
+            .principal_add("test-tenant", "test-user", &token_path)
+            .unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let scope = store.verify_token(token.trim()).unwrap().unwrap();
+        let origin = Origin {
+            host_id: "test-host".into(),
+            agent_id: "test-agent".into(),
+            session_id: "test-session".into(),
+        };
+        let occurred_at = chrono::Utc::now();
+        store
+            .record_evidence(
+                &scope,
+                &origin,
+                1,
+                "user",
+                "user",
+                &occurred_at,
+                "仅用于本地测试的手动整理事件",
+            )
+            .unwrap();
+        store
+            .dream_trigger(
+                &scope,
+                "manual",
+                "manual-trigger-test",
+                Some("test-agent"),
+                Some("test-host"),
+                Some("test-session"),
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .dream_runner_heartbeat(
+                &scope,
+                "test-runner",
+                "test-host",
+                "test-agent",
+                r#"["chat","dream_scoped_read_v1"]"#,
+                120,
+            )
+            .unwrap();
+
+        let embedding = embedding::EmbeddingClient::new(embedding::EmbeddingConfig {
+            endpoint: "http://127.0.0.1:1/v1/embeddings".into(),
+            model: "local-test-only".into(),
+            api_key: "local-test-only".into(),
+            timeout: std::time::Duration::from_secs(1),
+            dimensions: 1,
+        })
+        .unwrap();
+        let state = AppState {
+            store: Arc::new(Mutex::new(store)),
+            embedding: Some(Arc::new(embedding)),
+            rerank: None,
+            semantic_min_similarity: super::DEFAULT_SEMANTIC_MIN_SIMILARITY,
+            recency_mode: "linear",
+        };
+        let response = dream_runner_claim(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("test-request".into())),
+            Ok(Json(DreamRunnerClaimRequest {
+                runner_id: "test-runner".into(),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "claimed");
+        assert_eq!(value["work"]["phase"], "extract");
+        let dream_job_id = value["work"]["dream_job_id"].as_str().unwrap().to_string();
+        let dream_generation = value["work"]["dream_generation"].as_i64().unwrap();
+
+        let failure = dream_runner_failure(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("test-failure".into())),
+            Ok(Json(DreamRunnerFailureRequest {
+                runner_id: "test-runner".into(),
+                phase: "extract".into(),
+                dream_job_id: dream_job_id.clone(),
+                dream_generation,
+                adjudication_job_id: None,
+                adjudication_generation: None,
+                consolidation_job_id: None,
+                consolidation_generation: None,
+                error_code: "SUBAGENT_FAILED".into(),
+            })),
+        )
+        .await;
+        assert_eq!(failure.status(), StatusCode::OK);
+        let job = state
+            .store
+            .lock()
+            .unwrap()
+            .dream_get(&scope, &dream_job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "provider_wait");
+        assert_eq!(job.error_code.as_deref(), Some("SUBAGENT_FAILED"));
+        let retry_at = chrono::DateTime::parse_from_rfc3339(&job.run_after).unwrap();
+        assert!(retry_at > chrono::Utc::now() + chrono::Duration::hours(23));
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

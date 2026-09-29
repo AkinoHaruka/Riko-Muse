@@ -37,8 +37,6 @@ export interface AdapterConfig {
   requireContextBundle: boolean;
   /** GET /v1/soul 时限（doc6/06 §3：默认 300ms）。 */
   soulTimeoutMs: number;
-  /** POST /v1/context/bundle 时限（doc6/06 §3：默认 800ms）。 */
-  bundleTimeoutMs: number;
   /**
    * 部署级稳定 agent ID（doc6/03 §1「本进程配置的宿主 Agent ID」）。Soul 按
    * (tenant,user,agent_id) 隔离，DSH 的 agent.id 是随机会话 ID（session-*），
@@ -53,7 +51,6 @@ const DEFAULT_COMPOSE_TIMEOUT_MS = 500;
 const DEFAULT_WRITE_TIMEOUT_MS = 3000;
 const DEFAULT_SPOOL_LIMIT_BYTES = 100 * 1024 * 1024;
 const DEFAULT_SOUL_TIMEOUT_MS = 300;
-const DEFAULT_BUNDLE_TIMEOUT_MS = 800;
 const HOST_ID_MAX_CHARS = 256;
 
 export function loadConfig(raw: unknown): AdapterConfig {
@@ -88,7 +85,6 @@ export function loadConfig(raw: unknown): AdapterConfig {
     contextBundleEnabled,
     requireContextBundle: boolOr(r.requireContextBundle, false),
     soulTimeoutMs: positiveIntOr(r.soulTimeoutMs, DEFAULT_SOUL_TIMEOUT_MS, "soulTimeoutMs"),
-    bundleTimeoutMs: positiveIntOr(r.bundleTimeoutMs, DEFAULT_BUNDLE_TIMEOUT_MS, "bundleTimeoutMs"),
     agentName,
   };
 }

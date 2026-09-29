@@ -10,6 +10,7 @@ import type { JsonSchemaNode, ObjectJsonSchema } from "@deepseek-ai/dsh-tools";
 import type { SubagentRun, SubagentStartRequest } from "@deepseek-ai/dsh-subagent";
 import type { MemoryClient } from "./client.js";
 import type { Logger } from "./events.js";
+import { withDreamChildBinding } from "./dream-scope.js";
 
 type Work = Record<string, unknown> & {
   phase: "extract" | "redecision" | "adjudicate" | "consolidate";
@@ -20,6 +21,8 @@ type Work = Record<string, unknown> & {
   adjudication_generation?: number;
   consolidation_job_id?: string;
   consolidation_generation?: number;
+  generator_version?: string;
+  semantic_search_complete?: boolean;
 };
 
 type Claimed = { status?: string; work?: Work };
@@ -27,6 +30,13 @@ type Claimed = { status?: string; work?: Work };
 const stringSchema = { type: "string" } as const;
 const nullableStringSchema: JsonSchemaNode = {
   oneOf: [{ type: "string" }, { type: "null" }],
+};
+
+const consolidateV2Schema: ObjectJsonSchema = {
+  type: "object",
+  properties: { title: stringSchema, description: stringSchema, body_md: stringSchema },
+  required: ["title", "description", "body_md"],
+  additionalProperties: false,
 };
 
 const schemas: Record<Work["phase"], ObjectJsonSchema> = {
@@ -112,28 +122,64 @@ function textPrompt(work: Work): string {
   switch (work.phase) {
     case "extract":
     case "redecision":
+      if (work.extract_version === "dream_extract_v1") {
+        return [
+          "You are a restricted memory extraction child. Return only the requested structured JSON.",
+          "Use only the frozen input events below. Create atomic claims only from user-role evidence.",
+          "Copy each quote exactly from one event; evidence_id must identify that same event.",
+          "Never invent evidence, alter quotes, write to tools, or claim that a memory was committed.",
+          "Output schema: { candidates: [{ evidence_id, kind, quote, claim, occurred_at? }] }.",
+          payload,
+        ].join("\n\n");
+      }
       return [
         "You are a restricted memory extraction child. Return only the requested structured JSON.",
-        "Use only the frozen input events below. Create atomic claims only from user-role evidence.",
-        "Copy each quote exactly from one event; evidence_id must identify that same event.",
+        "First call dream_read_manifest, then dream_read_evidence for the listed IDs. Use only frozen input events.",
+        "Create atomic claims only from role=user evidence. Assistant/tool events are context only and cannot be cited.",
+        "Copy each quote exactly from one returned user event; evidence_id must identify that same event.",
         "Never invent evidence, alter quotes, write to tools, or claim that a memory was committed.",
         "Output schema: { candidates: [{ evidence_id, kind, quote, claim, occurred_at? }] }.",
         payload,
       ].join("\n\n");
     case "adjudicate":
+      if (work.adjudication_version === "adjudicate_v1") {
+        return [
+          "You are a restricted memory adjudication child. Return only the requested structured JSON.",
+          "Judge each frozen candidate against only the supplied recalled targets and evidence.",
+          "Choose one allowed action per candidate. Do not invent target IDs or versions.",
+          "Rust will independently validate and commit every proposed change.",
+          "Output schema: { results: [{ candidate_id, durability, action, reason_code?, target_memory_id?, expected_target_version?, model_confidence?, valid_until? }] }.",
+          payload,
+        ].join("\n\n");
+      }
       return [
         "You are a restricted memory adjudication child. Return only the requested structured JSON.",
-        "Judge each frozen candidate against only the supplied recalled targets and evidence.",
-        "Choose one allowed action per candidate. Do not invent target IDs or versions.",
+        "Read the frozen evidence with dream_read_manifest and dream_read_evidence, then search related memories with dream_search_memories before deciding.",
+        "Search once for each candidate and pass that candidate_id to dream_search_memories. If semantic_search_complete is false, a search reports complete=false, or a tool fails, do not claim there is no match; choose defer.",
+        "Judge each frozen candidate against its evidence and the matching retrieved targets. Choose one allowed action per candidate.",
+        "Do not invent target IDs or versions; only cite memory IDs and versions returned by the read tools.",
         "Rust will independently validate and commit every proposed change.",
         "Output schema: { results: [{ candidate_id, durability, action, reason_code?, target_memory_id?, expected_target_version?, model_confidence?, valid_until? }] }.",
         payload,
       ].join("\n\n");
     case "consolidate":
+      if (work.generator_version !== "consolidate_v2") {
+        return [
+          "You are a restricted derived-page writer. Return only title and body_md as structured JSON.",
+          "Use only the supplied question/document metadata and frozen source memories.",
+          "Do not add facts, source IDs, citations, or links that are not in the input.",
+          "Keep the title within 80 characters and body_md within 1200 characters.",
+          "Rust rechecks every frozen source before publishing.",
+          payload,
+        ].join("\n\n");
+      }
       return [
-        "You are a restricted derived-page writer. Return only title and body_md as structured JSON.",
+        "You are a restricted derived-page writer. Return only title, description, and body_md as structured JSON.",
+        "Before proposing a page, use dream_search_pages with the document key and topic terms; read relevant results using dream_get_page.",
+        "If a read tool fails or reports complete=false, do not claim no existing page was found.",
         "Use only the supplied question/document metadata and frozen source memories.",
         "Do not add facts, source IDs, citations, or links that are not in the input.",
+        "description is one concise, searchable sentence that states the page topic and scope; it is not a source of truth.",
         "Keep the title within 80 characters and body_md within 1200 characters.",
         "Rust rechecks every frozen source before publishing.",
         payload,
@@ -209,7 +255,7 @@ export class DreamRunner {
         runner_id: this.runnerId,
         host_id: this.hostId,
         agent_id: String(agent.id),
-        capabilities: ["chat", "dream_v1", "adjudicate_v1", "consolidate_v1"],
+        capabilities: ["chat", "dream_v1", "adjudicate_v1", "consolidate_v1", "dream_scoped_read_v1"],
       }, signal);
       if (heartbeat.failure !== "ok" || heartbeat.status < 200 || heartbeat.status >= 300) {
         this.diagnostic("memoryd_unavailable", "Dream runner heartbeat 未确认；作业仍由 memoryd 持久保存");
@@ -249,7 +295,7 @@ export class DreamRunner {
           runner_id: this.runnerId,
           host_id: this.hostId,
           agent_id: String(agent.id),
-          capabilities: ["chat", "dream_v1", "adjudicate_v1", "consolidate_v1"],
+          capabilities: ["chat", "dream_v1", "adjudicate_v1", "consolidate_v1", "dream_scoped_read_v1"],
         }, signal);
         const lease = await this.client.dreamRunnerLease({
           runner_id: this.runnerId,
@@ -284,9 +330,20 @@ export class DreamRunner {
         signal,
         maxDepth: 1,
         toolFilter: { allow: [] },
-        outputSchema: schemas[work.phase],
+        outputSchema: work.phase === "consolidate" && work.generator_version === "consolidate_v2"
+          ? consolidateV2Schema
+          : schemas[work.phase],
       };
-      child = await this.ctx.subagents.start("spawn", request);
+      child = await withDreamChildBinding({
+        runnerId: this.runnerId,
+        jobId: work.dream_job_id,
+        generation: work.dream_generation,
+        phase: work.phase,
+        parentAgentId: String(agent.id),
+        readToolsEnabled: work.extract_version === "dream_extract_v2"
+          || work.adjudication_version === "adjudicate_v2"
+          || work.generator_version === "consolidate_v2",
+      }, () => this.ctx.subagents.start("spawn", request));
       this.childAgentIds.add(String(child.id));
       const result = await child.result;
       if (leaseLost || signal.aborted) {

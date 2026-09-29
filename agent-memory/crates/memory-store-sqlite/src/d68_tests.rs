@@ -83,15 +83,32 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
         .unwrap();
     assert_eq!(j1.id, j1b.id, "同对象同模型待处理作业幂等");
     store
+        .semantic_enqueue(&scope, "memory", &m_near, "m2")
+        .unwrap()
+        .unwrap();
+    let now_c = crate::now_rfc3339_pub().unwrap();
+    let (scope_m2, model_m2) = store.semantic_job_claim(&now_c, 90, "m2").unwrap().unwrap();
+    assert_eq!(model_m2.model_id, "m2", "worker 只能领取当前配置模型的队列");
+    store
+        .semantic_job_finish(
+            &scope_m2,
+            &model_m2.id,
+            model_m2.claim_generation,
+            "stale_input",
+            Some("TEST_MODEL_QUEUE"),
+            None,
+        )
+        .unwrap();
+    store
         .semantic_enqueue(&scope, "memory", &m_far, "m1")
         .unwrap()
         .unwrap();
     // claim 两个作业并写向量：m_near=[1,0]、m_far=[0,1]。
-    for mid in [&m_near, &m_far] {
+    for _ in [&m_near, &m_far] {
         let now_c = crate::now_rfc3339_pub().unwrap();
-        let (scope_j, job) = store.semantic_job_claim(&now_c, 90).unwrap().unwrap();
+        let (scope_j, job) = store.semantic_job_claim(&now_c, 90, "m1").unwrap().unwrap();
         assert_eq!(job.model_id, "m1");
-        let v: Vec<f32> = if job.object_id == *mid {
+        let v: Vec<f32> = if job.object_id == m_near {
             [1.0f32, 0.0].into()
         } else {
             [0.0f32, 1.0].into()
@@ -125,6 +142,22 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
     assert_eq!((hits.len(), count), (2, 2));
     assert_eq!(hits[0].0, m_near, "余弦降序：近邻在前");
     assert_eq!(hits[1].0, m_far);
+    // Online retrieval can apply an inclusive relevance floor before top-K; the
+    // existing semantic_scan remains unchanged for Dream candidate generation.
+    let (qualified, qualified_count) = store
+        .semantic_scan_with_floor(&scope, "memory", "m1", &[0.95, 0.15], 10, 0.98)
+        .unwrap();
+    assert_eq!(qualified_count, 2, "floor 不改变 ready 向量总数诊断");
+    assert_eq!(qualified.len(), 1, "qualified hits: {qualified:?}");
+    assert_eq!(qualified[0].0, m_near);
+    let (inclusive, _) = store
+        .semantic_scan_with_floor(&scope, "memory", "m1", &[1.0, 0.0], 10, 1.0)
+        .unwrap();
+    assert_eq!(inclusive.len(), 1, "相似度等于 floor 时保留");
+    assert_eq!(inclusive[0].0, m_near);
+    assert!(store
+        .semantic_scan_with_floor(&scope, "memory", "m1", &[1.0, 0.0], 10, 1.01)
+        .is_err());
     // model_id 隔离：不同模型不混算。
     assert_eq!(
         store
@@ -239,6 +272,25 @@ fn adjudication_apply_pairwise_fixed_set() {
             rusqlite::params![scope.tenant_id, scope.user_id, target],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
+        .unwrap();
+    // Seed one ready vector and one pending index job. Updating this memory must
+    // invalidate both within the adjudication transaction.
+    store
+        .semantic_enqueue(&scope, "memory", &target, "gemini-embedding-001")
+        .unwrap();
+    store
+        .semantic_vector_save(
+            &scope,
+            "memory",
+            &target,
+            "gemini-embedding-001",
+            tver,
+            &thash,
+            &[1.0, 0.0],
+        )
+        .unwrap();
+    store
+        .semantic_enqueue(&scope, "memory", &target, "pending-model")
         .unwrap();
     // Dream job + 候选（走真实 submit 校验）。
     let content = "用户住在杭州，用户喜欢简短回答，用户下周去北京，用户养了一只猫，用户会拉小提琴，用户昨天打网球扭伤了脚，用户计划学日语，用户对花粉过敏。";
@@ -475,6 +527,50 @@ fn adjudication_apply_pairwise_fixed_set() {
         )
         .unwrap();
     assert_eq!(new_status, "active");
+    let result_memory_id = |candidate_id: &str| -> String {
+        store
+            .conn()
+            .query_row(
+                "SELECT applied_result_memory_id FROM adjudication_results
+                 WHERE tenant_id=?1 AND user_id=?2 AND job_id=?3 AND candidate_id=?4",
+                rusqlite::params![scope.tenant_id, scope.user_id, adj.id, candidate_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .unwrap()
+    };
+    for candidate_id in [&ids[0], &ids[2], &ids[3]] {
+        let memory_id = result_memory_id(candidate_id);
+        let (fts, grams): (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM memory_fts WHERE memory_id=?3),
+                        (SELECT COUNT(*) FROM memory_grams WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3)",
+                rusqlite::params![scope.tenant_id, scope.user_id, memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            fts > 0 || grams > 0,
+            "adjudicated active memory must be indexed"
+        );
+    }
+    let old_index_rows: i64 = store
+        .conn()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM memory_fts WHERE memory_id=?3)
+                    + (SELECT COUNT(*) FROM memory_grams WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3)",
+            rusqlite::params![scope.tenant_id, scope.user_id, target],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_index_rows, 0,
+        "superseded target leaves lexical indexes"
+    );
+    let updated_id = result_memory_id(&ids[2]);
+    let (updated_hits, _) = store.search_memories(&scope, "上海", 20, false).unwrap();
+    assert!(updated_hits.iter().any(|hit| hit.memory_id == updated_id));
     // d keep_separate：独立 L1 与 create 的 L1 并存（false merge 防护）。
     let (d_mem, a_mem) = (
         store.conn().query_row(
@@ -519,6 +615,26 @@ fn adjudication_apply_pairwise_fixed_set() {
         )
         .unwrap();
     assert_eq!((t_status.as_str(), t_v2), ("superseded", tver + 1));
+    let vector_status: String = store
+        .conn()
+        .query_row(
+            "SELECT status FROM semantic_vectors WHERE tenant_id=?1 AND user_id=?2
+             AND object_kind='memory' AND object_id=?3 AND model_id='gemini-embedding-001'",
+            rusqlite::params![scope.tenant_id, scope.user_id, target],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let pending_status: String = store
+        .conn()
+        .query_row(
+            "SELECT status FROM semantic_jobs WHERE tenant_id=?1 AND user_id=?2
+             AND object_kind='memory' AND object_id=?3 AND model_id='pending-model'",
+            rusqlite::params![scope.tenant_id, scope.user_id, target],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(vector_status, "stale");
+    assert_eq!(pending_status, "stale_input");
     let _ = thash;
 }
 
@@ -591,7 +707,7 @@ fn runner_adjudication_commit_and_processed_receipt_are_atomic() {
             &claimed.id,
             memory_contract::ADMISSION_VERSION_V3,
             crate::adjudication::ADJUDICATE_V1,
-            None,
+            Some("gemini-embedding-001"),
             &[input],
             &[],
         )
@@ -600,6 +716,51 @@ fn runner_adjudication_commit_and_processed_receipt_are_atomic() {
     let now = crate::now_rfc3339_pub().unwrap();
     let (_, adj_claim) = store.adjudication_claim(&now, 90).unwrap().unwrap();
     assert_eq!(adj_claim.id, adjudication.id);
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_semantic_enqueue BEFORE INSERT ON semantic_jobs
+             BEGIN SELECT RAISE(ABORT, 'forced semantic enqueue failure'); END;",
+        )
+        .unwrap();
+    let failed = store.adjudication_apply_and_complete(
+        &scope,
+        &adj_claim.id,
+        adj_claim.claim_generation,
+        claimed.claim_generation,
+        &[AdjudicationProposal {
+            candidate_id: candidate_id.clone(),
+            durability: "durable".into(),
+            action: "create".into(),
+            reason_code: None,
+            target_memory_id: None,
+            expected_target_version: None,
+            model_confidence: None,
+            valid_until: None,
+        }],
+    );
+    assert!(failed.is_err(), "强制语义入队失败应中止应用事务");
+    let (active_memories, adj_after_failure, dream_after_failure, evidence_after_failure):
+        (i64, String, String, String) = store.conn().query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM memories WHERE tenant_id=?1 AND user_id=?2 AND claim=?3 AND status='active'),
+             (SELECT status FROM adjudication_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?4),
+             (SELECT status FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?5),
+             (SELECT status FROM dream_evidence_state WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?6)",
+        rusqlite::params![scope.tenant_id, scope.user_id, content, adj_claim.id, dream.id, evidence],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(
+        active_memories, 0,
+        "memory apply 必须随 semantic queue 一同回滚"
+    );
+    assert_eq!(adj_after_failure, "running");
+    assert_eq!(dream_after_failure, "running");
+    assert_eq!(evidence_after_failure, "assigned");
+    store
+        .conn()
+        .execute_batch("DROP TRIGGER reject_semantic_enqueue;")
+        .unwrap();
     let omitted = store.adjudication_apply_and_complete(
         &scope,
         &adj_claim.id,
@@ -977,4 +1138,144 @@ fn adjudication_claim_lifecycle_and_provider_wait_resume() {
         )
         .unwrap();
     assert_eq!(est, "assigned");
+}
+
+#[test]
+fn dream_adjudication_create_populates_lexical_memory_indexes() {
+    let (mut store, scope, origin) = setup("dream-lexical-index");
+    let text = "我在云岚科技从事后端开发，主要维护 Rust 服务。";
+    let evidence = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &chrono::Utc::now(),
+            text,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+    let dream = store
+        .dream_trigger(&scope, "manual", "lexical-index", None, None, None)
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
+    assert_eq!(claimed.id, dream.id);
+    let (accepted, rejected) = store
+        .dream_submit_candidates(
+            &scope,
+            &claimed.id,
+            claimed.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[crate::dream_jobs::DreamProposal {
+                kind: "fact".into(),
+                claim: text.into(),
+                quote: text.into(),
+                evidence_id: evidence.clone(),
+                start_byte: 0,
+                end_byte: text.len() as i64,
+                status: "candidate".into(),
+                reason_code: None,
+                occurred_at: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!((accepted, rejected), (1, 0));
+    let candidate_id: String = store
+        .conn()
+        .query_row(
+            "SELECT id FROM dream_candidates WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, claimed.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let input = AdjudicationCandidate {
+        candidate_id,
+        kind: "fact".into(),
+        claim: text.into(),
+        quote: text.into(),
+        status: "candidate".into(),
+        evidence_id: evidence,
+        start_byte: 0,
+        end_byte: text.len() as i64,
+    };
+    let adjudication = store
+        .adjudication_create(
+            &scope,
+            &claimed.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("fixed-embedding"),
+            &[input],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    let now = crate::now_rfc3339_pub().unwrap();
+    let (_, adjudication_claim) = store.adjudication_claim(&now, 90).unwrap().unwrap();
+    assert_eq!(adjudication_claim.id, adjudication.id);
+    store
+        .adjudication_apply_and_complete(
+            &scope,
+            &adjudication_claim.id,
+            adjudication_claim.claim_generation,
+            claimed.claim_generation,
+            &[AdjudicationProposal {
+                candidate_id: store
+                    .conn()
+                    .query_row(
+                        "SELECT id FROM dream_candidates WHERE tenant_id=?1 AND user_id=?2 AND dream_job_id=?3",
+                        rusqlite::params![scope.tenant_id, scope.user_id, claimed.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                durability: "durable".into(),
+                action: "create".into(),
+                reason_code: None,
+                target_memory_id: None,
+                expected_target_version: None,
+                model_confidence: None,
+                valid_until: None,
+            }],
+        )
+        .unwrap();
+
+    let memory_id: String = store
+        .conn()
+        .query_row(
+            "SELECT id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND claim=?3 AND status='active'",
+            rusqlite::params![scope.tenant_id, scope.user_id, text],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let fts_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_id=?1",
+            rusqlite::params![memory_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let gram_count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_grams WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, memory_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (hits, _) = store.search_memories(&scope, "Rust", 20, false).unwrap();
+    assert!(fts_count > 0, "Dream-created active memory must enter FTS");
+    assert!(
+        gram_count > 0,
+        "Dream-created active memory must enter CJK grams"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.memory_id == memory_id),
+        "Dream-created active memory must be lexically searchable"
+    );
 }

@@ -159,11 +159,11 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
   return [
     defineTool({
       name: "memory_search",
-      description: "搜索当前用户 active 记忆，返回简短摘要与 ID（含版本）。历史查询需明确历史词。",
+      description: "需要回忆已保存内容时调用。默认搜索 active 记忆；只有用户明确询问旧值或历史版本时才启用 include_history。",
       parameters: {
-        query: { type: "string", required: true, description: "搜索词" },
+        query: { type: "string", required: true, description: "描述要查找的记忆内容" },
         limit: { type: "number", description: "1-20，默认 5" },
-        include_history: { type: "boolean", description: "是否含已被取代的历史记忆（需查询含历史词）" },
+        include_history: { type: "boolean", description: "仅用户明确询问已被纠正、替代或历史版本的内容时设为 true；其他情况省略或设为 false" },
       },
       output: { schema: RESULT_SCHEMA, render: renderResult },
       async execute(args: { query: string; limit?: number; include_history?: boolean }, exec: ToolExecLike) {
@@ -178,8 +178,8 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
     }),
     defineTool({
       name: "memory_get",
-      description: "取当前用户一条可见 active 记忆（跨用户 ID 返回 404）。",
-      parameters: { id: { type: "string", required: true, description: "memory_id" } },
+      description: "核对单条记忆详情时调用；ID 须来自 memory_search 或记忆工具的成功回执，不要猜 ID。只读当前 scope 可见的 active 记忆。",
+      parameters: { id: { type: "string", required: true, description: "memory_search 或记忆工具回执中的 memory_id" } },
       output: { schema: RESULT_SCHEMA, render: renderResult },
       async execute(args: { id: string }) {
         return toToolResult(await svc.client.getMemory(args.id));
@@ -187,10 +187,15 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
     }),
     defineTool({
       name: "memory_remember",
-      description: "只接受当前用户明确说出的内容；quote 必须是最近原始用户消息的连续片段。",
+      description: "持久保存本轮用户内容时调用。quote 必须是最近原始用户消息中的连续原文，kind 按原话选择；只有返回 ok=true 才能说已保存。",
       parameters: {
-        quote: { type: "string", required: true, description: "用户原话的连续片段" },
-        kind: { type: "string", required: true, enum: ["fact", "preference", "instruction", "episode"] },
+        quote: { type: "string", required: true, description: "最近原始用户消息中的连续原文，不要改写或拼接" },
+        kind: {
+          type: "string",
+          required: true,
+          enum: ["fact", "preference", "instruction", "episode"],
+          description: "按原话选择：fact=事实，preference=偏好，instruction=指令，episode=经历",
+        },
       },
       output: { schema: RESULT_SCHEMA, render: renderResult },
       async execute(args: { quote: string; kind: string }, exec: ToolExecLike) {
@@ -209,7 +214,7 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
     }),
     defineTool({
       name: "memory_correct",
-      description: "纠错：最近用户消息须同时给出旧片段与新片段；旧记忆 superseded，新记忆 active。",
+      description: "用户明确纠正已保存内容时调用。先查目标 ID 和版本；old_quote、replacement_quote 分别引用本轮更正中的旧值与新值。仅在 ok=true 后确认完成。",
       parameters: {
         id: { type: "string", required: true, description: "memory_id" },
         expected_version: { type: "number", required: true, description: "来自 search/get 的版本（乐观锁）" },
@@ -239,7 +244,7 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
     }),
     defineTool({
       name: "memory_forget",
-      description: "遗忘：最近用户消息须明确含遗忘动词与目标片段；原始会话证据仍保留。",
+      description: "仅用户明确要求忘记时调用。先查目标 ID 和版本，再引用本轮消息中唯一指认目标的原文；原始会话证据仍保留。仅在 ok=true 后确认完成。",
       parameters: {
         id: { type: "string", required: true, description: "memory_id" },
         expected_version: { type: "number", required: true, description: "来自 search/get 的版本（乐观锁）" },
@@ -264,7 +269,7 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
     }),
     defineTool({
       name: "memory_retire",
-      description: "仅在用户明确要求停用某条记忆时调用；先查当前版本，并引用最新用户消息中的唯一原文指令片段。",
+      description: "仅用户明确要求停用时调用。先查当前版本，再引用本轮消息中唯一的停用指令；停用保留记录，不等于删除。仅在 ok=true 后确认完成。",
       parameters: {
         id: { type: "string", required: true, description: "memory_id" },
         expected_version: { type: "number", required: true, description: "来自 memory_search/memory_get 的当前版本" },
@@ -300,7 +305,7 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
     }),
     defineTool({
       name: "memory_restore",
-      description: "仅在用户明确要求恢复某条已退休记忆时调用；引用最新用户消息中的唯一原文恢复指令。",
+      description: "仅用户明确要求恢复已退休记忆时调用。先查当前版本，再引用本轮消息中唯一的恢复指令。仅在 ok=true 后确认完成。",
       parameters: {
         id: { type: "string", required: true, description: "memory_id" },
         expected_version: { type: "number", required: true, description: "来自 memory_search/memory_get 的当前版本" },

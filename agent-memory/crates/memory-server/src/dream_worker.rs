@@ -14,11 +14,11 @@ use memory_domain::{claim_sha256, fold_whitespace, MemoryKind, ScopeKey};
 use memory_extract::{ExtractError, ExtractModel};
 use memory_store_sqlite::adjudication::{
     parse_adjudicate_v1, AdjudicationCandidate, AdjudicationJobRow, AdjudicationProposal,
-    AdjudicationRecall, AdjudicationRedecision, ADJUDICATE_V1_PROMPT,
+    AdjudicationRecall, AdjudicationRedecision, ADJUDICATE_V1_PROMPT, ADJUDICATE_V2_PROMPT,
 };
 use memory_store_sqlite::dream_jobs::{
     locate_quote_span, parse_dream_extract_v1, DreamJobRow, DreamProposal, DREAM_EXTRACT_V1_PROMPT,
-    DREAM_POLICY_V1,
+    DREAM_EXTRACT_V2_PROMPT, DREAM_POLICY_V1,
 };
 use memory_store_sqlite::semantic_index::semantic_index_text;
 use memory_store_sqlite::StoreError;
@@ -31,6 +31,9 @@ use crate::AppState;
 const RETRY_DELAYS_SECS: [i64; 3] = [5, 15, 45];
 const LEASE_SECS: u64 = memory_contract::JOB_LEASE_SECS;
 const MAX_ATTEMPTS: i64 = memory_contract::JOB_MAX_ATTEMPTS as i64;
+/// Provider failures keep their frozen job but are not probed again in a tight
+/// loop. The next automatic readiness/retry window is at most once per day.
+pub const PROVIDER_RECHECK_SECS: i64 = 24 * 60 * 60;
 
 /// 启动 Dream 管线 + 语义索引 worker。chat 未配置：Dream/裁决停队列；
 /// embedding 未配置：索引不跑、裁决停队列（见模块注释）。
@@ -82,7 +85,9 @@ pub fn spawn_dream_pipeline(
             if let Some(emb) = &embedding {
                 let claimed = {
                     let mut g = state.store.lock().unwrap();
-                    g.semantic_job_claim(&now, LEASE_SECS).ok().flatten()
+                    g.semantic_job_claim(&now, LEASE_SECS, emb.model_id())
+                        .ok()
+                        .flatten()
                 };
                 if let Some((scope, job)) = claimed {
                     process_semantic_index(&state, emb, &scope, &job).await;
@@ -100,6 +105,14 @@ fn retry_delay_for(attempts: i64) -> Option<i64> {
         .copied()
 }
 
+fn provider_wait_delay_for(attempts: i64, requires_cooldown: bool) -> Option<i64> {
+    if requires_cooldown || attempts >= MAX_ATTEMPTS {
+        Some(PROVIDER_RECHECK_SECS)
+    } else {
+        retry_delay_for(attempts.max(1))
+    }
+}
+
 fn kind_of(s: &str) -> Option<MemoryKind> {
     match s {
         "preference" => Some(MemoryKind::Preference),
@@ -110,30 +123,19 @@ fn kind_of(s: &str) -> Option<MemoryKind> {
     }
 }
 
-/// provider/transport 失败：attempts 未达上限 → provider_wait 退避；达上限 → dead。
-/// 裁决作业失败同步传导到其 Dream job（证据保持 assigned，doc6/10 §5）。
+/// Provider 故障不作为确定性失败：先做有限短退避，之后每日最多重新探测一次。
+/// 429/认证失败立即进入长冷却。冻结输入与 assigned 状态保留（doc6/10 §5）。
 async fn handle_provider_error(
     state: &AppState,
     scope: &ScopeKey,
     job: &DreamJobRow,
     e: &ExtractError,
 ) {
-    let code = match e {
-        ExtractError::Timeout => "MODEL_TIMEOUT",
-        _ => "MODEL_TRANSPORT",
-    };
+    let code = e.safe_error_code();
+    let should_cool_down = matches!(e, ExtractError::HttpStatus(401 | 403 | 429));
+    let delay = provider_wait_delay_for(job.attempts, should_cool_down);
     let mut g = state.store.lock().unwrap();
-    if job.attempts >= MAX_ATTEMPTS {
-        let _ = g.dream_dead(scope, &job.id, job.claim_generation, code);
-    } else {
-        let _ = g.dream_provider_wait(
-            scope,
-            &job.id,
-            job.claim_generation,
-            code,
-            retry_delay_for(job.attempts.max(1)),
-        );
-    }
+    let _ = g.dream_provider_wait(scope, &job.id, job.claim_generation, &code, delay);
 }
 
 /// 阶段 A（doc6/09 §4.A/§4.B.1）：冻结输入 → 抽取模型 → 严格解析 + Rust span
@@ -148,14 +150,14 @@ async fn process_dream_extract<M: ExtractModel>(
         match freeze_manual_redecision(state, scope, job).await {
             // 留在 running，待后续 adjudication job 成功应用后统一推进终态。
             Ok(()) => {}
-            Err(FreezeError::EmbeddingUnavailable) => {
+            Err(FreezeError::EmbeddingUnavailable { error_code }) => {
                 let mut g = state.store.lock().unwrap();
                 let _ = g.dream_provider_wait(
                     scope,
                     &job.id,
                     job.claim_generation,
-                    "EMBEDDING_UNAVAILABLE",
-                    retry_delay_for(job.attempts.max(1)),
+                    &error_code,
+                    Some(PROVIDER_RECHECK_SECS),
                 );
             }
             Err(FreezeError::StaleInput) => {
@@ -202,7 +204,21 @@ async fn process_dream_extract<M: ExtractModel>(
         }
     };
     // 模型调用（锁外）。
-    let out = match client.extract(DREAM_EXTRACT_V1_PROMPT, &user_prompt).await {
+    let extract_prompt = match job.extract_version.as_str() {
+        memory_store_sqlite::dream_jobs::DREAM_EXTRACT_V1 => DREAM_EXTRACT_V1_PROMPT,
+        memory_store_sqlite::dream_jobs::DREAM_EXTRACT_V2 => DREAM_EXTRACT_V2_PROMPT,
+        _ => {
+            let mut g = state.store.lock().unwrap();
+            let _ = g.dream_dead(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "UNKNOWN_DREAM_PROMPT_VERSION",
+            );
+            return;
+        }
+    };
+    let out = match client.extract(extract_prompt, &user_prompt).await {
         Ok(o) => o,
         Err(e) => {
             handle_provider_error(state, scope, job, &e).await;
@@ -287,19 +303,18 @@ async fn process_dream_extract<M: ExtractModel>(
         );
         return;
     }
-    // 裁决冻结；embedding 瞬时故障 → provider_wait 稍后重试（候选唯一键幂等）。
+    // 裁决冻结；embedding 故障保留候选与冻结输入，并将下一次探测推迟到 24h 后。
     match freeze_adjudication(state, scope, job).await {
         Ok(()) => {}
-        Err(FreezeError::EmbeddingUnavailable) => {
+        Err(FreezeError::EmbeddingUnavailable { error_code }) => {
             if state.embedding.is_some() {
-                // 配置了但此刻失败：退避重试（重新 extract；候选唯一键防重复）。
                 let mut g = state.store.lock().unwrap();
                 let _ = g.dream_provider_wait(
                     scope,
                     &job.id,
                     job.claim_generation,
-                    "EMBEDDING_UNAVAILABLE",
-                    retry_delay_for(job.attempts.max(1)),
+                    &error_code,
+                    Some(PROVIDER_RECHECK_SECS),
                 );
             }
             // 未配置 embedding：裁决作业已带 NULL model 冻结，保持待处理
@@ -324,9 +339,17 @@ async fn process_dream_extract<M: ExtractModel>(
 }
 
 pub enum FreezeError {
-    EmbeddingUnavailable,
+    EmbeddingUnavailable { error_code: String },
     StaleInput,
     Store(StoreError),
+}
+
+impl FreezeError {
+    fn embedding_unavailable(error: crate::embedding::EmbeddingError) -> Self {
+        Self::EmbeddingUnavailable {
+            error_code: error.safe_error_code(),
+        }
+    }
 }
 
 pub async fn prepare_runner_redecision(
@@ -372,13 +395,13 @@ pub async fn runner_submit_candidates(
             Err(error) => {
                 let mut g = state.store.lock().unwrap();
                 match &error {
-                    FreezeError::EmbeddingUnavailable => {
+                    FreezeError::EmbeddingUnavailable { error_code } => {
                         let _ = g.dream_provider_wait(
                             scope,
                             &job.id,
                             job.claim_generation,
-                            "EMBEDDING_UNAVAILABLE",
-                            Some(5),
+                            error_code,
+                            Some(PROVIDER_RECHECK_SECS),
                         );
                     }
                     FreezeError::StaleInput => {
@@ -427,11 +450,14 @@ async fn freeze_manual_redecision(
     let embedding = state
         .embedding
         .clone()
-        .ok_or(FreezeError::EmbeddingUnavailable)?;
+        .ok_or_else(|| FreezeError::EmbeddingUnavailable {
+            error_code: "EMBEDDING_NOT_CONFIGURED".into(),
+        })?;
     let claims: Vec<String> = candidates.iter().map(|(c, _)| c.claim.clone()).collect();
     let vectors = embedding.embed(&claims).await.map_err(|e| {
-        eprintln!("[dream] 显式重裁 embedding 不可用: {e}");
-        FreezeError::EmbeddingUnavailable
+        let error_code = e.safe_error_code();
+        eprintln!("[dream] 显式重裁 embedding 失败 error_code={error_code}");
+        FreezeError::embedding_unavailable(e)
     })?;
     let mut inputs = Vec::new();
     for (candidate, spans) in &candidates {
@@ -577,11 +603,13 @@ async fn freeze_adjudication(
     let emb = state
         .embedding
         .clone()
-        .ok_or(FreezeError::EmbeddingUnavailable)?;
+        .ok_or_else(|| FreezeError::EmbeddingUnavailable {
+            error_code: "EMBEDDING_NOT_CONFIGURED".into(),
+        })?;
     let strategy_fingerprint = format!(
         "{}:{}:{}",
         memory_contract::ADMISSION_VERSION_V3,
-        memory_store_sqlite::adjudication::ADJUDICATE_V1,
+        memory_store_sqlite::adjudication::ADJUDICATE_V2,
         emb.model_id()
     );
     let mut redecisions: Vec<AdjudicationRedecision> = Vec::new();
@@ -591,8 +619,9 @@ async fn freeze_adjudication(
         let mut texts: Vec<String> = accepted.iter().map(|(c, _)| c.claim.clone()).collect();
         texts.extend(held.iter().map(|(c, _)| c.claim.clone()));
         let vectors = emb.embed(&texts).await.map_err(|e| {
-            eprintln!("[dream] Held 重裁相关性 embedding 不可用: {e}");
-            FreezeError::EmbeddingUnavailable
+            let error_code = e.safe_error_code();
+            eprintln!("[dream] Held 重裁相关性 embedding 失败 error_code={error_code}");
+            FreezeError::embedding_unavailable(e)
         })?;
         let fresh_count = accepted.len();
         let mut linked_pairs = std::collections::HashSet::new();
@@ -682,8 +711,9 @@ async fn freeze_adjudication(
     } else {
         let texts: Vec<String> = accepted.iter().map(|(c, _)| c.claim.clone()).collect();
         emb.embed(&texts).await.map_err(|e| {
-            eprintln!("[dream] 候选向量召回不可用: {e}");
-            FreezeError::EmbeddingUnavailable
+            let error_code = e.safe_error_code();
+            eprintln!("[dream] 候选向量召回失败 error_code={error_code}");
+            FreezeError::embedding_unavailable(e)
         })?
     };
     // 词法 + 向量逐候选召回（锁内）。
@@ -725,7 +755,7 @@ async fn freeze_adjudication(
         scope,
         &dream_job.id,
         memory_contract::ADMISSION_VERSION_V3,
-        memory_store_sqlite::adjudication::ADJUDICATE_V1,
+        memory_store_sqlite::adjudication::ADJUDICATE_V2,
         Some(emb.model_id()),
         &cand_inputs,
         &recalls,
@@ -796,6 +826,7 @@ async fn process_adjudication<M: ExtractModel>(
         }
     }
     let user_prompt = serde_json::json!({
+        "semantic_search_complete": job.embedding_model_id.is_some(),
         "candidates": cands.iter().map(|c| serde_json::json!({
             "candidate_id": c.candidate_id,
             "kind": c.kind,
@@ -806,7 +837,26 @@ async fn process_adjudication<M: ExtractModel>(
     })
     .to_string();
     // 模型调用（锁外）。
-    let out = match client.extract(ADJUDICATE_V1_PROMPT, &user_prompt).await {
+    let adjudication_prompt = match job.adjudication_version.as_str() {
+        memory_store_sqlite::adjudication::ADJUDICATE_V1 => ADJUDICATE_V1_PROMPT,
+        memory_store_sqlite::adjudication::ADJUDICATE_V2 => ADJUDICATE_V2_PROMPT,
+        _ => {
+            let mut g = state.store.lock().unwrap();
+            let _ = g.adjudication_finish(
+                scope,
+                &job.id,
+                job.claim_generation,
+                "dead",
+                Some("UNKNOWN_ADJUDICATION_VERSION"),
+                None,
+                None,
+                None,
+                None,
+            );
+            return;
+        }
+    };
+    let out = match client.extract(adjudication_prompt, &user_prompt).await {
         Ok(o) => o,
         Err(e) => {
             let code = match e {
@@ -839,8 +889,13 @@ async fn process_adjudication<M: ExtractModel>(
                     None,
                     retry_delay_for(job.attempts.max(1)),
                 );
-                let _ =
-                    g.dream_provider_wait(scope, &job.dream_job_id, dream_generation, code, None);
+                let _ = g.dream_provider_wait(
+                    scope,
+                    &job.dream_job_id,
+                    dream_generation,
+                    code,
+                    Some(PROVIDER_RECHECK_SECS),
+                );
             }
             eprintln!("[adjudicate] job {} 模型失败: {code}", job.id);
             return;
@@ -886,7 +941,6 @@ async fn process_adjudication<M: ExtractModel>(
         })
         .collect();
     // Rust 原子应用；父 Dream job generation 在下方按数据库当前值复核。
-    let applied_ids: Vec<String>;
     let apply_result = {
         let mut g = state.store.lock().unwrap();
         // 取 dream job 当前 generation（裁决续作时 dream 行可能已是 provider_wait）。
@@ -897,15 +951,7 @@ async fn process_adjudication<M: ExtractModel>(
             .map(|j| j.claim_generation)
             .unwrap_or(-1);
         match g.adjudication_apply(scope, &job.id, job.claim_generation, &proposals) {
-            Ok(outcome) => {
-                applied_ids = outcome
-                    .rows
-                    .iter()
-                    .filter(|(_, st, _, _)| st == "applied")
-                    .filter_map(|(_, _, mid, _)| mid.clone())
-                    .collect();
-                Ok((dream_gen, outcome.applied, outcome.rejected, outcome.held))
-            }
+            Ok(outcome) => Ok((dream_gen, outcome.applied, outcome.rejected, outcome.held)),
             Err(StoreError::StaleInput) => {
                 // 任一召回 target 在模型运行中变化：整批 stale，不部分提交。
                 let _ = g.adjudication_finish(
@@ -984,14 +1030,6 @@ async fn process_adjudication<M: ExtractModel>(
             None,
         );
     }
-    // 应用成功的 L1 异步入向量索引（索引失败不回滚证据，doc6/09 §6）。
-    if let Some(emb) = &state.embedding {
-        let model_id = emb.model_id().to_string();
-        let mut g = state.store.lock().unwrap();
-        for mid in &applied_ids {
-            let _ = g.semantic_enqueue(scope, "memory", mid, &model_id);
-        }
-    }
     eprintln!(
         "[adjudicate] job {} 完成：applied={applied} rejected={rejected} held={held}",
         job.id
@@ -1024,7 +1062,11 @@ async fn process_semantic_index(
                 }
             },
             "page" => match g.get_page(scope, &job.object_id, &now_rfc()) {
-                Ok(Some(p)) => semantic_index_text("page", Some(&p.title), &p.body_md),
+                Ok(Some(p)) => memory_store_sqlite::semantic_index::semantic_index_page_text(
+                    &p.title,
+                    &p.description,
+                    &p.body_md,
+                ),
                 _ => {
                     let _ = g.semantic_job_finish(
                         scope,
@@ -1054,27 +1096,17 @@ async fn process_semantic_index(
     let vecs = match emb.embed(&[text]).await {
         Ok(v) => v,
         Err(e) => {
-            let (status, code) = match e {
-                crate::embedding::EmbeddingError::Timeout => ("provider_wait", "EMBED_TIMEOUT"),
-                crate::embedding::EmbeddingError::RateLimited => ("provider_wait", "EMBED_429"),
-                _ => ("retryable_failed", "EMBED_FAILED"),
-            };
+            let code = e.safe_error_code();
             let mut g = state.store.lock().unwrap();
-            let delay = retry_delay_for(job.attempts.max(1));
-            let status = if job.attempts >= MAX_ATTEMPTS {
-                "dead"
-            } else {
-                status
-            };
             let _ = g.semantic_job_finish(
                 scope,
                 &job.id,
                 job.claim_generation,
-                status,
-                Some(code),
-                delay,
+                "provider_wait",
+                Some(&code),
+                Some(PROVIDER_RECHECK_SECS),
             );
-            eprintln!("[semantic] job {} embed 失败: {e}", job.id);
+            eprintln!("[semantic] job {} embed 失败 error_code={code}", job.id);
             return;
         }
     };
@@ -1128,4 +1160,31 @@ async fn process_semantic_index(
 
 fn now_rfc() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+#[cfg(test)]
+mod provider_retry_tests {
+    use super::{provider_wait_delay_for, PROVIDER_RECHECK_SECS};
+
+    #[test]
+    fn provider_wait_is_bounded_then_cools_down_for_one_day() {
+        assert_eq!(provider_wait_delay_for(1, false), Some(5));
+        assert_eq!(provider_wait_delay_for(2, false), Some(15));
+        assert_eq!(
+            provider_wait_delay_for(3, false),
+            Some(PROVIDER_RECHECK_SECS)
+        );
+        assert_eq!(
+            provider_wait_delay_for(99, false),
+            Some(PROVIDER_RECHECK_SECS)
+        );
+    }
+
+    #[test]
+    fn rate_limit_and_auth_failures_skip_short_retries() {
+        assert_eq!(
+            provider_wait_delay_for(1, true),
+            Some(PROVIDER_RECHECK_SECS)
+        );
+    }
 }

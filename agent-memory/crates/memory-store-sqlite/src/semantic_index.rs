@@ -28,6 +28,17 @@ pub fn semantic_index_text(kind: &str, title: Option<&str>, body: &str) -> Strin
     }
 }
 
+/// Page v1 text remains byte-compatible while the description is empty; v2
+/// pages add description between title and body in both indexing and querying.
+pub fn semantic_index_page_text(title: &str, description: &str, body: &str) -> String {
+    let mut parts = vec![memory_domain::normalize_v1(title)];
+    if !description.is_empty() {
+        parts.push(memory_domain::normalize_v1(description));
+    }
+    parts.push(memory_domain::normalize_v1(body));
+    parts.join("\n")
+}
+
 /// 索引作业行。
 #[derive(Debug, Clone)]
 pub struct SemanticJobRow {
@@ -123,8 +134,9 @@ impl Store {
         Ok(job)
     }
 
-    /// 对象当前指纹：memory 须 active（version, claim_sha256）；page 须 published
-    /// （version, sha256(body_md)）。其余状态返回 None。
+    /// 对象当前指纹：memory 须 active（version, claim_sha256）；page 须 published。
+    /// legacy consolidate_v1 页面保留旧 body hash；consolidate_v2 以实际 embedding
+    /// 输入（title + description + body）计算 hash，确保描述变更会使旧向量 stale。
     pub fn semantic_object_fingerprint(
         &self,
         scope: &ScopeKey,
@@ -147,10 +159,10 @@ impl Store {
                 .optional()
                 .map_err(Into::into),
             "page" => {
-                let row: Option<(i64, String)> = self
+                let row: Option<(i64, String, String, String, String)> = self
                     .conn()
                     .query_row(
-                        "SELECT version, body_md FROM memory_pages
+                        "SELECT version, title, description, body_md, generator_version FROM memory_pages
                          WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='published'
                            AND EXISTS (SELECT 1 FROM page_sources ps
                              WHERE ps.tenant_id=memory_pages.tenant_id AND ps.user_id=memory_pages.user_id AND ps.page_id=memory_pages.id)
@@ -160,12 +172,22 @@ impl Store {
                                AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
                                  OR (m.valid_until IS NOT NULL AND m.valid_until<=?4)
                                  OR EXISTS (SELECT 1 FROM memory_retirements r
-                                   WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)))",
+                                   WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
+                                 OR EXISTS (SELECT 1 FROM purge_jobs pj
+                                   WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
+                                     AND pj.status IN ('pending','running'))))",
                         params![scope.tenant_id, scope.user_id, object_id, now],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
-                Ok(row.map(|(v, body)| (v, content_sha256_hex(&body))))
+                Ok(row.map(|(v, title, description, body, generator)| {
+                    let fingerprint_text = if generator == crate::pages::GENERATE_CONSOLIDATE_V2 {
+                        semantic_index_page_text(&title, &description, &body)
+                    } else {
+                        body
+                    };
+                    (v, content_sha256_hex(&fingerprint_text))
+                }))
             }
             _ => Err(StoreError::StateConflict),
         }
@@ -260,6 +282,43 @@ impl Store {
         query: &[f32],
         top_k: usize,
     ) -> Result<(Vec<(String, f32)>, usize), StoreError> {
+        self.semantic_scan_inner(scope, object_kind, model_id, query, top_k, None)
+    }
+
+    /// Query-time scan with an inclusive cosine relevance floor. This is for online
+    /// retrieval only; Dream adjudication keeps using `semantic_scan` so its candidate
+    /// generation semantics remain independent from query relevance tuning.
+    pub fn semantic_scan_with_floor(
+        &self,
+        scope: &ScopeKey,
+        object_kind: &str,
+        model_id: &str,
+        query: &[f32],
+        top_k: usize,
+        min_similarity: f32,
+    ) -> Result<(Vec<(String, f32)>, usize), StoreError> {
+        if !min_similarity.is_finite() || !(0.0..=1.0).contains(&min_similarity) {
+            return Err(StoreError::InvalidPageField);
+        }
+        self.semantic_scan_inner(
+            scope,
+            object_kind,
+            model_id,
+            query,
+            top_k,
+            Some(min_similarity),
+        )
+    }
+
+    fn semantic_scan_inner(
+        &self,
+        scope: &ScopeKey,
+        object_kind: &str,
+        model_id: &str,
+        query: &[f32],
+        top_k: usize,
+        min_similarity: Option<f32>,
+    ) -> Result<(Vec<(String, f32)>, usize), StoreError> {
         if query.is_empty() || !query.iter().all(|v| v.is_finite()) {
             return Err(StoreError::InvalidPageField);
         }
@@ -292,6 +351,9 @@ impl Store {
             }
         }
         hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(floor) = min_similarity {
+            hits.retain(|(_, similarity)| *similarity >= floor);
+        }
         hits.truncate(top_k);
         Ok((hits, ready_count))
     }
@@ -366,14 +428,15 @@ impl Store {
         &mut self,
         now: &str,
         lease_secs: u64,
+        configured_model_id: &str,
     ) -> Result<Option<(ScopeKey, SemanticJobRow)>, StoreError> {
         let next: Option<(String, i64, String, String)> = self
             .conn()
             .query_row(
                 "SELECT id, claim_generation, tenant_id, user_id FROM semantic_jobs
-                 WHERE status='queued' AND run_after<=?1
+                 WHERE status='queued' AND run_after<=?1 AND model_id=?2
                  ORDER BY run_after, created_at LIMIT 1",
-                params![now],
+                params![now, configured_model_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;

@@ -15,6 +15,7 @@ use crate::{now_rfc3339, Store, StoreError};
 
 /// extract 版本（doc6/10）：独立版本化，旧 extract_v1/v2/v3 不用于 Dream。
 pub const DREAM_EXTRACT_V1: &str = "dream_extract_v1";
+pub const DREAM_EXTRACT_V2: &str = "dream_extract_v2";
 pub const DREAM_PIPELINE_V1: &str = "dream_pipeline_v1";
 pub const DREAM_POLICY_V1: &str = "dream_policy_v1";
 
@@ -631,7 +632,7 @@ impl Store {
                 host_id,
                 session_id,
                 DREAM_PIPELINE_V1,
-                DREAM_EXTRACT_V1,
+                DREAM_EXTRACT_V2,
                 now,
                 fingerprint,
                 now
@@ -823,7 +824,7 @@ impl Store {
                 host_id,
                 session_id,
                 DREAM_PIPELINE_V1,
-                DREAM_EXTRACT_V1,
+                DREAM_EXTRACT_V2,
                 now,
                 fingerprint
             ],
@@ -1844,6 +1845,14 @@ pub const DREAM_EXTRACT_V1_PROMPT: &str =
 3) claim 是对 quote 的规范化改写，不得引入新事实；4) 只输出 JSON，字段固定为 \
 {\"candidates\":[{\"evidence_id\",\"kind\",\"quote\",\"claim\",\"occurred_at\"}]}，\
 kind 只能是 fact/preference/instruction/episode，occurred_at 可为 null；最多 20 条。";
+
+/// DSH Dream 子 Agent 受限读取版本。历史 dream_extract_v1 作业继续使用上面的冻结提示词。
+pub const DREAM_EXTRACT_V2_PROMPT: &str =
+    "你是记忆整理器。输入为本 job 已冻结的 evidence 清单和原文。\
+只从 role=user 的冻结证据提取原子候选；assistant/tool/system 只能作语境，不能引用。\
+quote 必须是单条用户事件中的最短充分逐字连续片段，不能跨事件、拼接或补写主语；\
+claim 只能规范化该 quote 明确表达的一个方面。读取工具失败或证据不清时返回空 candidates。\
+输出严格 JSON：{\"candidates\":[{\"evidence_id\":\"\",\"kind\":\"fact|preference|instruction|episode\",\"quote\":\"\",\"claim\":\"\",\"occurred_at\":null}]}，最多 20 条。";
 
 /// 把模型提案转成可核验的 DreamProposal：byte span 由 Rust 在事件原文中定位
 /// （quote 非逐字 → None → dream_submit_candidates 拒绝）。

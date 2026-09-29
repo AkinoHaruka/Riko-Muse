@@ -25,6 +25,8 @@ pub struct EmbeddingConfig {
 pub enum EmbeddingError {
     Timeout,
     RateLimited,
+    /// Provider returned an HTTP error. Persist only this status code, never its body.
+    HttpStatus(u16),
     /// 提供方返回维度与配置不符。
     DimensionMismatch {
         expected: usize,
@@ -32,8 +34,8 @@ pub enum EmbeddingError {
     },
     /// 向量含非有限值或空。
     BadVector,
-    Transport(String),
-    BadJson(String),
+    Transport,
+    BadJson,
 }
 
 impl std::fmt::Display for EmbeddingError {
@@ -41,12 +43,31 @@ impl std::fmt::Display for EmbeddingError {
         match self {
             EmbeddingError::Timeout => write!(f, "embedding 端点超时"),
             EmbeddingError::RateLimited => write!(f, "embedding 端点 429"),
+            EmbeddingError::HttpStatus(status) => {
+                write!(f, "embedding 端点返回 HTTP {status}")
+            }
             EmbeddingError::DimensionMismatch { expected, actual } => {
                 write!(f, "向量维度不符：期望 {expected} 实际 {actual}")
             }
             EmbeddingError::BadVector => write!(f, "向量含非有限值或为空"),
-            EmbeddingError::Transport(e) => write!(f, "embedding 端点请求失败: {e}"),
-            EmbeddingError::BadJson(e) => write!(f, "embedding 响应解析失败: {e}"),
+            EmbeddingError::Transport => write!(f, "embedding 端点传输失败"),
+            EmbeddingError::BadJson => write!(f, "embedding 响应解析失败"),
+        }
+    }
+}
+
+impl EmbeddingError {
+    /// Stable, safe diagnostic suitable for persistence. Never includes provider
+    /// response bodies, endpoint URLs, request headers, or credentials.
+    pub fn safe_error_code(&self) -> String {
+        match self {
+            Self::Timeout => "EMBED_TIMEOUT".into(),
+            Self::RateLimited => "EMBED_HTTP_429".into(),
+            Self::HttpStatus(status) => format!("EMBED_HTTP_{status}"),
+            Self::DimensionMismatch { .. } => "EMBED_DIMENSION_MISMATCH".into(),
+            Self::BadVector => "EMBED_BAD_VECTOR".into(),
+            Self::Transport => "EMBED_TRANSPORT".into(),
+            Self::BadJson => "EMBED_BAD_RESPONSE".into(),
         }
     }
 }
@@ -63,8 +84,129 @@ struct EmbeddingsResponse {
 
 #[derive(Deserialize)]
 struct EmbeddingsItem {
-    index: usize,
+    /// OpenAI requires an index, while Google's OpenAI-compatible embeddings
+    /// endpoint currently omits it. If every item omits the field, the client
+    /// maps items by response order after checking the result count.
+    #[serde(default, deserialize_with = "deserialize_index")]
+    index: EmbeddingIndex,
     embedding: Vec<serde_json::Value>,
+}
+
+enum EmbeddingIndex {
+    Missing,
+    Present(usize),
+}
+
+impl Default for EmbeddingIndex {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+fn deserialize_index<'de, D>(deserializer: D) -> Result<EmbeddingIndex, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let index = value
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| {
+            serde::de::Error::custom("embedding index must be a non-negative integer")
+        })?;
+    Ok(EmbeddingIndex::Present(index))
+}
+
+enum BoundedReadError {
+    Timeout,
+    Transport,
+    TooLarge,
+}
+
+fn append_bounded(raw: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), BoundedReadError> {
+    if raw.len().saturating_add(chunk.len()) > limit {
+        return Err(BoundedReadError::TooLarge);
+    }
+    raw.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, BoundedReadError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(BoundedReadError::TooLarge);
+    }
+
+    let mut raw = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            BoundedReadError::Timeout
+        } else {
+            BoundedReadError::Transport
+        }
+    })? {
+        append_bounded(&mut raw, &chunk, MAX_RESPONSE_BYTES)?;
+    }
+    Ok(raw)
+}
+
+fn decode_embeddings_response(
+    raw: &[u8],
+    expected_count: usize,
+    dimensions: usize,
+) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    let parsed: EmbeddingsResponse =
+        serde_json::from_slice(raw).map_err(|_| EmbeddingError::BadJson)?;
+    if parsed.data.len() != expected_count {
+        return Err(EmbeddingError::BadJson);
+    }
+
+    let indexed_count = parsed
+        .data
+        .iter()
+        .filter(|item| matches!(item.index, EmbeddingIndex::Present(_)))
+        .count();
+    if indexed_count != 0 && indexed_count != parsed.data.len() {
+        return Err(EmbeddingError::BadJson);
+    }
+
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; expected_count];
+    for (position, item) in parsed.data.into_iter().enumerate() {
+        let index = match item.index {
+            EmbeddingIndex::Missing => position,
+            EmbeddingIndex::Present(index) => index,
+        };
+        if index >= expected_count || out[index].is_some() {
+            return Err(EmbeddingError::BadJson);
+        }
+        let mut vector = Vec::with_capacity(item.embedding.len());
+        for value in item.embedding {
+            let number = value.as_f64().ok_or(EmbeddingError::BadVector)?;
+            if !number.is_finite() {
+                return Err(EmbeddingError::BadVector);
+            }
+            let number = number as f32;
+            if !number.is_finite() {
+                return Err(EmbeddingError::BadVector);
+            }
+            vector.push(number);
+        }
+        if vector.len() != dimensions {
+            return Err(EmbeddingError::DimensionMismatch {
+                expected: dimensions,
+                actual: vector.len(),
+            });
+        }
+        out[index] = Some(vector);
+    }
+
+    out.into_iter()
+        .map(|vector| vector.ok_or(EmbeddingError::BadJson))
+        .collect()
 }
 
 impl EmbeddingClient {
@@ -120,7 +262,7 @@ impl EmbeddingClient {
                 } else if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
                     EmbeddingError::RateLimited
                 } else {
-                    EmbeddingError::Transport(format!("{e}"))
+                    EmbeddingError::Transport
                 }
             })?;
         let status = resp.status();
@@ -131,46 +273,89 @@ impl EmbeddingClient {
             return Err(EmbeddingError::RateLimited);
         }
         if !status.is_success() {
-            return Err(EmbeddingError::Transport(format!("端点返回 {status}")));
+            return Err(EmbeddingError::HttpStatus(status.as_u16()));
         }
-        let raw = resp
-            .bytes()
+        let raw = read_bounded_response(resp)
             .await
-            .map_err(|e| EmbeddingError::Transport(format!("读取响应失败: {e}")))?;
-        if raw.len() > MAX_RESPONSE_BYTES {
-            return Err(EmbeddingError::Transport(format!(
-                "embedding 响应超过 {MAX_RESPONSE_BYTES} 字节上限"
-            )));
-        }
-        let parsed: EmbeddingsResponse =
-            serde_json::from_slice(&raw).map_err(|e| EmbeddingError::BadJson(e.to_string()))?;
-        let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        for item in parsed.data {
-            if item.index >= texts.len() {
-                return Err(EmbeddingError::BadJson(format!(
-                    "index {} 越界",
-                    item.index
-                )));
-            }
-            let mut v = Vec::with_capacity(item.embedding.len());
-            for x in item.embedding {
-                let n = x.as_f64().ok_or_else(|| EmbeddingError::BadVector)?;
-                if !n.is_finite() {
-                    return Err(EmbeddingError::BadVector);
+            .map_err(|error| match error {
+                BoundedReadError::Timeout => EmbeddingError::Timeout,
+                BoundedReadError::Transport | BoundedReadError::TooLarge => {
+                    EmbeddingError::Transport
                 }
-                v.push(n as f32);
-            }
-            if v.len() != self.cfg.dimensions {
-                return Err(EmbeddingError::DimensionMismatch {
-                    expected: self.cfg.dimensions,
-                    actual: v.len(),
-                });
-            }
-            out[item.index] = Some(v);
-        }
-        out.into_iter()
-            .map(|v| v.ok_or(EmbeddingError::BadJson("index 缺失".into())))
-            .collect()
+            })?;
+        decode_embeddings_response(&raw, texts.len(), self.cfg.dimensions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_bounded, decode_embeddings_response, EmbeddingError};
+
+    #[test]
+    fn accepts_google_compatible_embeddings_without_indexes_in_response_order() {
+        let raw = br#"{"data":[{"object":"embedding","embedding":[0.1,0.2]},{"object":"embedding","embedding":[0.3,0.4]}]}"#;
+        assert_eq!(
+            decode_embeddings_response(raw, 2, 2).unwrap(),
+            vec![vec![0.1, 0.2], vec![0.3, 0.4]],
+        );
+    }
+
+    #[test]
+    fn preserves_indexed_embedding_order_and_rejects_mixed_indexes() {
+        let indexed =
+            br#"{"data":[{"index":1,"embedding":[0.3,0.4]},{"index":0,"embedding":[0.1,0.2]}]}"#;
+        assert_eq!(
+            decode_embeddings_response(indexed, 2, 2).unwrap(),
+            vec![vec![0.1, 0.2], vec![0.3, 0.4]],
+        );
+
+        let mixed = br#"{"data":[{"index":0,"embedding":[0.1,0.2]},{"embedding":[0.3,0.4]}]}"#;
+        assert!(matches!(
+            decode_embeddings_response(mixed, 2, 2),
+            Err(EmbeddingError::BadJson)
+        ));
+
+        let explicit_null = br#"{"data":[{"index":null,"embedding":[0.1,0.2]}]}"#;
+        assert!(matches!(
+            decode_embeddings_response(explicit_null, 1, 2),
+            Err(EmbeddingError::BadJson)
+        ));
+    }
+
+    #[test]
+    fn rejects_values_that_overflow_f32() {
+        let raw = br#"{"data":[{"embedding":[1e39]}]}"#;
+        assert!(matches!(
+            decode_embeddings_response(raw, 1, 1),
+            Err(EmbeddingError::BadVector)
+        ));
+    }
+
+    #[test]
+    fn bounded_body_append_rejects_oversized_chunks_without_appending_them() {
+        let mut body = vec![1, 2, 3];
+        assert!(append_bounded(&mut body, &[4, 5], 4).is_err());
+        assert_eq!(body, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn safe_error_codes_preserve_http_class_without_sensitive_details() {
+        assert_eq!(
+            EmbeddingError::HttpStatus(401).safe_error_code(),
+            "EMBED_HTTP_401"
+        );
+        assert_eq!(
+            EmbeddingError::RateLimited.safe_error_code(),
+            "EMBED_HTTP_429"
+        );
+        assert_eq!(
+            EmbeddingError::Transport.safe_error_code(),
+            "EMBED_TRANSPORT"
+        );
+        assert_eq!(
+            EmbeddingError::Transport.to_string(),
+            "embedding 端点传输失败"
+        );
     }
 }
 
@@ -252,13 +437,15 @@ impl RerankClient {
         if !status.is_success() {
             return Err(format!("rerank 端点返回 {status}"));
         }
-        let raw = resp
-            .bytes()
+        let raw = read_bounded_response(resp)
             .await
-            .map_err(|e| format!("读取 rerank 响应失败: {e}"))?;
-        if raw.len() > MAX_RESPONSE_BYTES {
-            return Err(format!("rerank 响应超过 {MAX_RESPONSE_BYTES} 字节上限"));
-        }
+            .map_err(|error| match error {
+                BoundedReadError::Timeout => "rerank 响应读取超时".to_string(),
+                BoundedReadError::Transport => "读取 rerank 响应失败".to_string(),
+                BoundedReadError::TooLarge => {
+                    format!("rerank 响应超过 {MAX_RESPONSE_BYTES} 字节上限")
+                }
+            })?;
         let parsed: RerankResponse =
             serde_json::from_slice(&raw).map_err(|e| format!("rerank 响应解析失败: {e}"))?;
         let mut out: Vec<(usize, f64)> = parsed

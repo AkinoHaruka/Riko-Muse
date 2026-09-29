@@ -21,7 +21,8 @@ migrations_dir = "migrations"
 # embedding_model = "bge-m3"
 # embedding_key_file = "secrets/embedding.key"
 # embedding_dimensions = 1024            # 预期维度；响应维度不符即失败
-# embedding_timeout_secs = 30            # 实时 query embedding 另受 800ms 总预算约束
+# embedding_timeout_secs = 30            # provider 请求保护超时；查询不另设延迟预算
+# semantic_min_similarity = 0.3           # 在线向量候选余弦下限（含边界，范围 0..1）
 # reranker 须单独配置专用 rerank 端点（Jina/Cohere 兼容形状）；不配则保留 RRF 顺序。
 # rerank_endpoint = "https://api.example.com/v1/rerank"
 # rerank_model = "bge-reranker-v2-m3"

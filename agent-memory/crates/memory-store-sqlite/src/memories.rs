@@ -207,6 +207,19 @@ impl Store {
         keep: bool,
     ) -> Result<(), StoreError> {
         let tx = self.conn_mut().transaction()?;
+        Self::reindex_memory_in_tx(&tx, scope, memory_id, claim, keep)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 在已有业务事务内同步维护 FTS/grams，供需要与业务状态原子提交的路径使用。
+    pub(crate) fn reindex_memory_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        scope: &ScopeKey,
+        memory_id: &str,
+        claim: &str,
+        keep: bool,
+    ) -> Result<(), StoreError> {
         tx.execute(
             "DELETE FROM memory_fts WHERE memory_id=?1",
             params![memory_id],
@@ -228,7 +241,6 @@ impl Store {
             }
         }
         Self::clear_index_dirty(&tx)?;
-        tx.commit()?;
         Ok(())
     }
 
