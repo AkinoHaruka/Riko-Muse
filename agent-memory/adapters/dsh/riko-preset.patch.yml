@@ -71,9 +71,3 @@
               contextBundleEnabled: true
               requireContextBundle: false
               agentName: riko
-    - id: riko-app-api
-      name: '@agent-memory/dsh-adapter/mobile-api'
-      disabled: !!js "!(process.env.RIKO_APP_API_TOKEN_FILE && process.env.RIKO_APP_SESSION_REGISTRY_FILE)"
-      config:
-        apiTokenFile: !!js process.env.RIKO_APP_API_TOKEN_FILE
-        sessionRegistryFile: !!js process.env.RIKO_APP_SESSION_REGISTRY_FILE

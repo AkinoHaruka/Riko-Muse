@@ -26,32 +26,12 @@ The default memory service address is `http://127.0.0.1:8791`. If the service us
 
 The token file must remain outside Git and outside the plugin package. Do not put token contents in the profile patch or environment variable; only the token file path is configured.
 
-## Riko-App connection
+## Riko-App API Bridge
 
-The bundle also inserts a host-level `riko-app-api` route plugin. It is enabled only when both DSH environment variables below are set:
-
-| Variable | Value |
-|---|---|
-| `RIKO_APP_API_TOKEN_FILE` | Absolute path to a random, app-only bearer token file. Keep it outside Git and the plugin package. |
-| `RIKO_APP_SESSION_REGISTRY_FILE` | Absolute path to the bridge's persistent Riko-App session registry file. |
-
-Riko-App uses `https://riko.asia/riko-app-api/v1` by default; the URL remains editable in App settings for development or a later domain change. Put the DSH listener behind the existing HTTPS reverse proxy and route only `/riko-app-api/` to it, preserving the full URI prefix. Keep DSH bound to loopback. The bridge token is separate from provider API keys, is stored encrypted by Android Keystore in the App, and only authorizes sessions created through this bridge.
-
-The bridge maps its versioned HTTP API to DSH `SessionController` operations. New sessions are pinned to preset `riko`; the mobile session registry prevents the App from addressing unrelated DSH sessions. Provider credentials remain on the DSH host. This route has its own bearer authentication; it does not reuse DSH's browser launch token or browser cookie.
-
-The same bridge exposes DSH-backed model settings for the Android Settings screen:
-
-- `GET /model-settings` returns provider profiles, DSH settings revision, and credential configured/not-configured flags. It never returns credential values.
-- `POST /model-settings/discover` asks DSH `llm.discoverModels` to list models for a configured provider endpoint.
-- `POST|DELETE /model-settings/providers/{id}/credential` writes or removes a provider credential in DSH's credential store. The Android app submits a key once; it is not saved in the app or logged by the bridge.
-- `POST /model-settings/custom-providers` and `PUT|DELETE /model-settings/custom-providers/{id}` create, edit, or remove a custom OpenAI/Anthropic-compatible DSH provider profile and its separately stored credential.
-
-This feature depends on the updated Bridge package being installed and active on the DSH host. Building the Android app or passing the local bridge tests does not update the production Bridge.
-
-Generate a token on the DSH host, save it in the configured token file with owner-only permissions, and enter the same token once in Riko-App settings. The bridge exposes connection health, model catalog and selection, Riko-App session list/create/history, prompt submission, live event stream, and cancellation. History defaults to 20 messages, allows up to 50 per page, and supports older-page cursors. Model selection is session-local for the selected Agent, while DSH also asynchronously attempts to save it as the instance default for future sessions. The live stream preserves DSH bridge event names so errors can be surfaced to the App. Do not expose DSH's raw HTTP listener directly to the public network.
+The Android app's HTTP bridge is a separate DSH bundle in the repository's `riko-app-api/` directory. Install it independently from this memory adapter. It owns the `/riko-app-api/v1` routes, model settings proxy, app-only bearer token, and Riko-App session registry. See `../../../riko-app-api/README.md` for installation and configuration. Installing this memory bundle alone does not install or activate the Bridge.
 
 ## Package contents
 
-`riko-preset.patch.yml` inserts a new `preset-riko` declaration using the current upstream Minimal composition as its base, then appends the adapter row. It does not patch `preset-minimal`. The adapter module is loaded from `./dist/index.js` relative to the patch file. `dist/` is included so Git-subdirectory installation does not need to compile TypeScript or access this repository's local DSH checkout.
+`riko-preset.patch.yml` inserts a new `preset-riko` declaration using the current upstream Minimal composition as its base, then appends the memory adapter row. It does not patch `preset-minimal`. The adapter module is loaded from `./dist/index.js` relative to the patch file. `dist/` is included so Git-subdirectory installation does not need to compile TypeScript or access this repository's local DSH checkout.
 
 The package API and peer-version range are checked against DSH `0.2.0-rc.1`, source commit `4878cdabd87d4041bdaff61d04c966883b9fd07a`. DSH's package manager checks `@deepseek-ai/dsh-*` peer ranges during bundle installation and composition; this package declares the matching `0.2.0-rc.1` range. The preset composition is also compared with the current upstream Minimal patch so its Riko layer stays compatible without changing Minimal.

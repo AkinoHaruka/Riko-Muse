@@ -1,0 +1,37 @@
+{
+  "name": "@riko/riko-app-api",
+  "version": "0.1.1",
+  "description": "Riko App HTTP bridge plugin for DeepSeek Harness",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AkinoHaruka/Riko-Memory.git",
+    "directory": "riko-app-api"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "riko-app-api.patch.yml", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test \"tests/*.test.mjs\""
+  },
+  "license": "Apache-2.0",
+  "dsh": { "bundle": { "patch": "./riko-app-api.patch.yml" } },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-api-session-controller": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-host-webserver": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "^0.2.0-rc.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-llm-pi-ai": "^0.2.0-rc.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

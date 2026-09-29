@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { apply } from "../dist/mobile-api.js";
+import { apply } from "../dist/index.js";
 
 const bridgeToken = "riko-mobile-bridge-test-token-0123456789";
 

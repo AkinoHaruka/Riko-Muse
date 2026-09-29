@@ -1,7 +1,7 @@
 {
   "name": "@agent-memory/dsh-adapter",
-  "version": "0.5.1",
-  "description": "Riko Memory 的 DSH Riko preset bundle 与宿主适配器",
+  "version": "0.5.2",
+  "description": "Riko Memory 的 DSH Riko preset bundle 与记忆宿主适配器",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AkinoHaruka/Riko-Memory.git",
@@ -13,10 +13,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    },
-    "./mobile-api": {
-      "types": "./dist/mobile-api.d.ts",
-      "default": "./dist/mobile-api.js"
     }
   },
   "files": [
@@ -42,9 +38,7 @@
     "@deepseek-ai/dsh-llm-pi-ai": "^0.2.0-rc.1",
     "@deepseek-ai/dsh-session": "^0.2.0-rc.1",
     "@deepseek-ai/dsh-tools": "^0.2.0-rc.1",
-    "@deepseek-ai/dsh-subagent": "^0.2.0-rc.1",
-    "@deepseek-ai/dsh-host-webserver": "^0.2.0-rc.1",
-    "@deepseek-ai/dsh-api-session-controller": "^0.2.0-rc.1"
+    "@deepseek-ai/dsh-subagent": "^0.2.0-rc.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
