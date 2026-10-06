@@ -99,12 +99,15 @@ pub enum StoreError {
     InvalidDomainId,
     #[error("会话已绑定到其他域，拒绝静默改绑")]
     DomainBindingConflict,
+    #[error("修复行动不合法（行动与期望行为各至少 4 个字符，且必须具体到可观察行为）")]
+    InvalidRepairAction,
     #[error("时间溢出: {0}")]
     Time(String),
 }
 
 pub mod adjudication;
 pub mod alignment;
+pub mod background;
 pub mod consolidation_jobs;
 #[cfg(test)]
 mod d65_tests;
@@ -134,6 +137,8 @@ pub mod relationships;
 pub mod resident;
 pub mod semantic_index;
 pub mod soul;
+#[cfg(test)]
+mod v2_background_tests;
 #[cfg(test)]
 mod v2_d1_tests;
 #[cfg(test)]

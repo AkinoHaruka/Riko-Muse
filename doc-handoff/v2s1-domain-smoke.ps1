@@ -155,6 +155,26 @@ $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 Write-Output ("D1_COMPACT_MAIN_AFTER_GRANT=" + $r.status + " item_count=" + (($r.body | ConvertFrom-Json).item_count))
 
+# V2-B1/A1：后台闭环（doc7/08 §5）。本段不触发任何模型调用。
+$r = Call 'GET' "$b/v1/tasks/due" $null 'side_a'
+$due1 = $r.body | ConvertFrom-Json
+Write-Output ("B1_DUE_BEFORE=" + $r.status + " upkeep=" + $due1.tasks.upkeep.due + "/" + $due1.tasks.upkeep.reason + " quiet=" + $due1.tasks.quiet.due + "/" + $due1.tasks.quiet.reason + " nightly=" + $due1.tasks.nightly.due + "/" + $due1.tasks.nightly.reason)
+$r = Call 'POST' "$b/v1/tasks/run" @{ task_kind='upkeep'; outcome='ok'; signal_count=1 } 'side_a'
+Write-Output ("B1_TASK_RUN=" + $r.status + " " + $r.body)
+$r = Call 'POST' "$b/v1/tasks/run" @{ task_kind='bogus'; outcome='ok' } 'side_a'
+Write-Output ("B1_TASK_RUN_BAD_KIND=" + $r.status + " " + $r.body)
+$r = Call 'GET' "$b/v1/tasks/due" $null 'side_a'
+$due2 = $r.body | ConvertFrom-Json
+Write-Output ("B1_DUE_AFTER_RUN=" + $r.status + " upkeep=" + $due2.tasks.upkeep.due + "/" + $due2.tasks.upkeep.reason)
+$r = Call 'GET' "$b/v1/repair/actions" $null $null
+Write-Output ("B1_ACTIONS_EMPTY=" + $r.status + " count=" + (($r.body | ConvertFrom-Json).count))
+$r = Call 'POST' "$b/v1/repair/actions" @{ thread_id='no-such'; action='注意'; expected_behavior='小心'; proposed_by='model' } $null
+Write-Output ("B1_PROPOSE_VAGUE=" + $r.status + " " + $r.body)
+$r = Call 'POST' "$b/v1/repair/actions" @{ thread_id='no-such'; action='先复述用户给的时间再回复'; expected_behavior='回复里引用用户原话的时间点'; proposed_by='model' } $null
+Write-Output ("B1_PROPOSE_BAD_THREAD=" + $r.status + " " + $r.body)
+$r = Call 'POST' "$b/v1/repair/actions/no-such/activate" @{ } $null
+Write-Output ("B1_ACTIVATE_NO_AUTH=" + $r.status + " " + $r.body)
+
 # V2-R1：关系图谱（doc7/07 §5）
 $r = Call 'POST' "$b/v1/evidence/events" @{
   origin = @{ host_id='dsh'; agent_id='a'; session_id='s1' }

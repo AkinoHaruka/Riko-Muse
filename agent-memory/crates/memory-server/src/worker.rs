@@ -125,6 +125,7 @@ mod tests {
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
             domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
         };
         {
             let mut g = store.lock().unwrap();
@@ -261,6 +262,7 @@ mod tests {
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
             domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
         };
         let ev = {
             let mut g = store.lock().unwrap();
@@ -827,6 +829,7 @@ mod tests {
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
             domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
         };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
         for (session, content) in [
@@ -1023,6 +1026,7 @@ mod tests {
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
             domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
         };
         for session in ["s_old", "s_new"] {
             let t = chrono::Utc::now();

@@ -47,6 +47,7 @@
 | 05-V2-P1-精读与explain施工规范.md | V2-P1 统一可见性谓词、`memory_explain` 读模型、`riko://` 稳定引用与验收（不新增迁移） |
 | 06-V2-D1-蒸馏与投影施工规范.md | V2-D1 迁移 0016、`facet_v1`/`compact_v1` 规则、失效与 purge 闭包、只读投影与验收 |
 | 07-V2-R1-关系图谱施工规范.md | V2-R1 迁移 0017、`entity_v1` 投影规则（两种句式与拒绝规则）、索引/get/resolve、政策边界与验收 |
+| 08-V2-B1A1-后台闭环与修复行动施工规范.md | V2-B1/A1 迁移 0018、处理账本、调度纯函数与独立开关、`rupture_v2` 分类、修复行动授权与验收 |
 
 ## V2 卡登记（2026-10-06，依据 Muse-V2迭代开发文档 00/06）
 
@@ -60,6 +61,6 @@
 | V2-P1 | quote/speaker 多证据读取、explain、stable_ref | **已实施**（规范 05）：统一可见性谓词、`memory_explain`、`riko://` 稳定引用、`GET /v1/memories/{id}/explain`、适配器 `memory_explain` 工具；181 项 Rust 测试 + 19 项适配器测试全绿，临时库 HTTP 冒烟通过。见 [交接 27](../doc-handoff/27-V2-P1精读与explain交付记录.md) |
 | V2-R1 | people/groups 索引、别名解析、详情延迟读取、关系维护任务 | **已实施**（规范 07，迁移 0017 / schema 17）：`entity_v1` 确定性投影、索引/get/resolve 三接口、分级排序、来源失效即时屏蔽、purge 闭包、域隔离；组表建而未启用。203 项测试全绿 + 临时库 HTTP 冒烟。**人物事实完整覆盖仍受 THIRD_PARTY 门限制**，见 [交接 29](../doc-handoff/29-V2-R1关系图谱交付记录.md) |
 | V2-D1 | 四分面蒸馏、compact_memory、只读 Markdown 投影 | **已实施**（规范 06，迁移 0016 / schema 16）：`facet_v1` 确定性分面、compact 双预算与 Resident 去重、来源失效即时屏蔽、purge 闭包、`/v1/compact`+`/v1/facets`+`/v1/derived/refresh`、`memoryd export` 只读投影。191 项测试全绿 + 临时库 HTTP 冒烟。见 [交接 28](../doc-handoff/28-V2-D1蒸馏与投影交付记录.md) |
-| V2-B1/A1 | upkeep/Relationships/nightly 复盘/quiet pass + 复盘→修复行动 | 待施工（V2 文档 08） |
+| V2-B1/A1 | upkeep/Relationships/nightly 复盘/quiet pass + 复盘→修复行动 | **调度与可靠性层已实施**（规范 08，迁移 0018 / schema 18）：处理账本、四项独立开关的纯函数调度判定、Rust 侧信号计数、`rupture_v2` 目标分类、修复行动授权与复发观察。218 项测试全绿 + 临时库 HTTP 冒烟。**内容生成未实现**（需真实模型），见 [交接 30](../doc-handoff/30-V2-B1A1后台闭环交付记录.md) |
 | V2-H1 | DSH bundle 分段 + 工具 + 使用纪律 | 待施工（V2 文档 08） |
 | V2-Q1 | entry 上下文补充、检索质量对照 | 待施工（V2 文档 04/06） |

@@ -4,6 +4,7 @@
 pub mod domains;
 pub mod refs;
 pub mod rupture;
+pub mod schedule;
 
 pub use domains::{DomainScope, USER_MAIN_DOMAIN};
 

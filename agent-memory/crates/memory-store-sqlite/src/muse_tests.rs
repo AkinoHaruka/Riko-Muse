@@ -193,17 +193,31 @@ fn expire_leaves_not_due_memory_active() {
 #[test]
 fn rupture_scan_detects_groups_and_is_idempotent() {
     let (mut store, scope, origin) = setup("rupture-scan");
-    let e1 = ingest_user(&mut store, &scope, &origin, 0, "不对，我说的是十点不是九点");
+    // V2-B1（doc7/08 §3）：只有 agent_correction 会开线，用例测的是归组与幂等，
+    // 因此把内容写成明确指向 Agent 的纠正（V1 时代无此区分）。
+    let e1 = ingest_user(
+        &mut store,
+        &scope,
+        &origin,
+        0,
+        "不对，你记错了，我说的是十点不是九点",
+    );
     let _e2 = ingest_user(&mut store, &scope, &origin, 1, "好的，我明白了");
-    let _e3 = ingest_user(&mut store, &scope, &origin, 2, "你又这样，别这样了。");
-    // 同一事件多信号：e1 命中 correction（"不对"，同信号取最早）；
-    // e3 命中 recurrence + boundary 两个信号。
+    let _e3 = ingest_user(
+        &mut store,
+        &scope,
+        &origin,
+        2,
+        "你又这样，不要再这样了，你弄错了。",
+    );
+    // 同一事件多信号：e1 命中 correction（"不对" 与 "你记错了" 同信号，取最早）；
+    // e3 命中 recurrence + boundary + correction 三个信号。
 
     let out = store
         .rupture_scan(&scope, &memory_domain::DomainScope::user_main())
         .unwrap();
     assert_eq!(out.scanned_events, 3);
-    assert_eq!(out.inserted_ruptures, 3, "e1×1 + e3×2");
+    assert_eq!(out.inserted_ruptures, 4, "e1×1 + e3×3");
     assert_eq!(out.opened_threads, 1, "同一窗口内全部归入一个线程");
 
     // 幂等：重扫不新增（游标已推进 + 唯一键兜底）。
@@ -216,7 +230,7 @@ fn rupture_scan_detects_groups_and_is_idempotent() {
     let ruptures = store
         .ruptures_list(&scope, 50, &memory_domain::DomainScope::user_main())
         .unwrap();
-    assert_eq!(ruptures.len(), 3);
+    assert_eq!(ruptures.len(), 4);
     let thread_ids: std::collections::HashSet<_> = ruptures
         .iter()
         .map(|r| r.thread_id.clone().unwrap())
@@ -231,7 +245,7 @@ fn rupture_scan_detects_groups_and_is_idempotent() {
         )
         .unwrap();
     assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0].rupture_count, 3);
+    assert_eq!(threads[0].rupture_count, 4);
     assert_eq!(threads[0].status, "open");
     let _ = e1;
 }
@@ -240,7 +254,13 @@ fn rupture_scan_detects_groups_and_is_idempotent() {
 fn rupture_regroup_window_opens_new_thread_after_seven_days() {
     let (mut store, scope, origin) = setup("rupture-regroup");
     // 30 天前的一次纠正。
-    let old = ingest_user(&mut store, &scope, &origin, 0, "不对，这不是我要的");
+    let old = ingest_user(
+        &mut store,
+        &scope,
+        &origin,
+        0,
+        "不对，你理解错了，这不是我要的",
+    );
     set_received_at(&store, &scope, &old, &days_ago(30));
     store
         .rupture_scan(&scope, &memory_domain::DomainScope::user_main())
@@ -265,7 +285,7 @@ fn rupture_regroup_window_opens_new_thread_after_seven_days() {
 #[test]
 fn repair_thread_close_is_explicit_and_idempotent() {
     let (mut store, scope, origin) = setup("thread-close");
-    let _ = ingest_user(&mut store, &scope, &origin, 0, "不对，别这样回复");
+    let _ = ingest_user(&mut store, &scope, &origin, 0, "不对，你不要再这样回复了");
     store
         .rupture_scan(&scope, &memory_domain::DomainScope::user_main())
         .unwrap();
@@ -327,7 +347,8 @@ fn repair_thread_close_is_explicit_and_idempotent() {
 #[test]
 fn synthesis_metrics_and_regenerate_policy() {
     let (mut store, scope, origin) = setup("synthesis");
-    let _ = ingest_user(&mut store, &scope, &origin, 0, "不对，顺序反了");
+    // 明确指向 Agent 的纠正（V2 起只有 agent_correction 开线）。
+    let _ = ingest_user(&mut store, &scope, &origin, 0, "不对，你弄错了，顺序反了");
     for seq in 1..4 {
         let _ = ingest_user(&mut store, &scope, &origin, seq, "这条先记着");
     }

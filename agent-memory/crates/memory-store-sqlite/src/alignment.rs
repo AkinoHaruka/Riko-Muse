@@ -8,7 +8,7 @@
 //! rupture 的 detected_at 取事件 `received_at`（服务端可观测的发生时刻），
 //! RFC3339 固定微秒格式下字典序即时间序。
 
-use memory_domain::rupture::rupture_matches;
+use memory_domain::rupture::{rupture_matches_v2, RuptureTarget, DETECTOR_VERSION_V2};
 use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 
@@ -224,28 +224,45 @@ impl Store {
             if !dom.allows_read(&event_domain) {
                 continue;
             }
-            let matches = rupture_matches(&content);
+            // V2-B1（doc7/08 §3）：rupture_v2 逐条分类。只有 agent_correction 会开线/
+            // 强化线程；其余 target 仍然落库留痕（不丢证据，也不误报）。
+            let matches = rupture_matches_v2(&content);
             if matches.is_empty() {
                 continue;
             }
+            let agent_matches: Vec<_> = matches
+                .iter()
+                .filter(|m| m.target == RuptureTarget::AgentCorrection)
+                .collect();
             let detected_at: String = tx.query_row(
                 "SELECT received_at FROM evidence_events
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, evidence_id],
                 |r| r.get(0),
             )?;
-            let (thread_id, opened) =
-                assign_thread_tx(&tx, scope, &content, &detected_at, &now, &event_domain)?;
-            if opened {
-                outcome.opened_threads += 1;
-            }
-            touched_threads.insert(thread_id.clone());
+            let thread_id: Option<String> = if agent_matches.is_empty() {
+                None
+            } else {
+                let (thread_id, opened) =
+                    assign_thread_tx(&tx, scope, &content, &detected_at, &now, &event_domain)?;
+                if opened {
+                    outcome.opened_threads += 1;
+                }
+                touched_threads.insert(thread_id.clone());
+                Some(thread_id)
+            };
             for m in matches {
+                // 非 agent_correction 的事件也落库，但不挂线程（doc7/08 §3）。
+                let m_thread = match m.target {
+                    RuptureTarget::AgentCorrection => thread_id.clone(),
+                    _ => None,
+                };
                 let n = tx.execute(
                     "INSERT OR IGNORE INTO rupture_events
                      (id, tenant_id, user_id, evidence_id, host_id, session_id, event_seq,
-                      signal, cue, start_byte, end_byte, thread_id, detected_at, domain_id)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                      signal, cue, start_byte, end_byte, thread_id, detected_at, domain_id,
+                      target, detector_version)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     params![
                         uuid::Uuid::now_v7().to_string(),
                         scope.tenant_id,
@@ -258,9 +275,11 @@ impl Store {
                         m.cue,
                         m.start_byte as i64,
                         m.end_byte as i64,
-                        thread_id,
+                        m_thread,
                         detected_at,
-                        event_domain
+                        event_domain,
+                        m.target.as_str(),
+                        DETECTOR_VERSION_V2
                     ],
                 )?;
                 if n > 0 {

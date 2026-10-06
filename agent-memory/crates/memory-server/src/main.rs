@@ -76,6 +76,11 @@ enum Commands {
         #[command(subcommand)]
         action: DerivedAction,
     },
+    /// V2-B1 后台调度（doc7/08 §5）：只回答「该不该跑」，不触发任何调用
+    Tasks {
+        #[command(subcommand)]
+        action: TasksAction,
+    },
     /// V2-R1 关系图谱（doc7/07 §5）：重建实体/别名/分节条目
     Relationships {
         #[command(subcommand)]
@@ -264,6 +269,21 @@ enum JobAction {
         /// 运维原因 1—256 字符；不得填用户正文或密钥（写入审计）
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TasksAction {
+    /// 打印四项任务的 due 判定与依据（只读）
+    Due {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
 }
 
@@ -676,6 +696,56 @@ struct Config {
     /// 行为与 schema 14 一致；启用后管理端点才可用、域头才生效。
     #[serde(default)]
     domains: DomainsConfig,
+
+    /// V2-B1 后台调度（缺省与 doc7/08 §1 的初始参数一致）。
+    #[serde(default)]
+    schedule: ScheduleSection,
+}
+
+/// V2-B1 后台调度开关（doc7/08 §1、§2）。四项**互相独立**：
+/// 关掉一个不得改变其它任务已批准的判定语义。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ScheduleSection {
+    upkeep_enabled: bool,
+    relationships_enabled: bool,
+    quiet_enabled: bool,
+    nightly_enabled: bool,
+    upkeep_interval_secs: i64,
+    relationships_interval_secs: i64,
+    quiet_idle_secs: i64,
+    quiet_max_per_day: i64,
+}
+
+impl Default for ScheduleSection {
+    fn default() -> Self {
+        let d = memory_domain::schedule::ScheduleConfig::default();
+        ScheduleSection {
+            upkeep_enabled: d.upkeep_enabled,
+            relationships_enabled: d.relationships_enabled,
+            quiet_enabled: d.quiet_enabled,
+            nightly_enabled: d.nightly_enabled,
+            upkeep_interval_secs: d.upkeep_interval_secs,
+            relationships_interval_secs: d.relationships_interval_secs,
+            quiet_idle_secs: d.quiet_idle_secs,
+            quiet_max_per_day: d.quiet_max_per_day,
+        }
+    }
+}
+
+impl ScheduleSection {
+    fn to_config(&self) -> memory_domain::schedule::ScheduleConfig {
+        memory_domain::schedule::ScheduleConfig {
+            upkeep_enabled: self.upkeep_enabled,
+            relationships_enabled: self.relationships_enabled,
+            quiet_enabled: self.quiet_enabled,
+            nightly_enabled: self.nightly_enabled,
+            upkeep_interval_secs: self.upkeep_interval_secs.max(1),
+            relationships_interval_secs: self.relationships_interval_secs.max(1),
+            quiet_idle_secs: self.quiet_idle_secs.max(1),
+            quiet_max_per_day: self.quiet_max_per_day.max(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -745,6 +815,8 @@ struct AppState {
     recency_mode: &'static str,
     /// V2-S1：记忆域总开关（doc7/04 §2.1）。false 时域头与管理端点全部不生效。
     domains_enabled: bool,
+    /// V2-B1：后台调度参数与四项独立开关。
+    schedule: memory_domain::schedule::ScheduleConfig,
 }
 
 #[tokio::main]
@@ -837,6 +909,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => memory_contract::RECENCY_MODE_DEFAULT,
                 },
                 domains_enabled: cfg.domains.enabled,
+                schedule: cfg.schedule.to_config(),
             };
             // 提取 worker：模型配置齐全才启动；端点不可达时作业可见失败，不影响手工记忆（doc/09）。
             let model_cfg = match (&cfg.model_endpoint, &cfg.model_name, &cfg.model_key_file) {
@@ -1049,6 +1122,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/relationships/resolve", get(resolve_relationship))
                 .route("/v1/relationships/refresh", post(refresh_relationships))
                 .route("/v1/relationships/{entity_id}", get(get_relationship))
+                // V2-B1/A1（doc7/08 §5）：后台调度判定、任务回执与修复行动。
+                .route("/v1/tasks/due", get(tasks_due))
+                .route("/v1/tasks/run", post(tasks_run))
+                .route(
+                    "/v1/repair/actions",
+                    get(list_repair_actions).post(propose_repair_action),
+                )
+                .route(
+                    "/v1/repair/actions/{action_id}/activate",
+                    post(activate_repair_action),
+                )
+                .route(
+                    "/v1/repair/actions/{action_id}/close",
+                    post(close_repair_action),
+                )
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -1127,6 +1215,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+        Commands::Tasks { action } => match action {
+            TasksAction::Due {
+                config,
+                tenant,
+                user,
+                domain,
+            } => {
+                let cfg = Config::load(&config)?;
+                let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+                let scope = ScopeKey {
+                    tenant_id: tenant,
+                    user_id: user,
+                };
+                let dom = cli_domain_scope(&store, &scope, &domain)?;
+                let report = store
+                    .background_due(&scope, &dom, &cfg.schedule.to_config())
+                    .map_err(|e| e.to_string())?;
+                for (name, t) in [
+                    ("upkeep", &report.upkeep),
+                    ("relationships", &report.relationships),
+                    ("nightly", &report.nightly),
+                    ("quiet", &report.quiet),
+                ] {
+                    println!(
+                        "{name:<14} due={:<5} reason={:<20} unprocessed={}",
+                        t.due, t.reason, t.unprocessed
+                    );
+                }
+                Ok(())
+            }
+        },
         Commands::Relationships { action } => match action {
             RelationshipsAction::Refresh {
                 config,
@@ -3872,6 +3991,364 @@ fn entity_entry_json(
         "updated_at": e.updated_at,
         "detail_ref": e.detail_ref,
     })
+}
+
+// ---- V2-B1/A1 后台闭环端点（doc7/08 §5）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskRunRequest {
+    task_kind: String,
+    outcome: String,
+    #[serde(default)]
+    signal_count: i64,
+    #[serde(default)]
+    detail: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairActionRequest {
+    thread_id: String,
+    action: String,
+    expected_behavior: String,
+    #[serde(default)]
+    conditions: String,
+    #[serde(default)]
+    counterexamples: String,
+    /// model | user | cli。**模型只能 propose**。
+    proposed_by: String,
+    #[serde(default)]
+    source_memory_id: Option<String>,
+    #[serde(default)]
+    generator_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizeRequest {
+    #[serde(default)]
+    authorized_by: Option<String>,
+    #[serde(default)]
+    close_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairActionsQuery {
+    #[serde(default)]
+    thread_id: Option<String>,
+}
+
+async fn tasks_due(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    // 只读：只回答「该不该跑」，不入队、不调用模型。
+    match guard.background_due(&scope, &dom, &state.schedule) {
+        Ok(report) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "domain_id": report.domain_id,
+            "now": report.now,
+            "tasks": {
+                "upkeep": {"due": report.upkeep.due, "reason": report.upkeep.reason, "unprocessed": report.upkeep.unprocessed},
+                "relationships": {"due": report.relationships.due, "reason": report.relationships.reason, "unprocessed": report.relationships.unprocessed},
+                "nightly": {"due": report.nightly.due, "reason": report.nightly.reason},
+                "quiet": {"due": report.quiet.due, "reason": report.quiet.reason, "unprocessed": report.quiet.unprocessed},
+            },
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("调度判定失败: {e}"),
+        ),
+    }
+}
+
+async fn tasks_run(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    body: Result<Json<TaskRunRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.task_run_record(
+        &scope,
+        &dom,
+        &body.task_kind,
+        &body.outcome,
+        body.signal_count,
+        &body.detail,
+    ) {
+        Ok(id) => Json(serde_json::json!({"request_id": req_id.0, "status": "ok", "run_id": id}))
+            .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            &format!("任务回执被拒: {e}"),
+        ),
+    }
+}
+
+async fn list_repair_actions(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<RepairActionsQuery>,
+) -> Response {
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.repair_action_list(&scope, query.thread_id.as_deref()) {
+        Ok(list) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "count": list.len(),
+            "actions": list,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取修复行动失败: {e}"),
+        ),
+    }
+}
+
+async fn propose_repair_action(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<RepairActionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    // 模型只能提议：想直接写 active 一律拒绝。
+    if body.proposed_by != "model" && body.proposed_by != "user" && body.proposed_by != "cli" {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "proposed_by 必须是 model|user|cli",
+        );
+    }
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let req = memory_store_sqlite::background::ProposeAction {
+        thread_id: &body.thread_id,
+        action: &body.action,
+        expected_behavior: &body.expected_behavior,
+        conditions: &body.conditions,
+        counterexamples: &body.counterexamples,
+        proposed_by: &body.proposed_by,
+        source_memory_id: body.source_memory_id.as_deref(),
+        generator_version: body.generator_version.as_deref(),
+    };
+    match guard.repair_action_propose(&scope, &req) {
+        Ok(id) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "status": "proposed",
+            "action_id": id,
+        }))
+        .into_response(),
+        Err(memory_store_sqlite::StoreError::ThreadNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "修复线程不存在",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            &format!("提议被拒: {e}"),
+        ),
+    }
+}
+
+async fn activate_repair_action(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(action_id): AxumPath<String>,
+    body: Result<Json<AuthorizeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let Some(by) = body
+        .authorized_by
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "激活必须提供 authorized_by",
+        );
+    };
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.repair_action_activate(&scope, &action_id, by) {
+        Ok(true) => {
+            Json(serde_json::json!({"request_id": req_id.0, "status": "active"})).into_response()
+        }
+        Ok(false) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "行动不存在或不是 proposed 状态",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            &format!("激活被拒: {e}"),
+        ),
+    }
+}
+
+async fn close_repair_action(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(action_id): AxumPath<String>,
+    body: Result<Json<AuthorizeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let reason = body.close_reason.as_deref().unwrap_or("");
+    let by = body.authorized_by.as_deref().unwrap_or("user");
+    // 关闭必须有显式理由：「久未复发」这类自动理由不接受（doc7/08 §4）。
+    if reason.trim().chars().count() < 2 {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "关闭必须提供具体 close_reason（单纯没有新纠正不构成修复证据）",
+        );
+    }
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.repair_action_close(&scope, &action_id, reason, by) {
+        Ok(true) => {
+            Json(serde_json::json!({"request_id": req_id.0, "status": "done"})).into_response()
+        }
+        Ok(false) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "行动不存在或不是 active 状态",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            &format!("关闭被拒: {e}"),
+        ),
+    }
 }
 
 async fn list_relationships(
@@ -9579,6 +10056,7 @@ enabled = false
             semantic_min_similarity: super::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "linear",
             domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
         };
         let response = dream_runner_claim(
             State(state.clone()),

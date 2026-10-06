@@ -71,8 +71,8 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
             r.get(0)
         })
         .unwrap();
-    // 按迁移纪律随新增迁移同步：0017（doc7/07 V2-R1 关系图谱）起为 17。
-    assert_eq!(applied, 17);
+    // 按迁移纪律随新增迁移同步：0018（doc7/08 V2-B1/A1 后台闭环）起为 18。
+    assert_eq!(applied, 18);
     assert_eq!(
         store
             .dream_live_runner_count("9999-01-01T00:00:00Z")
