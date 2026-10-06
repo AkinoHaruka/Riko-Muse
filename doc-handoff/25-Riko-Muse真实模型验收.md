@@ -138,3 +138,45 @@ precision 3/4，recall 3/4。两个错误方向各有一个具体例子，方向
 - 模型调用：OpenRouter 9 次（全部 401，未产生 token）+ Gemini 4 次（全 200）。
 - 临时 key/令牌/库文件验收后删除；本文档无凭据。
 
+## 9. 第三轮：extract_v4 rewrite 验收（2026-10-06，验收指标达成）
+
+依据 `Muse文档/13-附录D-改写步骤规范.md` 实施 extract_v4（规范 [doc7/03](../doc7/03-extract_v4-rewrite.md)），
+同语料、同模型（Gemini 3.5 Flash Lite）对比 v3 基线（0/14 active）。
+
+### 9.1 验收指标（D.7-3）：active 0 → **7**
+
+6 次模型调用（3 extract + 3 rewrite），全部首次成功。7 条 active 记忆（v4 改写句为正文）：
+
+- 用户喜欢喝百事，办公室囤了一箱百事
+- 用户投资时一般采用左侧分批策略，跌 10% 买一点，越跌越买
+- **用户不喜欢被推销"抄底"话术**（instruction，NOT_EXPLICIT→改写后显式）
+- 用户持仓里除了百事还有腾讯和小麦期货
+- **用户在2026年10月前后在玩《星穹铁道》**（TEMPORAL→按 occurred_at 归位）
+- 用户玩《星穹铁道》的时间是每天晚上8点到11点
+- 用户在《星穹铁道》中只清模拟宇宙周常，别的不碰
+
+7 条 held 全部正确：第三人（我妈/老王）不被改写、准入门拦截；"最近"未归位的候选保持
+TEMPORAL；临时请求（季度汇报提醒）不硬改。**内容政策门零放水。**
+
+### 9.2 端到端
+
+- 检索"想买百事可乐" → 2 条改写记忆命中（FTS/grams 索引改用 claim 正文，见 §9.3）。
+- compose `include_alignment` → alignment 块 + 改写记忆同轮注入（既有形态不变）。
+- 审计：每作业 1 行 `extraction_rewrite`（actor=system/extract-worker），含
+  quote/claims/confidence/rewrite_notes（D.6 达成）。
+
+### 9.3 实施中发现并修复的两个缺陷（都在本轮验收暴露）
+
+1. **promote 路径 claim 未跟随改写**：memories INSERT 仍写 quote（候选表正确、
+   记忆表错误）。修复：claim/normalized_claim/revision 统一用改写后的 `claim_text`。
+2. **索引文本未跟随**：promote 的 FTS/grams 索引用 quote。修复：改用 `claim_text`
+   （quote 已存 evidence 锚）。两缺陷均为 v4 才能触达的路径（v3 claim==quote 掩盖）。
+
+### 9.4 冻结纪律核对
+
+- extract_v1/v2/v3、admit_v1/v2/v3（Dream）行为未变；新作业默认版本同一提交切换
+  `extract_v4/admit_v4`；`admit_v3` 号段被 Dream 占用故主线跳至 `admit_v4`（doc7/03 §1）。
+- 测试：workspace 156 项全过（新增 v4 dispatch/parse/admit 测试 + 更新版本钉值断言）。
+- 遗留观察：save_candidate 对 held 候选也 mark_index_dirty（最后一条 held 会使 dirty=1
+  残留至 rebuild-index）——既有行为，与本批无关，仅记录。
+

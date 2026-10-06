@@ -19,23 +19,32 @@ pub const SCHEMA_VERSION: u32 = 14;
 /// V1/V2 常量仅为按版本分派历史作业而保留（0002 迁移的列默认值同为 extract_v1）。
 /// doc5/03 §3：v3 Prompt、v2 准入与 worker 分派全部就绪后，新作业默认值在同一
 /// 提交切换为 extract_v3（自该提交起新建作业写 extract_v3）。
+/// doc7/03（Riko-Muse，2026-10-06）：extract_v4 = v3 提取 + rewrite 第二步
+/// （Muse文档/13），解决"逐字提取 × 显式主语准入"的结构矛盾；新作业默认值在同一
+/// 提交切换为 extract_v4；v1/v2/v3 冻结。
 pub const EXTRACT_PROMPT_VERSION_V1: &str = "extract_v1";
 pub const EXTRACT_PROMPT_VERSION_V2: &str = "extract_v2";
-pub const EXTRACT_PROMPT_VERSION: &str = "extract_v3";
 pub const EXTRACT_PROMPT_VERSION_V3: &str = "extract_v3";
+pub const EXTRACT_PROMPT_VERSION_V4: &str = "extract_v4";
+pub const EXTRACT_PROMPT_VERSION: &str = "extract_v4";
 
 /// 准入规则版本（doc5/03 §1）：admission_version 选 Rust 准入及查库提交规则，
 /// 与 prompt_version（只选模型提示词）分工明确。0004 迁移的列默认值为 admit_v1
 /// （历史作业回填）；v3 Prompt 与 v2 准入就绪后，新作业默认值在同一提交切换为
 /// admit_v2，与 EXTRACT_PROMPT_VERSION 的切换同步。
 pub const ADMISSION_VERSION_V1: &str = "admit_v1";
-pub const ADMISSION_VERSION: &str = "admit_v2";
 pub const ADMISSION_VERSION_V2: &str = "admit_v2";
 
 /// D6-8（doc6/09 §3）：新 Dream 作业专用准入/裁决版本；admit_v1/v2 冻结不改。
 pub const ADMISSION_VERSION_V3: &str = "admit_v3";
 pub const ADJUDICATION_VERSION_V1: &str = "adjudicate_v1";
 pub const ADJUDICATION_VERSION_V2: &str = "adjudicate_v2";
+
+/// doc7/03（Riko-Muse）：extract_v4 主线准入——与 admit_v2 同门，但规则 4–11 的
+/// 受检文本为 rewrite 产出的 claim（缺省回落 quote，回落路径与 v2 同判）；
+/// v1/v2/v3 冻结不改。新作业默认值在同一提交随 extract_v4 切换为 admit_v4。
+pub const ADMISSION_VERSION_V4: &str = "admit_v4";
+pub const ADMISSION_VERSION: &str = "admit_v4";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----
 /// 自动上下文默认最多 5 条原子记忆。

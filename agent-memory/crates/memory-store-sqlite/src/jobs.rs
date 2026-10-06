@@ -542,6 +542,31 @@ impl Store {
         Ok(ok)
     }
 
+    /// doc7/03（D.6）：extract_v4 rewrite 全部条目进审计（quote/claims/notes/reason），
+    /// 满足"这条 claim 的主语是哪来的"可追溯；失败仅告警，不阻断候选提交。
+    pub fn record_extraction_rewrite_audit(
+        &self,
+        scope: &ScopeKey,
+        job_id: &str,
+        detail: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let now = now_rfc3339()?;
+        self.conn().execute(
+            "INSERT INTO audit_events
+             (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
+             VALUES (?1,?2,?3,'system','extract-worker','extraction_rewrite',?4,?5,?6)",
+            params![
+                uuid::Uuid::now_v7().to_string(),
+                scope.tenant_id,
+                scope.user_id,
+                job_id,
+                now,
+                detail.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 完成提交（doc4/02 §2/§5）：generation 匹配才生效；影响 0 行返回
     /// `StaleClaim`——旧执行者不得覆盖新执行者，也不能假装成功。
     pub fn complete_job(
@@ -752,6 +777,8 @@ impl Store {
         admission: Admission,
     ) -> Result<CandidateOutcome, StoreError> {
         let quote = fold_whitespace(&c.quote);
+        // doc7/03：extract_v4 rewrite 产出的命题成为记忆正文；quote 保持逐字原文。
+        let claim_text = fold_whitespace(c.claim.as_deref().unwrap_or(&c.quote));
         let quote_hash = hex::encode(sha2::Sha256::digest(quote.as_bytes()));
         let kind = match c.kind.as_str() {
             "fact" => MemoryKind::Fact,
@@ -837,7 +864,7 @@ impl Store {
                 kind.as_str(),
                 c.quote,
                 quote_hash,
-                quote,
+                claim_text,
                 source_class,
                 status,
                 reason_code,
@@ -861,7 +888,7 @@ impl Store {
             },
         };
         if admission == Admission::Active {
-            let claim_hash = claim_sha256(kind, &quote);
+            let claim_hash = claim_sha256(kind, &claim_text);
             // 规则 8a：同 kind+hash 的 active → 仅加证据。
             let existing_active: Option<(String, i64)> = tx
                 .query_row(
@@ -897,7 +924,7 @@ impl Store {
                     };
                 } else {
                     // 规则 9：属性键相同而值不同的 active → held:POSSIBLE_CONFLICT。
-                    if let Some(conflict_id) = Self::attribute_conflict(&tx, scope, kind, &quote)? {
+                    if let Some(conflict_id) = Self::attribute_conflict(&tx, scope, kind, &claim_text)? {
                         let _ = conflict_id;
                         tx.execute(
                             "UPDATE memory_candidates SET status='held', reason_code='POSSIBLE_CONFLICT' WHERE id=?1",
@@ -916,8 +943,9 @@ impl Store {
                               created_at, updated_at)
                              VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11)",
                             params![
-                                memory_id, scope.tenant_id, scope.user_id, kind.as_str(), quote,
-                                normalize_v1(&quote), claim_hash, origin.host_id, origin.agent_id, now, now
+                                memory_id, scope.tenant_id, scope.user_id, kind.as_str(),
+                                claim_text, normalize_v1(&claim_text), claim_hash,
+                                origin.host_id, origin.agent_id, now, now
                             ],
                         )?;
                         tx.execute(
@@ -931,7 +959,7 @@ impl Store {
                               actor_kind, actor_id, reason_code, changed_at)
                              VALUES (?1,?2,?3,1,NULL,?4,NULL,'active','system',?5,?6,?7)",
                             params![
-                                scope.tenant_id, scope.user_id, memory_id, quote, job.id,
+                                scope.tenant_id, scope.user_id, memory_id, claim_text, job.id,
                                 format!("{}:{}", job.prompt_version, job.admission_version),
                                 now
                             ],
@@ -947,9 +975,10 @@ impl Store {
         }
         Self::mark_index_dirty(&tx)?;
         tx.commit()?;
-        // 索引事务（失败保留 dirty）。
+        // 索引事务（失败保留 dirty）。doc7/03：索引内容跟随记忆正文（改写后的
+        // claim_text），quote 已存 evidence 锚，不再作为 FTS/grams 的检索文本。
         if let CandidateOutcome::Active { memory_id } = &outcome {
-            if let Err(e) = self.reindex_memory(scope, memory_id, &quote, true) {
+            if let Err(e) = self.reindex_memory(scope, memory_id, &claim_text, true) {
                 eprintln!("[memoryd] 索引更新失败 memory_id={memory_id}: {e}");
             }
         }
@@ -1739,6 +1768,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
+            claim: None,
         };
         let out = store
             .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
@@ -1756,7 +1786,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(reason, "extract_v3:admit_v2");
+        assert_eq!(reason, "extract_v4:admit_v4");
     }
 
     #[test]
@@ -1793,7 +1823,7 @@ mod tests {
                 occurred_at: None,
                 valid_until: None,
                 confidence: None,
-            };
+            claim: None,};
             store
                 .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
                 .unwrap()
@@ -1865,7 +1895,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        };
+        claim: None,};
         let out1 = store
             .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
             .unwrap();

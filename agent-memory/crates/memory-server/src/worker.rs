@@ -304,7 +304,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        };
+        claim: None,};
         let out1 = g
             .save_candidate(
                 &scope,
@@ -341,7 +341,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        };
+        claim: None,};
         let out2 = g
             .save_candidate(
                 &scope,
@@ -394,7 +394,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        };
+        claim: None,};
         let out1 = g
             .save_candidate(
                 &scope,
@@ -476,7 +476,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        };
+        claim: None,};
         // 旧候选已存在（DUPLICATE_CANDIDATE 先触发也证明未复活）；用新 quote_sha 无法绕过——
         // 直接验证 suppressed_sources 行存在且搜索仍为空。
         let _ = (job2, c2);
@@ -681,7 +681,7 @@ mod tests {
         };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
         for (session, content) in [
-            ("sv3", "以后回答我用中文"),
+            ("sv4", "以后回答我用中文"),
             ("sv1", "以后回答我用中文"),
             ("sv0", "以后回答我用中文"),
             ("sv0b", "以后回答我用中文"),
@@ -722,12 +722,13 @@ mod tests {
         };
         let empty = Arc::new(Mutex::new(String::new()));
 
-        // 当前版本（extract_v3/admit_v2）作业 → v3 提示词，admission_version 为 admit_v2。
-        let job = flush_job(&store, "sv3");
+        // 当前版本（extract_v4/admit_v4）作业 → v4 提示词，admission_version 为 admit_v4。
+        let job = flush_job(&store, "sv4");
         assert_eq!(job.prompt_version, memory_contract::EXTRACT_PROMPT_VERSION);
         assert_eq!(job.admission_version, memory_contract::ADMISSION_VERSION);
-        assert_eq!(job.prompt_version, "extract_v3");
-        assert_eq!(job.admission_version, "admit_v2");
+        // doc7/03：新作业默认版本同提交切换为 extract_v4/admit_v4（v1/v2/v3 冻结）。
+        assert_eq!(job.prompt_version, "extract_v4");
+        assert_eq!(job.admission_version, "admit_v4");
         let sys2 = empty.clone();
         let mock2 = SysCapture {
             system: sys2.clone(),
@@ -738,7 +739,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             *sys2.lock().unwrap(),
-            memory_extract::EXTRACT_SYSTEM_PROMPT_V3
+            memory_extract::EXTRACT_SYSTEM_PROMPT_V4
         );
 
         // 老版本（extract_v1 冻结文本）作业 → 老提示词（extract_v2 的分派在
@@ -1116,6 +1117,15 @@ impl ExtractModel for OpenAiCompatibleClient {
 }
 
 /// 启动单 worker 串行循环（D-10）。模型未配置或客户端构建失败时不开线程并报明确错误。
+/// doc7/03：v4 两阶段用量相加；任一侧缺 usage 则保留有值一侧（不估算）。
+fn add_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    }
+}
+
 pub fn spawn_worker(state: AppState, model: Option<ModelConfig>) {
     let Some(cfg) = model else { return };
     let client = match OpenAiCompatibleClient::new(cfg.clone()) {
@@ -1223,7 +1233,9 @@ async fn process_job_inner<M: ExtractModel>(
     // doc5/03 §1：准入规则按作业行 admission_version 分派，与 Prompt 版本相互独立；
     // 未知准入版本同样确定性 dead，不退回"最新规则"（doc5 卡 D5-3）。
     let admission_version = match job.admission_version.as_str() {
-        memory_contract::ADMISSION_VERSION_V1 | memory_contract::ADMISSION_VERSION_V2 => {
+        memory_contract::ADMISSION_VERSION_V1
+        | memory_contract::ADMISSION_VERSION_V2
+        | memory_contract::ADMISSION_VERSION_V4 => {
             job.admission_version.clone()
         }
         other => {
@@ -1320,6 +1332,44 @@ async fn process_job_inner<M: ExtractModel>(
 
     // 模型网络调用不持锁。
     let result = client.extract(system_prompt, &input).await;
+    // doc7/03：extract_v4 阶段 2 —— 对结构性 held 候选做一次批量 rewrite（D.7-4：
+    // 只重写 held，阶段 1 已 active 的直接过）。admit_for 是纯函数、rewrite 调用
+    // 全程不持锁；代际在调用后统一核验（覆盖两次调用的窗口，doc4/02 §5 语义不变）。
+    let mut rewrite_result: Option<Result<ExtractOutput, ExtractError>> = None;
+    let mut rewrite_held_indices: Vec<usize> = Vec::new();
+    if job.prompt_version == memory_contract::EXTRACT_PROMPT_VERSION_V4 {
+        if let Ok(output) = &result {
+            if let Ok(ex) = memory_extract::parse_extraction(&output.content) {
+                let held: Vec<usize> = ex
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        matches!(
+                            memory_extract::admit_for(&admission_version, c, &events),
+                            Some(Admission::Held(reason))
+                                if memory_extract::rewrite_eligible_reason(reason)
+                        )
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if !held.is_empty() {
+                    let held_refs: Vec<(usize, &memory_extract::ModelCandidate)> =
+                        held.iter().map(|&i| (i, &ex.candidates[i])).collect();
+                    rewrite_held_indices = held;
+                    // 输入序列化异常等内部问题统一走 BAD_JSON 失败路径（同输入重试不变）。
+                    rewrite_result = Some(
+                        match memory_extract::rewrite_input_json(&events, &held_refs) {
+                            Ok(input) => client
+                                .extract(memory_extract::REWRITE_SYSTEM_PROMPT_V4, &input)
+                                .await,
+                            Err(_) => Err(ExtractError::BadJson),
+                        },
+                    );
+                }
+            }
+        }
+    }
     let mut guard = state.store.lock().unwrap();
     // 旧执行者隔离：提交任何结果前核当前代际；失败/查不动时丢弃本轮结果，
     // 不改候选与作业状态，交由 lease 到期恢复（doc4/02 §5）。
@@ -1345,10 +1395,101 @@ async fn process_job_inner<M: ExtractModel>(
             let extraction: Result<Extraction, String> =
                 memory_extract::parse_extraction(&output.content);
             match extraction {
-                Ok(ex) => {
+                Ok(mut ex) => {
+                    let mut usage_input = output.input_tokens;
+                    let mut usage_output = output.output_tokens;
+                    // doc7/03：应用 rewrite 结果并写 D.6 审计；失败按模型错误走既有重试。
+                    if let Some(rw) = rewrite_result {
+                        match rw {
+                            Ok(rw_out) => {
+                                match memory_extract::parse_rewrite_output(
+                                    &rw_out.content,
+                                    &rewrite_held_indices,
+                                ) {
+                                    Ok(results) => {
+                                        let mut audit_items: Vec<serde_json::Value> = Vec::new();
+                                        for r in results {
+                                            let Some(c) =
+                                                ex.candidates.get_mut(r.candidate_index)
+                                            else {
+                                                continue;
+                                            };
+                                            // 落库取首条 claim（doc7/03 §3：D.4-2 拆分的
+                                            // 次条不进候选，记审计）。
+                                            c.claim = r.claims.first().cloned();
+                                            if r.confidence.is_some() {
+                                                c.confidence = r.confidence;
+                                            }
+                                            audit_items.push(serde_json::json!({
+                                                "candidate_index": r.candidate_index,
+                                                "quote": c.quote,
+                                                "claims": r.claims,
+                                                "applied_claim": c.claim,
+                                                "reason": r.reason,
+                                                "confidence": r.confidence,
+                                                "rewrite_notes": r.rewrite_notes,
+                                            }));
+                                        }
+                                        usage_input = add_tokens(usage_input, rw_out.input_tokens);
+                                        usage_output =
+                                            add_tokens(usage_output, rw_out.output_tokens);
+                                        let audit = serde_json::json!({
+                                            "job_id": job.id,
+                                            "prompt_version": job.prompt_version,
+                                            "admission_version": job.admission_version,
+                                            "rewrites": audit_items,
+                                        });
+                                        if let Err(e) = guard.record_extraction_rewrite_audit(
+                                            &scope,
+                                            &job.id,
+                                            &audit,
+                                        ) {
+                                            eprintln!(
+                                                "[worker] rewrite 审计写入失败 job={}: {e}",
+                                                job.id
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        match guard.fail_job(
+                                            &job.id,
+                                            job.claim_generation,
+                                            attempts,
+                                            "BAD_JSON",
+                                        ) {
+                                            Ok(_) => {}
+                                            Err(e2) => eprintln!(
+                                                "[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复",
+                                                job.id
+                                            ),
+                                        }
+                                        return Err(format!("rewrite 响应不合法: {e}"));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let code = match &e {
+                                    ExtractError::Timeout => "MODEL_TIMEOUT",
+                                    ExtractError::BadJson => "BAD_JSON",
+                                    ExtractError::Transport(_) => "MODEL_UNAVAILABLE",
+                                    ExtractError::HttpStatus(_) => "MODEL_HTTP_ERROR",
+                                };
+                                match guard.fail_job(&job.id, job.claim_generation, attempts, code)
+                                {
+                                    Ok(_) => {}
+                                    Err(e2) => eprintln!(
+                                        "[worker] job {} 失败写入未生效（{e2}），交由 lease 恢复",
+                                        job.id
+                                    ),
+                                }
+                                return Err(format!("rewrite 模型调用失败: {e}"));
+                            }
+                        }
+                    }
                     let mut last_err: Option<String> = None;
                     for c in &ex.candidates {
-                        // 按作业行版本分派准入（版本已在上方验证，分派必有实现）。
+                        // 按作业行版本分派准入（v4 的 admit 对已回填 claim 的候选用
+                        // 改写文本受检；版本已在上方验证，分派必有实现）。
                         let admission = memory_extract::admit_for(&admission_version, c, &events)
                             .unwrap_or(Admission::Held("NOT_EXPLICIT"));
                         match guard.save_candidate(&scope, job, &origin, c, admission) {
@@ -1386,14 +1527,15 @@ async fn process_job_inner<M: ExtractModel>(
                         }
                         return Err(e);
                     }
-                    // 用量：提供者给了 usage 就持久化，没给保持 NULL 不估算（doc2/05 §2）。
+                    // 用量：提供者给了 usage 就持久化，没给保持 NULL 不估算（doc2/05 §2）；
+                    // extract_v4 的 rewrite 是同作业第二次调用，用量相加（缺侧保持 NULL）。
                     match guard.complete_job(
                         &job.id,
                         job.claim_generation,
                         attempts,
                         &cfg.model,
-                        output.input_tokens,
-                        output.output_tokens,
+                        usage_input,
+                        usage_output,
                     ) {
                         Ok(()) => Ok(()),
                         Err(StoreError::StaleClaim) => {

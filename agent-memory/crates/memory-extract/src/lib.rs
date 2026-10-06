@@ -63,9 +63,43 @@ pub fn system_prompt_for(version: &str) -> Option<&'static str> {
         memory_contract::EXTRACT_PROMPT_VERSION_V1 => Some(EXTRACT_SYSTEM_PROMPT_V1),
         memory_contract::EXTRACT_PROMPT_VERSION_V2 => Some(EXTRACT_SYSTEM_PROMPT),
         memory_contract::EXTRACT_PROMPT_VERSION_V3 => Some(EXTRACT_SYSTEM_PROMPT_V3),
+        memory_contract::EXTRACT_PROMPT_VERSION_V4 => Some(EXTRACT_SYSTEM_PROMPT_V4),
         _ => None,
     }
 }
+
+/// doc7/03（extract_v4 阶段 1，Muse文档/13 D.1）：提取行为与 v3 完全一致（逐字 quote、
+/// 一候选一命题、不得补写主语）；v4 的增量在阶段 2 rewrite（[REWRITE_SYSTEM_PROMPT_V4]），
+/// 由 worker 对 held 候选触发。提示词与 v3 分立为独立常量：两版本的 prompt 文本
+/// 各自冻结，允许未来各自演化。
+pub const EXTRACT_SYSTEM_PROMPT_V4: &str = EXTRACT_SYSTEM_PROMPT_V3;
+
+/// doc7/03（extract_v4 阶段 2，Muse文档/13 D.2—D.5）：对阶段 1 被 held 的候选做改写。
+/// 原则：主语只来自 speaker/同窗上文/用户自述；一候选至多两条 claim（D.4-2，落库取首条，
+/// 次条进审计）；保留限定词；不引入新事实；推断降 confidence；允许 claims=[] + reason
+/// （D.5 例 6：改写步骤允许说"不知道"，硬补主语即幻觉）。
+pub const REWRITE_SYSTEM_PROMPT_V4: &str = "\
+你在改写记忆候选，不是在提取。输入的 items 里每一条都是从用户原话中逐字取出的 quote，\
+它们因为缺少显式主语或不是显式陈述而被准入规则暂时扣下（held）。\
+请把每条改写成一个可独立纠错、遗忘或过期的完整命题，写给下一次对话直接使用。
+改写规则：
+1. 主语只能来自三处：items 里的 speaker 字段、context 同窗上文、用户自述；三处都推不出来时\
+输出 claims 为空数组并写 reason（例如「主语无法从上下文唯一确定」），绝不硬补主语。
+2. 一条 claim 只含一个命题。若 quote 确实含两个各自成立的命题，输出两条 claim（至多两条），\
+按更重要的在前；拿不准就只输出最有把握的一条。
+3. 保留限定词：「平时」「主要」「偶尔」这些词是命题的一部分，不丢。
+4. 不引入原文与 context 都没有的事实；改写只做补主语和理顺句式。
+5. 相对时间按 occurred_at 归位为具体时间（只到月/日精度，不编造）；临时性/一次性请求不改写，\
+输出 claims 空数组并注明。
+6. 从上文推断出的部分（如职业、身份）在 rewrite_notes 里写明来源；confidence 相应降到 0.8 以下，\
+直接陈述用 0.9。
+7. kind 不变；口语转书面，保持原意，不要文绉绉。
+8. 第三人命题不改写：关于用户家人、朋友、同事等第三者的事实（如「我爸不吃香菜」）输出\
+claims 空数组并在 reason 注明「第三人命题」；只改写关于用户本人的命题。
+只输出 JSON。响应形状（字段名逐字一致，不增不减）：
+{\"results\":[{\"candidate_index\":0,\"claims\":[\"用户是后端开发，平时主要使用 Rust\"],\"confidence\":0.9,\"rewrite_notes\":\"主语'用户'来自 speaker；'后端开发'来自 context 上文\"}]}
+无法改写时该条输出 {\"candidate_index\":0,\"claims\":[],\"reason\":\"主语无法从上下文唯一确定\"}。
+results 必须恰好覆盖每个 candidate_index 一次。";
 
 /// 模型响应 Schema（doc/13 §4）。confidence 仅作诊断，不能驱动准入。
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +116,10 @@ pub struct ModelCandidate {
     pub occurred_at: Option<String>,
     pub valid_until: Option<String>,
     pub confidence: Option<f64>,
+    /// doc7/03：extract_v4 阶段 2 rewrite 产出的改写命题（阶段 1 不出现，worker 回填；
+    /// None 时 admit_v4 各内容门回落 quote，与 admit_v2 同判）。
+    #[serde(default)]
+    pub claim: Option<String>,
 }
 
 /// 窗口内可供校验的事件（由 store 层加载）。
@@ -187,6 +225,113 @@ pub fn parse_extraction(content: &str) -> Result<Extraction, String> {
         t
     };
     serde_json::from_str(stripped).map_err(|e| e.to_string())
+}
+
+/// doc7/03：rewrite 输入构造（Muse文档/13 D.3）。context 与提取输入共用同一事件
+/// 序列化（同窗原文，冻结输入）；items 只携带 held 候选的最小定位信息。
+pub fn rewrite_input_json(
+    events: &[WindowEvent],
+    held: &[(usize, &ModelCandidate)],
+) -> Result<String, String> {
+    let items: Vec<serde_json::Value> = held
+        .iter()
+        .map(|(idx, c)| {
+            let occurred = c
+                .occurred_at
+                .clone()
+                .or_else(|| events.iter().find(|e| e.id == c.source_event_id).map(|e| e.occurred_at.clone()));
+            serde_json::json!({
+                "candidate_index": idx,
+                "source_event_id": c.source_event_id,
+                "quote": c.quote,
+                "kind": c.kind,
+                "speaker": "user",
+                "occurred_at": occurred,
+            })
+        })
+        .collect();
+    let context: Vec<serde_json::Value> = events.iter().map(window_event_json).collect();
+    serde_json::to_string(&serde_json::json!({ "context": context, "items": items }))
+        .map_err(|e| format!("rewrite 输入序列化失败: {e}"))
+}
+
+/// doc7/03：rewrite 单条结果。claims 空 = 无法改写（等效 null + reason，D.3/D.5 例 6）；
+/// 至多 2 条（D.4-2 拆分上限；落库取首条，次条由 worker 记审计）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteResult {
+    pub candidate_index: usize,
+    #[serde(default)]
+    pub claims: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub rewrite_notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteOutput {
+    pub results: Vec<RewriteResult>,
+}
+
+/// 解析 rewrite 输出（与 parse_extraction 同样的围栏归一化），并做覆盖校验：
+/// results 必须恰好覆盖每个期望的 candidate_index 一次（缺失/重复/越界即错，
+/// 作业按 MODEL_BAD_RESPONSE 走既有重试）。
+pub fn parse_rewrite_output(
+    content: &str,
+    expected_indices: &[usize],
+) -> Result<Vec<RewriteResult>, String> {
+    let t = content.trim();
+    let stripped = if let Some(rest) = t.strip_prefix("```") {
+        let first_break = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &rest[first_break..];
+        let body = body.trim_end();
+        match body.rfind("```") {
+            Some(i) if body[..i].trim().starts_with('{') => body[..i].trim(),
+            _ => t,
+        }
+    } else {
+        t
+    };
+    let out: RewriteOutput = serde_json::from_str(stripped).map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    for r in &out.results {
+        if !expected_indices.contains(&r.candidate_index) {
+            return Err(format!("rewrite 覆盖越界 index={}", r.candidate_index));
+        }
+        if !seen.insert(r.candidate_index) {
+            return Err(format!("rewrite 覆盖重复 index={}", r.candidate_index));
+        }
+        if r.claims.len() > 2 {
+            return Err(format!("rewrite claims 超上限 index={}", r.candidate_index));
+        }
+        if r.claims.is_empty() && r.reason.is_none() {
+            return Err(format!("rewrite 空 claims 缺 reason index={}", r.candidate_index));
+        }
+    }
+    for &idx in expected_indices {
+        if !seen.contains(&idx) {
+            return Err(format!("rewrite 覆盖缺失 index={idx}"));
+        }
+    }
+    Ok(out.results)
+}
+
+/// doc7/03：结构性 held 可重写；内容政策类 held 不重写（D.5 例 4「THIRD_PARTY 的活，
+/// rewrite 不碰」；SECRET/SENSITIVE/CONTEXT_UNCERTAIN 同理保持原样）。
+pub fn rewrite_eligible_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "UNCLEAR_SUBJECT"
+            | "NOT_EXPLICIT"
+            | "MULTI_CLAIM"
+            | "NON_MINIMAL_QUOTE"
+            | "KIND_MISMATCH"
+            | "TEMPORAL"
+    )
 }
 
 /// doc/13 §5 的确定性准入规则第 1～7 步（第 8、9 步需查库，由 store 层完成）。
@@ -299,9 +444,155 @@ pub fn admit_for(
     match admission_version {
         memory_contract::ADMISSION_VERSION_V1 => Some(admit_v1(c, events)),
         memory_contract::ADMISSION_VERSION_V2 => Some(admit_v2(c, events)),
+        memory_contract::ADMISSION_VERSION_V4 => Some(admit_v4(c, events)),
         _ => None,
     }
 }
+
+/// doc7/03（Riko-Muse）：extract_v4 主线准入（Muse文档/13 D.1"门不动"——同一门序，
+/// 受检文本换成 rewrite 产出的 claim）。规则 1–3 仍检 quote（来源/逐字 span/长度与
+/// 改写无关）；规则 4–11 的受检文本 = `claim`（存在且非空）否则回落 quote——**回落
+/// 路径与 admit_v2 逐字节同判**，v2 行为不静默漂移。
+///
+/// claim 路径的两处适配（仅针对"用户…"第三人称改写句式）：
+/// - 规则 5：多命题判定改为"句首再次出现用户主语（用户/用户的）"，`，`谓语并列不算
+///   （Muse D.5 例 1 的合并句式合法；quote 路径沿用原启发式）；
+/// - 规则 6/11：`用户`/`用户的` 开头即视为有显式主语/显式陈述（quote 路径沿用原
+///   形状表）。第三人称形式的第三人命题由 [`rewritten_third_party_marker`] 防御
+///   （rewrite prompt 已禁止改写第三人命题，此处为门上兜底）。
+/// 规则 7–10（SECRET/SENSITIVE/THIRD_PARTY/TEMPORAL）原样作用于改写文本：
+/// 内容政策门不因 rewrite 放水。
+pub fn admit_v4(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
+    use Admission::*;
+    // 1. 来源必须属于本窗口、role=user、source_kind=user（同 v2）。
+    let Some(ev) = events.iter().find(|e| e.id == c.source_event_id) else {
+        return Rejected("BAD_SOURCE");
+    };
+    if ev.role != "user" || ev.source_kind != "user" {
+        return Rejected("BAD_SOURCE");
+    }
+    // 2. quote 是同一来源正文的连续原文（逐字锚不因改写改变）。
+    if !ev.content.contains(&c.quote) {
+        return Rejected("QUOTE_MISMATCH");
+    }
+    // 3. 规范化为空或超过 512 Unicode 标量字符（检 quote，同 v2）。
+    if memory_domain::fold_whitespace(&c.quote).is_empty()
+        || c.quote.chars().count() > memory_contract::QUOTE_MAX_CHARS
+    {
+        return Rejected("INVALID_QUOTE");
+    }
+    let claim_text = c.claim.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let text = claim_text.unwrap_or(&c.quote);
+    // 4. 假设、转述、引用、一次性语境。
+    if context_uncertain(text) || text.contains("今天先") {
+        return Held("CONTEXT_UNCERTAIN");
+    }
+    // 5. 多命题/宽 quote：quote 路径同 v2；claim 路径用改写形态判定
+    //    （non_minimal_quote 是口语前缀的 quote 形状门，对改写句不适用）。
+    if claim_text.is_some() {
+        if rewritten_multi_claim(text) {
+            return Held("MULTI_CLAIM");
+        }
+    } else {
+        if non_minimal_quote(&c.quote) {
+            return Held("NON_MINIMAL_QUOTE");
+        }
+        if multi_claim(&c.quote) {
+            return Held("MULTI_CLAIM");
+        }
+    }
+    // 6. fact/preference 缺明确归属主体。
+    if matches!(c.kind.as_str(), "fact" | "preference") && rewritten_unclear_subject(text, claim_text.is_some())
+    {
+        return Held("UNCLEAR_SUBJECT");
+    }
+    // 7. 凭据内容：任何路径不得 active。
+    if secret_like(text) {
+        return Held("SECRET");
+    }
+    // 8. 健康/过敏/诊断/病历等敏感个人信息。
+    if sensitive_health(text) {
+        return Held("SENSITIVE");
+    }
+    // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
+    if has_third_person_marker(text) || claim_text.is_some() && rewritten_third_party_marker(text) {
+        return Held("THIRD_PARTY");
+    }
+    // 10. 未来节点、相对时间或明显短期状态（改写按 occurred_at 归位后应不再命中）。
+    if temporal_marker(text) {
+        return Held("TEMPORAL");
+    }
+    // 11. 显式陈述：quote 路径同 v2；claim 路径以"用户"主语句式为显式
+    //     （kind 由阶段 1 判定，v4 不对其重检）。
+    match claim_text {
+        Some(_) => {
+            if text.starts_with("用户") {
+                Active
+            } else {
+                match explicit_shape(text) {
+                    None => Held("NOT_EXPLICIT"),
+                    Some(shape) if shape.kind() == c.kind.as_str() => Active,
+                    Some(_) => Held("KIND_MISMATCH"),
+                }
+            }
+        }
+        None => match explicit_shape(&c.quote) {
+            None => Held("NOT_EXPLICIT"),
+            Some(shape) if shape.kind() == c.kind.as_str() => Active,
+            Some(_) => Held("KIND_MISMATCH"),
+        },
+    }
+}
+
+/// claim 路径的多命题判定：按句号/分号切分后，多于一段以用户主语（用户/用户的）
+/// 开头 → 多命题；`，` 谓语并列不算（Muse D.5 例 1）。
+fn rewritten_multi_claim(claim: &str) -> bool {
+    let mut segments = 0usize;
+    for part in claim.split(['。', '；', ';']) {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.starts_with("用户") {
+            segments += 1;
+        }
+    }
+    segments > 1
+}
+
+/// claim 路径的第三人标记（防御层）：rewrite prompt 已禁止改写第三人命题，
+/// 此处捕获"用户的父亲"这类 v2 词表覆盖不到的改写形式。
+fn rewritten_third_party_marker(claim: &str) -> bool {
+    [
+        "用户的父亲",
+        "用户的妈妈",
+        "用户的母亲",
+        "用户的哥哥",
+        "用户的姐姐",
+        "用户的弟弟",
+        "用户的妹妹",
+        "用户的儿子",
+        "用户的女儿",
+        "用户的孩子",
+        "用户的家人",
+        "用户的同事",
+        "用户的朋友",
+        "用户父亲",
+        "用户母亲",
+        "用户家里",
+    ]
+    .iter()
+    .any(|w| claim.contains(w))
+}
+
+/// claim 路径的主语判定：`用户` 主语句式视为显式；否则沿用 v2 逻辑。
+fn rewritten_unclear_subject(text: &str, is_claim: bool) -> bool {
+    if is_claim && text.starts_with("用户") {
+        return false;
+    }
+    unclear_subject(text)
+}
+
 
 /// 一次性/假设/转述词（doc/13 §5.5）。
 fn context_uncertain(quote: &str) -> bool {
@@ -789,6 +1080,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: Some(0.9),
+            claim: None,
         }
     }
 
@@ -1105,7 +1397,7 @@ mod tests {
             let c = ModelCandidate {
                 kind: kind.into(),
                 ..cand(quote)
-            };
+        };
             admit_v2(&c, &events)
         };
         use Admission::{Active, Held};
@@ -1229,5 +1521,162 @@ mod tests {
         );
         assert_eq!(admit_for("admit_v2", &c1, &events), Some(Admission::Active));
         assert_eq!(admit_for("admit_v0", &c1, &events), None);
+    }
+
+    #[test]
+    fn v4_prompt_dispatch_and_rewrite_prompt_contract() {
+        // doc7/03：v4 阶段 1 与 v3 行为一致（提示词逐字相同，各自冻结）；未知版本 None。
+        assert_eq!(
+            system_prompt_for("extract_v4"),
+            Some(EXTRACT_SYSTEM_PROMPT_V4)
+        );
+        assert_eq!(EXTRACT_SYSTEM_PROMPT_V4, EXTRACT_SYSTEM_PROMPT_V3);
+        assert_eq!(system_prompt_for("extract_v9"), None);
+        assert!(REWRITE_SYSTEM_PROMPT_V4.contains("绝不硬补主语"));
+        assert!(REWRITE_SYSTEM_PROMPT_V4.contains("第三人命题不改写"));
+        assert!(REWRITE_SYSTEM_PROMPT_V4.contains("恰好覆盖每个 candidate_index"));
+    }
+
+    #[test]
+    fn rewrite_parse_coverage_and_null_contract() {
+        let expected = [0usize, 1, 2];
+        let ok = parse_rewrite_output(
+            "{\"results\":[{\"candidate_index\":0,\"claims\":[\"用户是后端开发，平时主要写 Rust\"],\"confidence\":0.9,\"rewrite_notes\":\"主语来自 speaker\"},{\"candidate_index\":1,\"claims\":[\"用户的父亲不吃香菜\",\"用户的母亲不碰辣\"],\"confidence\":0.9},{\"candidate_index\":2,\"claims\":[],\"reason\":\"主语无法从上下文唯一确定\"}]}",
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 3);
+        assert_eq!(ok[0].claims.len(), 1);
+        assert_eq!(ok[1].claims.len(), 2, "D.4-2 拆分至多两条");
+        assert!(ok[2].claims.is_empty() && ok[2].reason.is_some());
+        // Markdown 围栏归一化。
+        let fenced = parse_rewrite_output(
+            "```json
+{\"results\":[{\"candidate_index\":0,\"claims\":[\"用户喜欢普洱茶\"]}]}
+```",
+            &[0],
+        )
+        .unwrap();
+        assert_eq!(fenced[0].claims, vec!["用户喜欢普洱茶".to_string()]);
+        // 覆盖缺失 / 重复 / 越界 / 空 claims 无 reason / 超上限 → 全部报错。
+        assert!(parse_rewrite_output("{\"results\":[]}", &expected).is_err());
+        assert!(parse_rewrite_output(
+            "{\"results\":[{\"candidate_index\":0,\"claims\":[\"a\"]},{\"candidate_index\":0,\"claims\":[\"b\"]}]}",
+            &expected,
+        )
+        .is_err());
+        assert!(parse_rewrite_output(
+            "{\"results\":[{\"candidate_index\":9,\"claims\":[\"x\"]}]}",
+            &expected,
+        )
+        .is_err());
+        assert!(parse_rewrite_output(
+            "{\"results\":[{\"candidate_index\":0,\"claims\":[]}]}",
+            &[0],
+        )
+        .is_err());
+        assert!(parse_rewrite_output(
+            "{\"results\":[{\"candidate_index\":0,\"claims\":[\"a\",\"b\",\"c\"]}]}",
+            &[0],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn admit_v4_rewritten_subject_activates_and_policy_gates_hold() {
+        // 每个候选配对包含其 quote 的窗口事件（admit 规则 2 检查逐字 span）。
+        fn mk_events(quotes: &[&str]) -> Vec<WindowEvent> {
+            quotes
+                .iter()
+                .enumerate()
+                .map(|(i, q)| WindowEvent {
+                    id: format!("e{i}"),
+                    role: "user".into(),
+                    source_kind: "user".into(),
+                    occurred_at: "2026-09-24T12:00:00Z".into(),
+                    content: q.to_string(),
+                })
+                .collect()
+        }
+        fn held_cand(quote: &str, idx: usize) -> ModelCandidate {
+            ModelCandidate {
+                source_event_id: format!("e{idx}"),
+                quote: quote.into(),
+                kind: "fact".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: None,
+                claim: None,
+            }
+        }
+        // 阶段 1：无主语 quote → UNCLEAR_SUBJECT（v4 claim 缺省回落 quote，与 v2 同判）。
+        let events = mk_events(&["我是做后端开发的", "平时主要写 Rust"]);
+        let mut c = held_cand("平时主要写 Rust", 1);
+        assert_eq!(admit_v4(&c, &events), admit_v2(&c, &events));
+        assert_eq!(admit_v4(&c, &events), Admission::Held("UNCLEAR_SUBJECT"));
+        // rewrite 回填显式主语 → Active；claim 文本进入记忆。
+        c.claim = Some("用户平时主要使用 Rust 开发".into());
+        c.confidence = Some(0.8);
+        assert_eq!(admit_v4(&c, &events), Admission::Active);
+        // Muse D.5 例 1 的合并句式（，谓语并列）不算多命题。
+        c.claim = Some("用户是后端开发，平时主要写 Rust".into());
+        assert_eq!(admit_v4(&c, &events), Admission::Active);
+        // 内容政策门不因 rewrite 放水：第三人（单句改写形式）照旧 held。
+        // （门序与 v2 一致：MULTI_CLAIM 在 THIRD_PARTY 之前——"用户不吃香菜。用户的
+        // 母亲不碰辣"这种双主语改写会先停 MULTI_CLAIM。）
+        let events_fam = mk_events(&["我妈不碰辣"]);
+        let mut fam = held_cand("我妈不碰辣", 0);
+        fam.claim = Some("用户的母亲不碰辣".into());
+        assert_eq!(admit_v4(&fam, &events_fam), Admission::Held("THIRD_PARTY"));
+        // 改写句里再次出现独立用户主语（句号分隔）→ MULTI_CLAIM。
+        let mut multi2 = held_cand("我喜欢咖啡，也喜欢茶", 0);
+        multi2.kind = "preference".into();
+        multi2.claim = Some("用户喜欢咖啡。用户喜欢茶".into());
+        let events_pref = mk_events(&["我喜欢咖啡，也喜欢茶"]);
+        assert_eq!(admit_v4(&multi2, &events_pref), Admission::Held("MULTI_CLAIM"));
+        // 敏感/时效。
+        let events_health = mk_events(&["我对花生过敏"]);
+        let mut health = held_cand("我对花生过敏", 0);
+        health.claim = Some("用户对花生过敏".into());
+        assert_eq!(admit_v4(&health, &events_health), Admission::Held("SENSITIVE"));
+        let events_temp = mk_events(&["我最近在肝星穹铁道"]);
+        let mut temporal = held_cand("我最近在肝星穹铁道", 0);
+        temporal.claim = Some("用户最近在玩星穹铁道".into());
+        assert_eq!(admit_v4(&temporal, &events_temp), Admission::Held("TEMPORAL"));
+        // 按时间归位后 → Active。
+        temporal.claim = Some("用户在 2026-10 玩星穹铁道".into());
+        assert_eq!(admit_v4(&temporal, &events_temp), Admission::Active);
+        // rewrite_eligible_reason：结构性可重写；内容政策类不重写。
+        for r in [
+            "UNCLEAR_SUBJECT",
+            "NOT_EXPLICIT",
+            "MULTI_CLAIM",
+            "NON_MINIMAL_QUOTE",
+            "KIND_MISMATCH",
+            "TEMPORAL",
+        ] {
+            assert!(rewrite_eligible_reason(r));
+        }
+        for r in ["THIRD_PARTY", "SENSITIVE", "SECRET", "CONTEXT_UNCERTAIN"] {
+            assert!(!rewrite_eligible_reason(r));
+        }
+    }
+
+    #[test]
+    fn rewrite_input_json_carries_context_and_items() {
+        let events = vec![ev("我是做后端开发的")];
+        let c = ModelCandidate {
+            source_event_id: "e1".into(),
+            quote: "平时主要写 Rust".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: None,
+            claim: None,
+        };
+        let s = rewrite_input_json(&events, &[(3, &c)]).unwrap();
+        assert!(s.contains("\"candidate_index\":3"));
+        assert!(s.contains("\"speaker\":\"user\""));
+        assert!(s.contains("我是做后端开发的"));
     }
 }

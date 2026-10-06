@@ -630,7 +630,7 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        };
+        claim: None,};
         let outcome = store
             .save_candidate(
                 &scope("u1"),
