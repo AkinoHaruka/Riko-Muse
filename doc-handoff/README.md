@@ -51,7 +51,8 @@
 | [25 Riko-Muse 真实模型验收](25-Riko-Muse真实模型验收.md) | 三轮真实模型观察；含 extract_v3 的 0-active 问题、extract_v4 的同语料 7/15 active 结果、保护门核对与清理记录 |
 | [26 V2-S1 记忆域交付记录](26-V2-S1记忆域交付记录.md) | 接手上一轮中断（208 编译错误）后的修复、V2-S1 内核与 HTTP 层实施、5 个真实缺陷、168 项测试与临时库 HTTP 冒烟证据、未接线边界 |
 | [27 V2-P1 精读与 explain 交付记录](27-V2-P1精读与explain交付记录.md) | 统一可见性谓词（修 `get_memory` 不看 `valid_until` 的真实缺陷）、`memory_explain` 逐字证据读模型、`riko://` 稳定引用、explain 端点与适配器工具；含一次规范自我修订（墓碑不进读谓词）与三处测试探针更新 |
-| [28 V2-D1 蒸馏与投影交付记录](28-V2-D1蒸馏与投影交付记录.md) | **最新**：迁移 0016（schema 16）、`facet_v1` 确定性四分面、compact 双预算与 Resident 去重、来源失效即时屏蔽、purge 闭包、`/v1/compact`+`/v1/facets`+`/v1/derived/refresh`、`memoryd export` 只读 Markdown 投影；含 4 个实施期缺陷 |
+| [28 V2-D1 蒸馏与投影交付记录](28-V2-D1蒸馏与投影交付记录.md) | 迁移 0016（schema 16）、`facet_v1` 确定性四分面、compact 双预算与 Resident 去重、来源失效即时屏蔽、purge 闭包、`/v1/compact`+`/v1/facets`+`/v1/derived/refresh`、`memoryd export` 只读 Markdown 投影；含 4 个实施期缺陷 |
+| [29 V2-R1 关系图谱交付记录](29-V2-R1关系图谱交付记录.md) | **最新**：迁移 0017（schema 17）、`entity_v1` 确定性投影（两种句式 + 代词/长度/多候选拒绝规则）、索引/get/resolve、分级排序、来源失效即时屏蔽、purge 闭包、域隔离；含 3 个实施期缺陷与 THIRD_PARTY 政策边界（完整人物覆盖仍受限） |
 
 ## 30 秒状态
 

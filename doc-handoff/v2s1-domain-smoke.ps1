@@ -155,6 +155,36 @@ $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 Write-Output ("D1_COMPACT_MAIN_AFTER_GRANT=" + $r.status + " item_count=" + (($r.body | ConvertFrom-Json).item_count))
 
+# V2-R1：关系图谱（doc7/07 §5）
+$r = Call 'POST' "$b/v1/evidence/events" @{
+  origin = @{ host_id='dsh'; agent_id='a'; session_id='s1' }
+  event_seq = 2; role='user'; source_kind='user'
+  occurred_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')
+  content = '我妻子叫小雨，她特别喜欢园艺'
+} $null
+$evR = ($r.body | ConvertFrom-Json).evidence_id
+$r = Call 'POST' "$b/v1/memories/remember" @{
+  origin = @{ host_id='dsh'; agent_id='a'; session_id='s1' }
+  user_evidence_id = $evR; quote='我妻子叫小雨，她特别喜欢园艺'; kind='fact'
+} $null
+Write-Output ("R1_SEED_REMEMBER=" + $r.status)
+$r = Call 'POST' "$b/v1/relationships/refresh" $null 'side_a'
+Write-Output ("R1_REFRESH=" + $r.status + " " + $r.body)
+$r = Call 'GET' "$b/v1/relationships" $null 'side_a'
+Write-Output ("R1_INDEX=" + $r.status + " total=" + (($r.body | ConvertFrom-Json).total) + " omitted=" + (($r.body | ConvertFrom-Json).omitted))
+$entId = (($r.body | ConvertFrom-Json).entities | Select-Object -First 1).entity_id
+Write-Output ("R1_ENTITY_ID_PRESENT=" + [bool]$entId)
+$r = Call 'GET' "$b/v1/relationships/$entId" $null 'side_a'
+Write-Output ("R1_GET=" + $r.status + " items=" + (($r.body | ConvertFrom-Json).items.Count) + " skipped_stale=" + (($r.body | ConvertFrom-Json).skipped_stale) + " first_section=" + (($r.body | ConvertFrom-Json).items[0].section))
+$r = Call 'GET' "$b/v1/relationships/resolve?q=$([uri]::EscapeDataString('小雨'))" $null 'side_a'
+Write-Output ("R1_RESOLVE_ONE=" + $r.status + " resolution=" + (($r.body | ConvertFrom-Json).resolution))
+$r = Call 'GET' "$b/v1/relationships/resolve?q=nobody" $null 'side_a'
+Write-Output ("R1_RESOLVE_NONE=" + $r.status + " resolution=" + (($r.body | ConvertFrom-Json).resolution))
+$r = Call 'GET' "$b/v1/relationships/resolve?q=$([uri]::EscapeDataString('妻子'))" $null 'side_a'
+Write-Output ("R1_RESOLVE_ROLE=" + $r.status + " resolution=" + (($r.body | ConvertFrom-Json).resolution))
+$r = Call 'GET' "$b/v1/relationships" $null 'user_main'
+Write-Output ("R1_INDEX_MAIN_AFTER_GRANT=" + $r.status + " total=" + (($r.body | ConvertFrom-Json).total))
+
 # V2-D1：只读 Markdown 投影（CLI，临时目录）
 $exportDir = Join-Path $tmp 'export'
 & $exe export --config (Join-Path $tmp 'on.toml') --tenant t --user u --out $exportDir --domain side_a | Out-Null

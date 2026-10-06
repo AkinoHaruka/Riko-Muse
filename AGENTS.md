@@ -14,17 +14,18 @@
 
 ```
 当前基线：分支 `Riko-Muse`；每次开工现场核对 branch、HEAD、status，不依赖文档中的旧 SHA。接手时 HEAD 为 `2033da9`；V2-S1 交付 `611ef7f`，V2-P1 交付 `6d10567`，V2-D1 交付 `aa84e9c`。工作区另有 Riko-App Bridge 0.1.2 未提交改动，尚未验证。
-Riko-Muse（doc7/）：schema 16（`0015_memory_domains.sql` V2-S1、`0016_derived_views.sql` V2-D1；`0001`—`0014` 冻结不动）。M1 `valid_until` 到期自动转 expired；M2 确定性 rupture 检测 + repair 线程；M3 alignment synthesis + compose opt-in；M4 新增 `extract_v4` rewrite 与 `admit_v4`，同语料 Gemini 样本从 v3 的 0/14 active 到 v4 的 7/15 active，内容政策门保持生效。M1—M3 构建/测试及临时库 CLI/HTTP 冒烟见 doc-handoff/24；M4 真实模型观察和验证边界见 doc-handoff/25 §9。真实 DSH 闭环、DSH 适配器消费 alignment、dana/realtest 原库升级均未完成/未触碰。
+Riko-Muse（doc7/）：schema 17（`0015` V2-S1 记忆域、`0016` V2-D1 蒸馏视图、`0017` V2-R1 关系图谱；`0001`—`0014` 冻结不动）。M1 `valid_until` 到期自动转 expired；M2 确定性 rupture 检测 + repair 线程；M3 alignment synthesis + compose opt-in；M4 新增 `extract_v4` rewrite 与 `admit_v4`，同语料 Gemini 样本从 v3 的 0/14 active 到 v4 的 7/15 active，内容政策门保持生效。M1—M3 构建/测试及临时库 CLI/HTTP 冒烟见 doc-handoff/24；M4 真实模型观察和验证边界见 doc-handoff/25 §9。真实 DSH 闭环、DSH 适配器消费 alignment、dana/realtest 原库升级均未完成/未触碰。
 V2-S1 记忆域（Muse-V2迭代开发文档 02 / doc7/04）：内核与 HTTP 层已实施——域注册/会话绑定/跨域授权/证据域映射、`DomainScope` 读域集闭包、`[domains] enabled`（缺省 false）、7 个 `/v1/domains*` 管理端点、写路径（写域取自可信会话绑定）与读路径（域头 + 授权）接线、8 项 `v2_domain_tests`。`cargo test --workspace` 168 passed/0 failed，另有临时库 HTTP 冒烟。记录见 doc-handoff/26。**未接线**：Dream 作业域（`dream_worker.rs` 13 处 `/*DOM:dream-job-domain-pending*/`）、CLI 子命令（`main.rs` 17 处 `/*DOM*/`，按主域处理是本项目选择但未写入规范）；V2-P1/R1/D1/B1/A1/H1/Q1 未开工。
 V2-P1 精读与 explain（Muse-V2迭代开发文档 04 / doc7/05）：统一可见性谓词 `visible_memory_sql`（status + valid_until + 未被 retire + 至少一条未被 forget 抑制的来源 + 读域集）已用于 `get_memory` 与 `search_memories` 组装步，修掉「到期只靠 15 分钟调度器」的真实缺陷；新增 `memory_explain` 读模型（逐字 span 证据、speaker、subject 恒 unknown、reason_code、relations、`riko://` 稳定引用）与 `GET /v1/memories/{id}/explain`，适配器新增 `memory_explain` 工具。`cargo test --workspace` 181 passed/0 failed，适配器 `npm test` 19 passed。**注意**：`purge_tombstones` 故意不进读谓词（内容哈希会误伤同域同文的存活证据），只留在 `record_evidence` 重放闸。记录见 doc-handoff/27；交付提交 `6d10567`。本卡不新增迁移（0016 留给 V2-Q1）。未接线照旧：Dream 作业域 13 处、CLI 17 处标记；`select_resident` 的来源/到期过滤未统一。
 V2-D1 蒸馏与投影（Muse-V2迭代开发文档 03 / doc7/06，提交 `aa84e9c`）：迁移 `0016_derived_views.sql`（schema **16**）新增 `derived_items`/`derived_item_sources`/`derived_exports`；`facet_v1` 确定性四分面（experience/opinions/reflections/world，同一条可进多面，反思必须有 `memory_relations` 取代边）、`compact_v1` 精炼常驻（24 条 / 1200 字符双预算，与 Resident pin 去重）；读路径逐条复核来源，来源一改即时不注入（`skipped_stale` 计数）；`purge_confirm` 第 7.5 步清来源行与零来源孤立条目；新增 `GET /v1/compact`、`GET /v1/facets`、`POST /v1/derived/refresh` 与 `memoryd derived refresh`、`memoryd export`（只读 Markdown 投影 + manifest）。`cargo test --workspace` 191 passed/0 failed。**本卡不调用模型**：多源概括与 dated notes 属 V2-B1；DSH 适配器尚未消费 compact/facets（属 V2-H1）。记录见 doc-handoff/28。
+V2-R1 关系图谱（Muse-V2迭代开发文档 01 / doc7/07）：迁移 `0017_relationship_graph.sql`（schema **17**）新增 `relationship_entities`/`entity_aliases`/`relationship_items`/`relationship_sources`/`group_memberships`（组表建而未启用）。`entity_v1` 确定性投影只识别两种句式（`<REL>叫<NAME>`、`<NAME>是我的<REL>`），代词/单字名/多候选/未知关系词一律不建实体；索引有预算与省略计数，`get` 逐条复核来源（改了即时屏蔽），`resolve` 返回 none/one/ambiguous 且不猜；`purge_confirm` 第 7.6 步清来源与零来源实体。新增 `GET /v1/relationships`、`/resolve`、`/{entity_id}`、`POST /v1/relationships/refresh` 与 `memoryd relationships refresh`。`cargo test --workspace` 203 passed/0 failed。**政策边界**：THIRD_PARTY 门未放宽，不新增准入路径；**完整人物事实覆盖仍受限**，不得写成已解决。记录见 doc-handoff/29。
 DSH 适配：官方本地 clone `0.2.0-rc.2 / 639ed015397290b3745d163aafe02ffee4aa3f84`。Bridge `@riko/riko-app-api@0.1.1` 已安装到生产 `riko-dsh-runtime` 的 `web` profile；Android 已认证读取 health、model catalog、model-settings。凭据写入、自定义 provider 保存/发现和经 Android 设置发起真实模型对话仍未验证；证据见 `doc-handoff/22`、`23`。当前工作树中的 Bridge 0.1.2 修改尚未验证，也未部署。
 v1（doc/ 卡 0–6）、v2（doc2/ 卡 V2-0…V2-6）、doc4（D4-0…D4-7）、doc5（D5-0…D5-6）：已交付；已验证档位见 doc-handoff/README.md
-现有内核 schema 16（迁移 0001—0016；Riko-Muse 分支）；`0001`—`0015` 冻结，新增迁移须从 `0017` 顺序递增（`0016` 已交付 V2-D1）；D5 新作业 extract_v3/admit_v2；doc7/03 起新作业 extract_v4/admit_v4（Muse rewrite 步骤），全部历史版本按作业行冻结
+现有内核 schema 17（迁移 0001—0017；Riko-Muse 分支）；`0001`—`0016` 冻结，新增迁移须从 `0018` 顺序递增（`0016`=V2-D1、`0017`=V2-R1）；D5 新作业 extract_v3/admit_v2；doc7/03 起新作业 extract_v4/admit_v4（Muse rewrite 步骤），全部历史版本按作业行冻结
 remember 直写内容护栏按用户决定全部解除；保留 scope、最新用户证据、逐字 span、幂等与审计（doc-handoff/12）
 D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DSH 固定响应证据见 doc-handoff/20。记忆内核真实模型质量、全量 E01—E25、性能、dana/realtest 升级与 memoryd 生产部署仍未验证/未执行；Riko-App Bridge 生产部署状态单列见 doc-handoff/23。新开发以 doc6/doc7 当前规范和最新交接记录为准（doc7 变更须先更新规范）
-用户库 dana/realtest 未升级；没有单独部署指令不得触碰，升级前先只读快照并按交接记录处理 index_dirty（注意：Riko-Muse 分支的二进制会把库自动迁到 schema 16）
-最新实施入口：doc-handoff/README.md + doc-handoff/28-V2-D1蒸馏与投影交付记录.md + doc-handoff/27-V2-P1精读与explain交付记录.md + doc-handoff/26-V2-S1记忆域交付记录.md + doc-handoff/24-Riko-Muse交付记录.md + doc-handoff/25-Riko-Muse真实模型验收.md + doc-handoff/20-D6-11-15交付记录.md + doc-handoff/21-DSH-0.2适配.md + doc-handoff/22-DSH-rc2本机安装验证.md + doc-handoff/23-Android-Bridge生产部署与连通验证.md + doc6/README.md + doc6/08-施工任务卡.md + doc7/README.md + doc7/02-施工任务卡.md + doc7/03-extract_v4-rewrite.md
+用户库 dana/realtest 未升级；没有单独部署指令不得触碰，升级前先只读快照并按交接记录处理 index_dirty（注意：Riko-Muse 分支的二进制会把库自动迁到 schema 17）
+最新实施入口：doc-handoff/README.md + doc-handoff/29-V2-R1关系图谱交付记录.md + doc-handoff/28-V2-D1蒸馏与投影交付记录.md + doc-handoff/27-V2-P1精读与explain交付记录.md + doc-handoff/26-V2-S1记忆域交付记录.md + doc-handoff/24-Riko-Muse交付记录.md + doc-handoff/25-Riko-Muse真实模型验收.md + doc-handoff/20-D6-11-15交付记录.md + doc-handoff/21-DSH-0.2适配.md + doc-handoff/22-DSH-rc2本机安装验证.md + doc-handoff/23-Android-Bridge生产部署与连通验证.md + doc6/README.md + doc6/08-施工任务卡.md + doc7/README.md + doc7/02-施工任务卡.md + doc7/03-extract_v4-rewrite.md
 ```
 
 ## 3. 目录与只读边界
@@ -37,7 +38,7 @@ D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DS
 | `doc2/` | v2 施工规范（官方 DSH 源码事实 + 修复任务卡 + 运行手册） |
 | `doc5/` | doc5 记忆质量规则（产品决定与施工规范，已实施；未跟踪） |
 | `doc6/` | D6 产品与施工规范（D6-0—D6-15 已实施；人格/Soul、Resident、语义召回与合并、Dream、生命周期治理及受限 child 整理） |
-| `doc7/` | Riko-Muse 施工规范（Muse 增量 M1—M4 + V2-S1/P1/D1 施工规范，schema 16；分支 Riko-Muse） |
+| `doc7/` | Riko-Muse 施工规范（Muse 增量 M1—M4 + V2-S1/P1/D1/R1 施工规范，schema 17；分支 Riko-Muse） |
 | `Muse-V2迭代开发文档/` | Muse-V2 迭代开发规范（V2-S1…V2-Q1 卡片与行为验收矩阵；未跟踪） |
 | `Muse文档/` | 璃对 Muse 记忆系统的逆向分析 + 与本仓库源码的对照（doc7 的立项依据；未跟踪） |
 | `doc-handoff/` | 交接文档：环境复现、已完成证据、待办与冲突、可复制交接 Prompt |

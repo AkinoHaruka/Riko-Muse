@@ -76,6 +76,11 @@ enum Commands {
         #[command(subcommand)]
         action: DerivedAction,
     },
+    /// V2-R1 关系图谱（doc7/07 §5）：重建实体/别名/分节条目
+    Relationships {
+        #[command(subcommand)]
+        action: RelationshipsAction,
+    },
     /// V2-D1 只读 Markdown 投影（doc7/06 §5）：渲染 compact/分面/清单到授权目录
     Export {
         #[arg(long)]
@@ -259,6 +264,21 @@ enum JobAction {
         /// 运维原因 1—256 字符；不得填用户正文或密钥（写入审计）
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelationshipsAction {
+    /// 重建关系实体与条目（整体替换，batch_version 递增）
+    Refresh {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
 }
 
@@ -1024,6 +1044,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/compact", get(get_compact))
                 .route("/v1/facets", get(get_facets))
                 .route("/v1/derived/refresh", post(refresh_derived))
+                // V2-R1（doc7/07 §5）：关系图谱。静态段先于 {entity_id} 注册。
+                .route("/v1/relationships", get(list_relationships))
+                .route("/v1/relationships/resolve", get(resolve_relationship))
+                .route("/v1/relationships/refresh", post(refresh_relationships))
+                .route("/v1/relationships/{entity_id}", get(get_relationship))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -1102,6 +1127,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+        Commands::Relationships { action } => match action {
+            RelationshipsAction::Refresh {
+                config,
+                tenant,
+                user,
+                domain,
+            } => {
+                let cfg = Config::load(&config)?;
+                let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+                let scope = ScopeKey {
+                    tenant_id: tenant,
+                    user_id: user,
+                };
+                let dom = cli_domain_scope(&store, &scope, &domain)?;
+                let out = store
+                    .relationship_refresh(&scope, &dom)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "已重建关系图谱 batch_version={} 实体={} 条目={}（上一批实体 {}）",
+                    out.batch_version, out.entities, out.items, out.previous_entities
+                );
+                Ok(())
+            }
+        },
         Commands::Derived { action } => match action {
             DerivedAction::Refresh {
                 config,
@@ -3792,6 +3841,238 @@ struct ExplainQuery {
 struct FacetsQuery {
     #[serde(default)]
     kind: Option<String>,
+}
+
+// ---- V2-R1 关系图谱端点（doc7/07 §5）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelationshipsQuery {
+    #[serde(default)]
+    expected_version: Option<i64>,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn entity_entry_json(
+    e: &memory_store_sqlite::relationships::EntityIndexEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "entity_id": e.entity_id,
+        "entity_kind": e.entity_kind,
+        "display_name": e.display_name,
+        "relation": e.relation,
+        "aliases": e.aliases,
+        "summary": e.summary,
+        "version": e.version,
+        "rank_source": e.rank_source,
+        "closeness_rank": e.closeness_rank,
+        "updated_at": e.updated_at,
+        "detail_ref": e.detail_ref,
+    })
+}
+
+async fn list_relationships(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    axum::extract::Query(query): axum::extract::Query<RelationshipsQuery>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let limit = query
+        .limit
+        .unwrap_or(memory_store_sqlite::relationships::INDEX_MAX_ENTITIES)
+        .min(200);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.relationship_index(&scope, &dom, limit) {
+        Ok(index) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "domain_id": index.domain_id,
+            "batch_version": index.batch_version,
+            "total": index.total,
+            "omitted": index.omitted,
+            "entities": index.entities.iter().map(entity_entry_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取关系索引失败: {e}"),
+        ),
+    }
+}
+
+async fn get_relationship(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    AxumPath(entity_id): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<RelationshipsQuery>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.relationship_get(&scope, &dom, &entity_id, query.expected_version) {
+        Ok(Some(detail)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "entity": entity_entry_json(&detail.entity),
+            "skipped_stale": detail.skipped_stale,
+            "items": detail.items.iter().map(|i| serde_json::json!({
+                "item_id": i.item_id,
+                "section": i.section,
+                "body": i.body,
+                "observed_or_inferred": i.observed_or_inferred,
+                "version": i.version,
+                "sources": i.sources.iter().map(|(mid, v, sha)| serde_json::json!({
+                    "memory_id": mid,
+                    "memory_version": v,
+                    "claim_sha256": sha,
+                    "stable_ref": memory_domain::refs::memory_stable_ref(
+                        &scope.tenant_id, &scope.user_id, &dom.write, mid, *v),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(None) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "实体不存在或不可见",
+        ),
+        Err(memory_store_sqlite::StoreError::VersionConflict) => err(
+            &req_id.0,
+            StatusCode::CONFLICT,
+            ErrorCode::VersionConflict,
+            "实体版本已变化，请重新读取",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取实体失败: {e}"),
+        ),
+    }
+}
+
+async fn resolve_relationship(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    axum::extract::Query(query): axum::extract::Query<RelationshipsQuery>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) else {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "q 不能为空",
+        );
+    };
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.relationship_resolve(&scope, &dom, q) {
+        Ok(memory_store_sqlite::relationships::Resolution::None) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "query": q,
+            "resolution": "none",
+            "candidates": [],
+        }))
+        .into_response(),
+        Ok(memory_store_sqlite::relationships::Resolution::One(e)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "query": q,
+            "resolution": "one",
+            "candidates": [entity_entry_json(&e)],
+        }))
+        .into_response(),
+        Ok(memory_store_sqlite::relationships::Resolution::Ambiguous(list)) => {
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "query": q,
+                "resolution": "ambiguous",
+                "candidates": list.iter().map(entity_entry_json).collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("解析失败: {e}"),
+        ),
+    }
+}
+
+async fn refresh_relationships(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.relationship_refresh(&scope, &dom) {
+        Ok(out) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "status": "ok",
+            "batch_version": out.batch_version,
+            "entities": out.entities,
+            "items": out.items,
+            "previous_entities": out.previous_entities,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("重建关系图谱失败: {e}"),
+        ),
+    }
 }
 
 async fn get_compact(

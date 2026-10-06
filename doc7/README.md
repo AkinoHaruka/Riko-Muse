@@ -46,6 +46,7 @@
 | 04-V2-S1-记忆域施工规范.md | V2-S1 迁移 0015、域解析/授权矩阵、存储层契约与验收（其余 V2 卡施工时先补规范） |
 | 05-V2-P1-精读与explain施工规范.md | V2-P1 统一可见性谓词、`memory_explain` 读模型、`riko://` 稳定引用与验收（不新增迁移） |
 | 06-V2-D1-蒸馏与投影施工规范.md | V2-D1 迁移 0016、`facet_v1`/`compact_v1` 规则、失效与 purge 闭包、只读投影与验收 |
+| 07-V2-R1-关系图谱施工规范.md | V2-R1 迁移 0017、`entity_v1` 投影规则（两种句式与拒绝规则）、索引/get/resolve、政策边界与验收 |
 
 ## V2 卡登记（2026-10-06，依据 Muse-V2迭代开发文档 00/06）
 
@@ -57,7 +58,7 @@
 | V2-00 | 基线核对、证据纠偏、doc7 依赖规范先行 | 本文件 + 04 号规范 |
 | V2-S1 | 记忆域与 side-chat 隔离（迁移 0015） | **内核与 HTTP 层已实施**：168 项 workspace 测试全绿、临时库 HTTP 冒烟通过，见 [交接 26](../doc-handoff/26-V2-S1记忆域交付记录.md)。未接线：Dream 作业域（`dream_worker.rs` 13 处 `/*DOM:dream-job-domain-pending*/`）、CLI 子命令（17 处 `/*DOM*/`）。真实 DSH 闭环与真实模型未验证 |
 | V2-P1 | quote/speaker 多证据读取、explain、stable_ref | **已实施**（规范 05）：统一可见性谓词、`memory_explain`、`riko://` 稳定引用、`GET /v1/memories/{id}/explain`、适配器 `memory_explain` 工具；181 项 Rust 测试 + 19 项适配器测试全绿，临时库 HTTP 冒烟通过。见 [交接 27](../doc-handoff/27-V2-P1精读与explain交付记录.md) |
-| V2-R1 | people/groups 索引、别名解析、详情延迟读取、关系维护任务 | 待施工（V2 文档 01） |
+| V2-R1 | people/groups 索引、别名解析、详情延迟读取、关系维护任务 | **已实施**（规范 07，迁移 0017 / schema 17）：`entity_v1` 确定性投影、索引/get/resolve 三接口、分级排序、来源失效即时屏蔽、purge 闭包、域隔离；组表建而未启用。203 项测试全绿 + 临时库 HTTP 冒烟。**人物事实完整覆盖仍受 THIRD_PARTY 门限制**，见 [交接 29](../doc-handoff/29-V2-R1关系图谱交付记录.md) |
 | V2-D1 | 四分面蒸馏、compact_memory、只读 Markdown 投影 | **已实施**（规范 06，迁移 0016 / schema 16）：`facet_v1` 确定性分面、compact 双预算与 Resident 去重、来源失效即时屏蔽、purge 闭包、`/v1/compact`+`/v1/facets`+`/v1/derived/refresh`、`memoryd export` 只读投影。191 项测试全绿 + 临时库 HTTP 冒烟。见 [交接 28](../doc-handoff/28-V2-D1蒸馏与投影交付记录.md) |
 | V2-B1/A1 | upkeep/Relationships/nightly 复盘/quiet pass + 复盘→修复行动 | 待施工（V2 文档 08） |
 | V2-H1 | DSH bundle 分段 + 工具 + 使用纪律 | 待施工（V2 文档 08） |

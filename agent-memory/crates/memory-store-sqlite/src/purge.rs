@@ -671,6 +671,36 @@ impl Store {
                      AND s.item_id=derived_items.id)",
             params![scope.tenant_id, scope.user_id],
         )?;
+        // 7.6 V2-R1（doc7/07 §4）：关系图谱闭包——删该记忆的来源行与别名行，
+        // 再删零来源的条目与实体；不允许无来源的实体存活。
+        tx.execute(
+            "DELETE FROM relationship_sources
+             WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+        )?;
+        tx.execute(
+            "DELETE FROM entity_aliases
+             WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+        )?;
+        tx.execute(
+            "DELETE FROM relationship_items
+             WHERE tenant_id=?1 AND user_id=?2
+               AND NOT EXISTS (SELECT 1 FROM relationship_sources s
+                   WHERE s.tenant_id=relationship_items.tenant_id
+                     AND s.user_id=relationship_items.user_id
+                     AND s.item_id=relationship_items.id)",
+            params![scope.tenant_id, scope.user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM relationship_entities
+             WHERE tenant_id=?1 AND user_id=?2
+               AND NOT EXISTS (SELECT 1 FROM relationship_items i
+                   WHERE i.tenant_id=relationship_entities.tenant_id
+                     AND i.user_id=relationship_entities.user_id
+                     AND i.entity_id=relationship_entities.id)",
+            params![scope.tenant_id, scope.user_id],
+        )?;
         // 8. 记忆墓碑。
         tx.execute(
             "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, domain_id, source_kind, source_id, created_at)

@@ -130,6 +130,7 @@ pub mod pages;
 #[cfg(test)]
 mod probes;
 pub mod purge;
+pub mod relationships;
 pub mod resident;
 pub mod semantic_index;
 pub mod soul;
@@ -139,6 +140,8 @@ mod v2_d1_tests;
 mod v2_domain_tests;
 #[cfg(test)]
 mod v2_p1_tests;
+#[cfg(test)]
+mod v2_r1_tests;
 
 pub use diagnostics::{CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem};
 pub use evidence::IngestOutcome;
