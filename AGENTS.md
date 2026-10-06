@@ -22,7 +22,7 @@ v1（doc/ 卡 0–6）、v2（doc2/ 卡 V2-0…V2-6）、doc4（D4-0…D4-7）�
 现有内核 schema 15（迁移 0001—0015；Riko-Muse 分支）；`0001`—`0014` 均冻结，新增迁移须从 `0016` 顺序递增；D5 新作业 extract_v3/admit_v2；doc7/03 起新作业 extract_v4/admit_v4（Muse rewrite 步骤），全部历史版本按作业行冻结
 remember 直写内容护栏按用户决定全部解除；保留 scope、最新用户证据、逐字 span、幂等与审计（doc-handoff/12）
 D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DSH 固定响应证据见 doc-handoff/20。记忆内核真实模型质量、全量 E01—E25、性能、dana/realtest 升级与 memoryd 生产部署仍未验证/未执行；Riko-App Bridge 生产部署状态单列见 doc-handoff/23。新开发以 doc6/doc7 当前规范和最新交接记录为准（doc7 变更须先更新规范）
-用户库 dana/realtest 未升级；没有单独部署指令不得触碰，升级前先只读快照并按交接记录处理 index_dirty（注意：Riko-Muse 分支的二进制会把库自动迁到 schema 14）
+用户库 dana/realtest 未升级；没有单独部署指令不得触碰，升级前先只读快照并按交接记录处理 index_dirty（注意：Riko-Muse 分支的二进制会把库自动迁到 schema 15）
 最新实施入口：doc-handoff/README.md + doc-handoff/27-V2-P1精读与explain交付记录.md + doc-handoff/26-V2-S1记忆域交付记录.md + doc-handoff/24-Riko-Muse交付记录.md + doc-handoff/25-Riko-Muse真实模型验收.md + doc-handoff/20-D6-11-15交付记录.md + doc-handoff/21-DSH-0.2适配.md + doc-handoff/22-DSH-rc2本机安装验证.md + doc-handoff/23-Android-Bridge生产部署与连通验证.md + doc6/README.md + doc6/08-施工任务卡.md + doc7/README.md + doc7/02-施工任务卡.md + doc7/03-extract_v4-rewrite.md
 ```
 
