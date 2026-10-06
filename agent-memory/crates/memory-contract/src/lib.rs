@@ -12,7 +12,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 整理作业与页面索引；历史迁移 0001—0004 冻结不改。
 /// 0014→14（doc7/01）：Riko-Muse 增量——rupture_events / repair_threads /
 /// alignment_synthesis；M1 valid_until 到期转 expired 复用既有 status 枚举，不新增表。
-pub const SCHEMA_VERSION: u32 = 14;
+/// 0015→15（doc7/04）：V2-S1 记忆域——memory_domains / 会话绑定 / 跨域授权 /
+/// 证据域映射；一等对象加 domain_id（缺省 user_main）；alignment_synthesis、
+/// purge_tombstones 主键重建；pages_published_unique 加域。
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；
@@ -122,6 +125,9 @@ pub enum ErrorCode {
     IndexDegraded,
     RateLimited,
     Internal,
+    /// V2-S1（doc7/04 §4）：域功能未启用时域管理端点统一 403。
+    /// 新增枚举值，不回改既有 code 的语义。
+    DomainDisabled,
 }
 
 impl ErrorCode {
@@ -144,6 +150,7 @@ impl ErrorCode {
             ErrorCode::IndexDegraded => "INDEX_DEGRADED",
             ErrorCode::RateLimited => "RATE_LIMITED",
             ErrorCode::Internal => "INTERNAL",
+            ErrorCode::DomainDisabled => "DOMAIN_DISABLED",
         }
     }
 }

@@ -40,10 +40,7 @@ pub fn rupture_matches(content: &str) -> Vec<RuptureMatch> {
             start_byte: start,
             end_byte: start + cue.len(),
         };
-        match best_by_signal
-            .iter_mut()
-            .find(|b| b.signal == *signal)
-        {
+        match best_by_signal.iter_mut().find(|b| b.signal == *signal) {
             Some(b) if m.start_byte < b.start_byte => *b = m,
             Some(_) => {}
             None => best_by_signal.push(m),
@@ -72,10 +69,7 @@ mod tests {
     fn same_signal_keeps_earliest_occurrence_only() {
         let content = "不对，这样不对。";
         let ms = rupture_matches(content);
-        let corrections: Vec<_> = ms
-            .iter()
-            .filter(|m| m.signal == "correction")
-            .collect();
+        let corrections: Vec<_> = ms.iter().filter(|m| m.signal == "correction").collect();
         assert_eq!(corrections.len(), 1);
         assert_eq!(corrections[0].start_byte, 0);
     }

@@ -38,13 +38,32 @@ fn remember_one(
     use crate::IngestOutcome;
     let t = chrono::Utc::now();
     let ev = match store
-        .record_evidence(scope, origin, seq, "user", "user", &t, claim)
+        .record_evidence(
+            scope,
+            origin,
+            seq,
+            "user",
+            "user",
+            &t,
+            claim,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) => id,
         crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
-    match store.remember(scope, origin, &ev, claim, kind).unwrap() {
+    match store
+        .remember(
+            scope,
+            origin,
+            &ev,
+            claim,
+            kind,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap()
+    {
         crate::RememberOutcome::Created { memory_id, .. } => memory_id,
         crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
     }
@@ -131,17 +150,31 @@ fn publish_page_and_read_path_source_validation() {
         sources: &[s1.clone(), s2.clone()],
         actor_kind: "system",
     };
-    let (page_id, v1) = store.publish_page(&req).unwrap();
+    let (page_id, v1) = store
+        .publish_page(&req, &memory_domain::DomainScope::user_main())
+        .unwrap();
     assert_eq!(v1, 1);
     let now = crate::now_rfc3339_pub().unwrap();
-    let page = store.get_page(&scope, &page_id, &now).unwrap().unwrap();
+    let page = store
+        .get_page(
+            &scope,
+            &page_id,
+            &now,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(page.status, "published");
     assert_eq!(page.sources.len(), 2);
     // HTTP 重放专用发布入口在相同冻结输入下返回原 receipt，不造新版本。
-    let replay = store.publish_page_idempotent(&req).unwrap();
+    let replay = store
+        .publish_page_idempotent(&req, &memory_domain::DomainScope::user_main())
+        .unwrap();
     assert_eq!(replay, (page_id.clone(), v1));
     // 普通手工发布保留 CAS 语义：同 key 再发布 → version+1，旧版留 revisions。
-    let (_, v2) = store.publish_page(&req).unwrap();
+    let (_, v2) = store
+        .publish_page(&req, &memory_domain::DomainScope::user_main())
+        .unwrap();
     assert_eq!(v2, 2);
     let rev_count: i64 = store
         .conn()
@@ -179,7 +212,7 @@ fn publish_page_and_read_path_source_validation() {
         actor_kind: "system",
     };
     assert!(matches!(
-        store.publish_page(&bad),
+        store.publish_page(&bad, &memory_domain::DomainScope::user_main()),
         Err(StoreError::StaleInput)
     ));
 }
@@ -210,15 +243,29 @@ fn topic_page_description_is_persisted_indexed_and_part_of_v2_vector_fingerprint
         actor_kind: "system",
     };
     let (page_id, version) = store
-        .publish_page_with_description(&request, "QuartzBay Rust 服务端工作经历")
+        .publish_page_with_description(
+            &request,
+            "QuartzBay Rust 服务端工作经历",
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     let page = store
-        .get_page(&scope, &page_id, &crate::now_rfc3339_pub().unwrap())
+        .get_page(
+            &scope,
+            &page_id,
+            &crate::now_rfc3339_pub().unwrap(),
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(page.description, "QuartzBay Rust 服务端工作经历");
     assert!(store
-        .page_fts_search(&scope, "quartzbay", 10)
+        .page_fts_search(
+            &scope,
+            "quartzbay",
+            10,
+            &memory_domain::DomainScope::user_main()
+        )
         .unwrap()
         .contains(&page_id));
 
@@ -246,7 +293,12 @@ fn topic_page_description_is_persisted_indexed_and_part_of_v2_vector_fingerprint
         .unwrap();
     store.rebuild_page_index().unwrap();
     assert!(store
-        .page_fts_search(&scope, "quartzbay", 10)
+        .page_fts_search(
+            &scope,
+            "quartzbay",
+            10,
+            &memory_domain::DomainScope::user_main()
+        )
         .unwrap()
         .contains(&page_id));
 }
@@ -274,9 +326,17 @@ fn page_with_purge_pending_source_is_hidden_from_search_reads_and_vector_indexin
         )
         .unwrap();
 
-    assert!(store.get_page(&scope, &page_id, &now).unwrap().is_none());
+    assert!(store
+        .get_page(
+            &scope,
+            &page_id,
+            &now,
+            &memory_domain::DomainScope::user_main()
+        )
+        .unwrap()
+        .is_none());
     assert!(!store
-        .page_fts_search(&scope, "摘要", 10)
+        .page_fts_search(&scope, "摘要", 10, &memory_domain::DomainScope::user_main())
         .unwrap()
         .contains(&page_id));
     assert!(store
@@ -321,9 +381,19 @@ fn source_invalidation_on_forget_and_correct() {
         ],
         actor_kind: "system",
     };
-    let (page_id, _) = store.publish_page(&req).unwrap();
+    let (page_id, _) = store
+        .publish_page(&req, &memory_domain::DomainScope::user_main())
+        .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
-    assert!(store.get_page(&scope, &page_id, &now).unwrap().is_some());
+    assert!(store
+        .get_page(
+            &scope,
+            &page_id,
+            &now,
+            &memory_domain::DomainScope::user_main()
+        )
+        .unwrap()
+        .is_some());
     // forget m1（v1 契约终态）+ 同事务语义的 stale_pages_for_memory。
     store
         .conn()
@@ -334,7 +404,15 @@ fn source_invalidation_on_forget_and_correct() {
         .unwrap();
     store.stale_pages_for_memory(&scope, &m1).unwrap();
     assert!(
-        store.get_page(&scope, &page_id, &now).unwrap().is_none(),
+        store
+            .get_page(
+                &scope,
+                &page_id,
+                &now,
+                &memory_domain::DomainScope::user_main()
+            )
+            .unwrap()
+            .is_none(),
         "来源失效后页立即不可见"
     );
     // FTS 索引同步移除。
@@ -390,21 +468,45 @@ fn question_version_change_and_archive_invalidate_pages() {
             .unwrap();
     }
     let now = crate::now_rfc3339_pub().unwrap();
-    assert!(store.get_page(&scope, "pg1", &now).unwrap().is_some());
+    assert!(store
+        .get_page(
+            &scope,
+            "pg1",
+            &now,
+            &memory_domain::DomainScope::user_main()
+        )
+        .unwrap()
+        .is_some());
     // 问题更新 → 画像立即 stale。
     let v2 = store
         .question_update(&scope, "work_style", "新定义", v, "user_cli")
         .unwrap();
     assert_eq!(v2, 2);
     assert!(
-        store.get_page(&scope, "pg1", &now).unwrap().is_none(),
+        store
+            .get_page(
+                &scope,
+                "pg1",
+                &now,
+                &memory_domain::DomainScope::user_main()
+            )
+            .unwrap()
+            .is_none(),
         "旧定义画像立即失效"
     );
     // 归档 → 同样即时失效；重复归档幂等。
     let v3 = store
         .question_archive(&scope, "work_style", v2, "user_cli")
         .unwrap();
-    assert!(store.get_page(&scope, "pg1", &now).unwrap().is_none());
+    assert!(store
+        .get_page(
+            &scope,
+            "pg1",
+            &now,
+            &memory_domain::DomainScope::user_main()
+        )
+        .unwrap()
+        .is_none());
     let v3b = store
         .question_archive(&scope, "work_style", v3, "user_cli")
         .unwrap();
@@ -438,6 +540,7 @@ fn consolidation_job_lifecycle_and_idempotency() {
             "fp-1",
             &inputs,
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     assert_eq!(job.status, "queued");
@@ -452,6 +555,7 @@ fn consolidation_job_lifecycle_and_idempotency() {
             "fp-1",
             &inputs,
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     assert_eq!(again.id, job.id, "同指纹返回原 job");
@@ -489,6 +593,7 @@ fn consolidation_job_lifecycle_and_idempotency() {
             "fp-2",
             &inputs,
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     let now2 = crate::now_rfc3339_pub().unwrap();
@@ -626,7 +731,10 @@ fn publish_two_source_page(
         sources: &sources,
         actor_kind: "system",
     };
-    store.publish_page(&req).unwrap().0
+    store
+        .publish_page(&req, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .0
 }
 
 #[test]
@@ -636,7 +744,15 @@ fn page_pin_enters_resident_and_stale_source_omits() {
     let page_id = publish_two_source_page(&mut store, &scope, &origin, "pp", 101);
     store.page_pin(&scope, &page_id).unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
-    let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+    let sel = store
+        .select_resident(
+            &scope,
+            &now,
+            24,
+            3000,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(sel
         .items
         .iter()
@@ -662,7 +778,15 @@ fn page_pin_enters_resident_and_stale_source_omits() {
         mid
     };
     store.stale_pages_for_memory(&scope, &m_forgotten).unwrap();
-    let sel2 = store.select_resident(&scope, &now, 24, 3000).unwrap();
+    let sel2 = store
+        .select_resident(
+            &scope,
+            &now,
+            24,
+            3000,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(
         sel2.items.iter().all(|i| i.memory_id != page_id),
         "失效页不进正文"
@@ -681,7 +805,7 @@ fn page_archive_and_rebuild_index_no_revival() {
     let now = crate::now_rfc3339_pub().unwrap();
     // FTS 命中（published）。
     assert!(store
-        .page_fts_search(&scope, "摘要", 10)
+        .page_fts_search(&scope, "摘要", 10, &memory_domain::DomainScope::user_main())
         .unwrap()
         .contains(&page_id));
     // 归档（CAS）。
@@ -696,7 +820,7 @@ fn page_archive_and_rebuild_index_no_revival() {
     assert!(store.page_archive(&scope, &page_id, version).unwrap());
     assert!(
         store
-            .page_fts_search(&scope, "摘要", 10)
+            .page_fts_search(&scope, "摘要", 10, &memory_domain::DomainScope::user_main())
             .unwrap()
             .is_empty(),
         "归档即移除索引"
@@ -704,7 +828,7 @@ fn page_archive_and_rebuild_index_no_revival() {
     // rebuild 只重建 published：归档页不复活。
     store.rebuild_page_index().unwrap();
     assert!(store
-        .page_fts_search(&scope, "摘要", 10)
+        .page_fts_search(&scope, "摘要", 10, &memory_domain::DomainScope::user_main())
         .unwrap()
         .is_empty());
     // pin 一页 + forget 一条来源 → 页 stale；rebuild 不复活。
@@ -728,7 +852,12 @@ fn page_archive_and_rebuild_index_no_revival() {
     store.rebuild_page_index().unwrap();
     assert!(
         !store
-            .page_fts_search(&scope, "arch2", 10)
+            .page_fts_search(
+                &scope,
+                "arch2",
+                10,
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .contains(&page2),
         "stale 页 rebuild 后不复活"

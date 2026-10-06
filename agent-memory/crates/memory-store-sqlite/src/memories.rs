@@ -5,7 +5,8 @@
 //! 绝不回滚已提交的规范记忆。所有读路径按规范表状态过滤（forgotten 永不返回）。
 
 use memory_domain::{
-    claim_sha256, find_quote_span, fold_whitespace, normalize_v1, MemoryKind, Origin, ScopeKey,
+    claim_sha256, find_quote_span, fold_whitespace, normalize_v1, DomainScope, MemoryKind, Origin,
+    ScopeKey, USER_MAIN_DOMAIN,
 };
 use memory_recall::{cjk_bigrams, is_single_char_query, latin_tokens, rrf_score};
 use rusqlite::{params, OptionalExtension};
@@ -267,6 +268,7 @@ impl Store {
         user_evidence_id: &str,
         quote: &str,
         kind: MemoryKind,
+        dom: &DomainScope,
     ) -> Result<RememberOutcome, StoreError> {
         // 1. 证据属当前 scope、role=user、source_kind=user、host/session 匹配。
         let (host, session, role, source_kind, content) = self
@@ -277,6 +279,21 @@ impl Store {
         }
         if host != origin.host_id || session != origin.session_id {
             return Err(StoreError::EvidenceNotFound);
+        }
+        // V2-S1（doc7/04 §2.2）：证据事件已映射到其他域时拒绝重放改域；
+        // 无映射行按 user_main 处理（域功能未启用期间的旧行为）。
+        let evidence_domain: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT domain_id FROM evidence_domain_map
+                 WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id, scope.user_id, user_evidence_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let evidence_domain = evidence_domain.unwrap_or_else(|| USER_MAIN_DOMAIN.to_string());
+        if evidence_domain != dom.write {
+            return Err(StoreError::StateConflict);
         }
         // 2. 必须是该会话最新用户事件。
         let (latest_id, _, _) = self
@@ -300,13 +317,15 @@ impl Store {
         let claim_hash = claim_sha256(kind, &claim);
         let now = now_rfc3339()?;
 
-        // 5. 去重：同 scope/kind/hash 且 active → 仅加证据。
+        // 5. 去重：同 scope/写域/kind/hash 且 active → 仅加证据。
+        // V2-S1：同文记忆在 main 与 side 保留各自身份，不跨域 dedup（doc7/04 §3）。
         let existing: Option<(String, i64)> = self
             .conn()
             .query_row(
                 "SELECT id, version FROM memories
-                 WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND claim_sha256=?4 AND status='active'",
-                params![scope.tenant_id, scope.user_id, kind.as_str(), claim_hash],
+                 WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND claim_sha256=?4 AND status='active'
+                   AND domain_id=?5",
+                params![scope.tenant_id, scope.user_id, kind.as_str(), claim_hash, dom.write],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -341,8 +360,8 @@ impl Store {
             "INSERT INTO memories
              (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256, source_class,
               status, version, occurred_at, valid_from, valid_until, origin_host_id, origin_agent_id,
-              created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11)",
+              created_at, updated_at, domain_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11,?12)",
             params![
                 memory_id,
                 scope.tenant_id,
@@ -354,7 +373,8 @@ impl Store {
                 origin.host_id,
                 origin.agent_id,
                 now,
-                now
+                now,
+                dom.write
             ],
         )?;
         tx.execute(
@@ -403,21 +423,30 @@ impl Store {
         })
     }
 
-    /// exact 召回（doc6/09 §4.B.1）：scope 内同 kind+claim hash 的 active 记忆。
+    /// exact 召回（doc6/09 §4.B.1）：读域集内同 kind+claim hash 的 active 记忆。
     pub fn memories_by_exact_hash(
         &self,
         scope: &ScopeKey,
         kind: &str,
         hash: &str,
         limit: usize,
+        dom: &DomainScope,
     ) -> Result<Vec<(String, i64)>, StoreError> {
         let mut stmt = self.conn().prepare(
             "SELECT id, version FROM memories
              WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND claim_sha256=?4 AND status='active'
-             LIMIT ?5",
+               AND domain_id IN (SELECT value FROM json_each(?5))
+             LIMIT ?6",
         )?;
         let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, kind, hash, limit as i64],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                kind,
+                hash,
+                dom.read_json(),
+                limit as i64
+            ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -439,17 +468,20 @@ impl Store {
     }
 
     /// GET /v1/memories/{id}。普通读只返回 active；非 active 视为不存在（doc/12 §5）。
+    /// V2-S1：只在读域集内可见。
     pub fn get_memory(
         &self,
         scope: &ScopeKey,
         memory_id: &str,
+        dom: &DomainScope,
     ) -> Result<Option<MemoryRow>, StoreError> {
         let row = self
             .conn()
             .query_row(
                 "SELECT kind, claim, status, version, occurred_at, valid_until, origin_agent_id, updated_at
-                 FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, memory_id],
+                 FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND domain_id IN (SELECT value FROM json_each(?4))",
+                params![scope.tenant_id, scope.user_id, memory_id, dom.read_json()],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -494,35 +526,39 @@ impl Store {
         }))
     }
 
-    /// 只读取当前 claim（resident export 等视图用）；跨 scope/不存在返回 None。
+    /// 只读取当前 claim（resident export 等视图用）；跨 scope/读域外/不存在返回 None。
     pub fn get_memory_claim(
         &self,
         scope: &ScopeKey,
         memory_id: &str,
+        dom: &DomainScope,
     ) -> Result<Option<String>, StoreError> {
         let claim = self
             .conn()
             .query_row(
-                "SELECT claim FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, memory_id],
+                "SELECT claim FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND domain_id IN (SELECT value FROM json_each(?4))",
+                params![scope.tenant_id, scope.user_id, memory_id, dom.read_json()],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(claim)
     }
 
-    /// 读取 (version, claim_sha256)（整理入队固化输入用）；跨 scope/不存在 None。
+    /// 读取 (version, claim_sha256)（整理入队固化输入用）；跨 scope/读域外/不存在 None。
     pub fn memory_version_sha(
         &self,
         scope: &ScopeKey,
         memory_id: &str,
+        dom: &DomainScope,
     ) -> Result<Option<(i64, String)>, StoreError> {
         let row = self
             .conn()
             .query_row(
                 "SELECT version, claim_sha256 FROM memories
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, memory_id],
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND domain_id IN (SELECT value FROM json_each(?4))",
+                params![scope.tenant_id, scope.user_id, memory_id, dom.read_json()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -536,20 +572,32 @@ impl Store {
         query: &str,
         limit: usize,
         include_history: bool,
+        dom: &DomainScope,
     ) -> Result<(Vec<SearchHit>, bool), StoreError> {
         let now = now_rfc3339()?;
         let status_clause = is_active_clause(include_history);
         let mut fts_hits: Vec<(String, f64)> = Vec::new();
         let mut gram_hits: Vec<(String, f64)> = Vec::new();
 
-        // 路 1：FTS5（拉丁文 token）
+        // 路 1：FTS5（拉丁文 token）；join 规范表过滤读域集（doc7/04 §3）。
         let tokens = latin_tokens(query);
         if let Some(m) = fts_match_query(&tokens) {
             let mut stmt = self.conn().prepare(
-                "SELECT memory_id, rank FROM memory_fts WHERE memory_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+                // FTS5 的 MATCH 左侧必须是 FTS 表名本身；带别名后 SQLite 会把别名
+                // 当列名解析（no such column: f），因此这里不给 FTS 表起别名。
+                "SELECT memory_fts.memory_id, rank FROM memory_fts
+                 JOIN memories m ON m.tenant_id=?2 AND m.user_id=?3 AND m.id=memory_fts.memory_id
+                   AND m.domain_id IN (SELECT value FROM json_each(?4))
+                 WHERE memory_fts MATCH ?1 ORDER BY rank LIMIT ?5",
             )?;
             let rows = stmt.query_map(
-                params![m, memory_contract::SEARCH_PER_CHANNEL_LIMIT as i64],
+                params![
+                    m,
+                    scope.tenant_id,
+                    scope.user_id,
+                    dom.read_json(),
+                    memory_contract::SEARCH_PER_CHANNEL_LIMIT as i64
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
             )?;
             for row in rows {
@@ -558,20 +606,24 @@ impl Store {
             }
         }
 
-        // 路 2：Unicode 二元字索引
+        // 路 2：Unicode 二元字索引（join 规范表过滤读域集）。
         let grams = cjk_bigrams(query);
         if !grams.is_empty() {
             let placeholders: Vec<String> = grams.iter().map(|_| "?".to_string()).collect();
             let sql = format!(
-                "SELECT memory_id, COUNT(DISTINCT gram) AS hits FROM memory_grams
-                 WHERE tenant_id=? AND user_id=? AND gram IN ({})
-                 GROUP BY memory_id ORDER BY hits DESC LIMIT ?",
+                "SELECT g.memory_id, COUNT(DISTINCT g.gram) AS hits FROM memory_grams g
+                 JOIN memories m ON m.tenant_id=? AND m.user_id=? AND m.id=g.memory_id
+                   AND m.domain_id IN (SELECT value FROM json_each(?))
+                 WHERE g.gram IN ({})
+                 GROUP BY g.memory_id ORDER BY hits DESC LIMIT ?",
                 placeholders.join(",")
             );
             let mut stmt = self.conn().prepare(&sql)?;
             let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::new();
             bind.push(&scope.tenant_id);
             bind.push(&scope.user_id);
+            let dom_json = dom.read_json();
+            bind.push(&dom_json);
             for g in &grams {
                 bind.push(g);
             }
@@ -597,12 +649,14 @@ impl Store {
             let mut stmt = self.conn().prepare(
                 "SELECT id, claim FROM memories
                  WHERE tenant_id=? AND user_id=? AND {status}
+                   AND domain_id IN (SELECT value FROM json_each(?))
                  ORDER BY updated_at DESC LIMIT ?",
             )?;
             let rows = stmt.query_map(
                 params![
                     scope.tenant_id,
                     scope.user_id,
+                    dom.read_json(),
                     memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64
                 ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
@@ -624,12 +678,14 @@ impl Store {
             let mut stmt = self.conn().prepare(
                 "SELECT id, claim FROM memories
                  WHERE tenant_id=? AND user_id=? AND status IN ('superseded','expired')
+                   AND domain_id IN (SELECT value FROM json_each(?))
                  ORDER BY updated_at DESC LIMIT ?",
             )?;
             let rows = stmt.query_map(
                 params![
                     scope.tenant_id,
                     scope.user_id,
+                    dom.read_json(),
                     memory_contract::SINGLE_CHAR_SCAN_LIMIT as i64
                 ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
@@ -703,13 +759,14 @@ impl Store {
                     &format!(
                         "SELECT kind, claim, status, version FROM memories
                          WHERE tenant_id=? AND user_id=? AND id=? AND {status_clause}
+                           AND domain_id IN (SELECT value FROM json_each(?))
                            AND (valid_until IS NULL OR valid_until > ?)
                            AND NOT EXISTS (SELECT 1 FROM memory_retirements r
                                            WHERE r.tenant_id=memories.tenant_id AND r.user_id=memories.user_id
                                              AND r.memory_id=memories.id)
                          ORDER BY updated_at DESC"
                     ),
-                    params![scope.tenant_id, scope.user_id, id, now],
+                    params![scope.tenant_id, scope.user_id, id, dom.read_json(), now],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
@@ -751,14 +808,15 @@ impl Store {
         &self,
         scope: &ScopeKey,
         memory_id: &str,
+        dom: &DomainScope,
     ) -> Result<Option<(String, String, i64, String, String)>, StoreError> {
-        // (kind, claim, version, status, claim_sha256)
+        // (kind, claim, version, status, claim_sha256)；仅写域内对象可更正/遗忘。
         let row = self
             .conn()
             .query_row(
                 "SELECT kind, claim, version, status, claim_sha256 FROM memories
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, memory_id],
+                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND domain_id=?4",
+                params![scope.tenant_id, scope.user_id, memory_id, dom.write],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -807,9 +865,10 @@ impl Store {
         scope: &ScopeKey,
         memory_id: &str,
         req: &CorrectRequest,
+        dom: &DomainScope,
     ) -> Result<CorrectOutcome, StoreError> {
         let Some((kind, claim, version, status, claim_hash)) =
-            self.memory_row_for_update(scope, memory_id)?
+            self.memory_row_for_update(scope, memory_id, dom)?
         else {
             return Err(StoreError::MemoryNotFound);
         };
@@ -866,15 +925,15 @@ impl Store {
              VALUES (?1,?2,?3,?4,?5,?6,'active','superseded','user',?7,'user_correct',?8)",
             params![scope.tenant_id, scope.user_id, memory_id, version + 1, claim, new_claim, req.user_evidence_id, now],
         )?;
-        // 新记忆 active。
+        // 新记忆 active（归属写域，与被更正对象同域）。
         tx.execute(
             "INSERT INTO memories
              (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256, source_class,
-              status, version, occurred_at, valid_from, valid_until, origin_host_id, origin_agent_id, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11)",
+              status, version, occurred_at, valid_from, valid_until, origin_host_id, origin_agent_id, created_at, updated_at, domain_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11,?12)",
             params![
                 new_memory_id, scope.tenant_id, scope.user_id, kind, new_claim,
-                normalize_v1(&new_claim), new_hash, req.origin.host_id, req.origin.agent_id, now, now
+                normalize_v1(&new_claim), new_hash, req.origin.host_id, req.origin.agent_id, now, now, dom.write
             ],
         )?;
         tx.execute(
@@ -958,9 +1017,10 @@ impl Store {
         scope: &ScopeKey,
         memory_id: &str,
         req: &ForgetRequest,
+        dom: &DomainScope,
     ) -> Result<ForgetOutcome, StoreError> {
         let Some((kind, claim, version, status, claim_hash)) =
-            self.memory_row_for_update(scope, memory_id)?
+            self.memory_row_for_update(scope, memory_id, dom)?
         else {
             return Err(StoreError::MemoryNotFound);
         };
@@ -1017,15 +1077,17 @@ impl Store {
              VALUES (?1,?2,?3,?4,?5,?6,'active','forgotten','user',?7,'user_forget',?8)",
             params![scope.tenant_id, scope.user_id, memory_id, version + 1, claim, claim, req.user_evidence_id, now],
         )?;
-        // 抑制源：每个证据引用一行，防后台重放复活（doc/13 §7）。
+        // 抑制源：每个证据引用一行，防后台重放复活（doc/13 §7）；
+        // V2-S1：按写域记墓碑，main 遗忘不拦 side 重放（doc7/04 §3）。
         for (evidence_id, _, _) in &refs {
             tx.execute(
                 "INSERT OR IGNORE INTO suppressed_sources
-                 (tenant_id, user_id, evidence_id, claim_sha256, forgotten_memory_id, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                 (tenant_id, user_id, domain_id, evidence_id, claim_sha256, forgotten_memory_id, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     scope.tenant_id,
                     scope.user_id,
+                    dom.write,
                     evidence_id,
                     claim_hash,
                     memory_id,
@@ -1133,8 +1195,9 @@ impl Store {
         query: &str,
         max_items: usize,
         max_chars: usize,
+        dom: &DomainScope,
     ) -> Result<ComposeResult, StoreError> {
-        let (hits, degraded) = self.search_memories(scope, query, 20, false)?;
+        let (hits, degraded) = self.search_memories(scope, query, 20, false, dom)?;
         // doc/13 §6：长期指令先占最多 2 个名额，再填当前查询相关记录。
         // 指令名额独立于查询——词法未命中的 active 指令也必须进入，否则
         // 「以后回答请始终用中文」在无关查询（如闲聊）下失效
@@ -1153,7 +1216,7 @@ impl Store {
         }
         // 名额未满时按 updated_at DESC 补齐未命中的 active 指令。
         if instruction_slots < 2 {
-            for h in self.active_instruction_hits(scope, 2)? {
+            for h in self.active_instruction_hits(scope, 2, dom)? {
                 if seen.insert(h.memory_id.clone()) {
                     ordered.push(h);
                     instruction_slots += 1;
@@ -1216,6 +1279,7 @@ impl Store {
         &self,
         scope: &ScopeKey,
         limit: usize,
+        dom: &DomainScope,
     ) -> Result<Vec<SearchHit>, StoreError> {
         let now = now_rfc3339()?;
         let ids: Vec<String> = {
@@ -1223,10 +1287,17 @@ impl Store {
                 "SELECT id FROM memories
                  WHERE tenant_id=?1 AND user_id=?2 AND kind='instruction' AND status='active'
                    AND (valid_until IS NULL OR valid_until > ?3)
-                 ORDER BY updated_at DESC, id ASC LIMIT ?4",
+                   AND domain_id IN (SELECT value FROM json_each(?4))
+                 ORDER BY updated_at DESC, id ASC LIMIT ?5",
             )?;
             let rows = stmt.query_map(
-                params![scope.tenant_id, scope.user_id, now, limit as i64],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    now,
+                    dom.read_json(),
+                    limit as i64
+                ],
                 |r| r.get::<_, String>(0),
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -1238,8 +1309,9 @@ impl Store {
                 .query_row(
                     "SELECT kind, claim, status, version FROM memories
                      WHERE tenant_id=? AND user_id=? AND id=? AND status='active'
+                       AND domain_id IN (SELECT value FROM json_each(?))
                        AND (valid_until IS NULL OR valid_until > ?)",
-                    params![scope.tenant_id, scope.user_id, id, now],
+                    params![scope.tenant_id, scope.user_id, id, dom.read_json(), now],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
@@ -1308,7 +1380,16 @@ mod tests {
     fn ingest_user(store: &mut Store, scope: &ScopeKey, seq: i64, content: &str) -> String {
         let t = chrono::Utc::now();
         match store
-            .record_evidence(scope, &origin(), seq, "user", "user", &t, content)
+            .record_evidence(
+                scope,
+                &origin(),
+                seq,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             IngestOutcome::Recorded(id) => id,
@@ -1329,11 +1410,19 @@ mod tests {
                 &ev,
                 "以后回答请始终用中文",
                 MemoryKind::Instruction,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         // 与指令零词法重叠的查询也要召回该指令。
         let r = store
-            .compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000)
+            .compose_context(
+                &scope,
+                "a",
+                "怎么做蛋炒饭",
+                5,
+                2000,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         assert_eq!(r.items.len(), 1);
         assert!(r.text.contains("以后回答请始终用中文"));
@@ -1350,6 +1439,7 @@ mod tests {
                 &ev2,
                 "以后回答要给代码示例",
                 MemoryKind::Instruction,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         let ev3 = ingest_user(&mut store, &scope, 24, "以后先说明风险再动手");
@@ -1360,10 +1450,18 @@ mod tests {
                 &ev3,
                 "以后先说明风险再动手",
                 MemoryKind::Instruction,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         let r2 = store
-            .compose_context(&scope, "a", "怎么做蛋炒饭", 5, 2000)
+            .compose_context(
+                &scope,
+                "a",
+                "怎么做蛋炒饭",
+                5,
+                2000,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         // 三条指令但名额只有 2：文本恰好包含两条 claim（最新的 updated_at DESC 两条）。
         assert!(r2.text.contains("以后回答要给代码示例"));
@@ -1389,16 +1487,51 @@ mod tests {
         };
         // Agent 主动写入（无任何保存指令）：普通偏好。
         let ev1 = ingest_user(&mut store, &scope, 1, "我喜欢暗色主题");
-        created(store.remember(&scope, &o, &ev1, "我喜欢暗色主题", MemoryKind::Preference));
+        created(store.remember(
+            &scope,
+            &o,
+            &ev1,
+            "我喜欢暗色主题",
+            MemoryKind::Preference,
+            &memory_domain::DomainScope::user_main(),
+        ));
         // 健康、凭据、时间性、第三人：无指令均 active（原四类门解除）。
         let ev2 = ingest_user(&mut store, &scope, 2, "我对花生过敏");
-        let id1 = created(store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Fact));
+        let id1 = created(store.remember(
+            &scope,
+            &o,
+            &ev2,
+            "我对花生过敏",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        ));
         let ev3 = ingest_user(&mut store, &scope, 3, "我的密码：abcd1234");
-        created(store.remember(&scope, &o, &ev3, "我的密码：abcd1234", MemoryKind::Fact));
+        created(store.remember(
+            &scope,
+            &o,
+            &ev3,
+            "我的密码：abcd1234",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        ));
         let ev4 = ingest_user(&mut store, &scope, 4, "我今年九月开始新工作");
-        created(store.remember(&scope, &o, &ev4, "我今年九月开始新工作", MemoryKind::Fact));
+        created(store.remember(
+            &scope,
+            &o,
+            &ev4,
+            "我今年九月开始新工作",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        ));
         let ev5 = ingest_user(&mut store, &scope, 5, "我姐在成都教书");
-        created(store.remember(&scope, &o, &ev5, "我姐在成都教书", MemoryKind::Fact));
+        created(store.remember(
+            &scope,
+            &o,
+            &ev5,
+            "我姐在成都教书",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        ));
         // 复合命题（原 doc5/09 决策 B 拒绝样本）→ active。
         let ev6 = ingest_user(
             &mut store,
@@ -1412,11 +1545,19 @@ mod tests {
             &ev6,
             "我对芒果过敏，以后别再推荐含芒果的甜品",
             MemoryKind::Preference,
+            &memory_domain::DomainScope::user_main(),
         ));
         // 幂等不变：同 claim 重复 remember → Dedup（仅加证据，不新建）。
         let ev7 = ingest_user(&mut store, &scope, 7, "我对花生过敏");
         match store
-            .remember(&scope, &o, &ev7, "我对花生过敏", MemoryKind::Fact)
+            .remember(
+                &scope,
+                &o,
+                &ev7,
+                "我对花生过敏",
+                MemoryKind::Fact,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             RememberOutcome::Dedup { memory_id, .. } => assert_eq!(memory_id, id1),
@@ -1425,12 +1566,26 @@ mod tests {
         // quote 不逐字仍拒绝（协议校验，非内容护栏）。
         let ev8 = ingest_user(&mut store, &scope, 8, "今天聊到这");
         assert!(matches!(
-            store.remember(&scope, &o, &ev8, "这句话不在消息里", MemoryKind::Fact),
+            store.remember(
+                &scope,
+                &o,
+                &ev8,
+                "这句话不在消息里",
+                MemoryKind::Fact,
+                &memory_domain::DomainScope::user_main()
+            ),
             Err(StoreError::QuoteMismatch)
         ));
         // stale 证据仍拒绝。
         assert!(matches!(
-            store.remember(&scope, &o, &ev2, "我对花生过敏", MemoryKind::Fact),
+            store.remember(
+                &scope,
+                &o,
+                &ev2,
+                "我对花生过敏",
+                MemoryKind::Fact,
+                &memory_domain::DomainScope::user_main()
+            ),
             Err(StoreError::StaleUserEvidence)
         ));
         // 跨用户隔离不变：另一 scope 的 evidence id → EvidenceNotFound，不泄露存在性。
@@ -1445,7 +1600,14 @@ mod tests {
             user_id: "u2".into(),
         };
         assert!(matches!(
-            store.remember(&scope2, &o, &ev2, "我对花生过敏", MemoryKind::Fact),
+            store.remember(
+                &scope2,
+                &o,
+                &ev2,
+                "我对花生过敏",
+                MemoryKind::Fact,
+                &memory_domain::DomainScope::user_main()
+            ),
             Err(StoreError::EvidenceNotFound)
         ));
     }

@@ -36,7 +36,16 @@ fn ingest_user(
 ) -> String {
     let t = chrono::Utc::now();
     match store
-        .record_evidence(scope, origin, seq, "user", "user", &t, content)
+        .record_evidence(
+            scope,
+            origin,
+            seq,
+            "user",
+            "user",
+            &t,
+            content,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) => id,
@@ -51,21 +60,45 @@ fn dream_trigger_snapshot_idempotent_and_freezes_inputs() {
     let (mut store, scope, origin) = setup("trigger");
     // 无事件：不建作业。
     assert!(store
-        .dream_trigger(&scope, "manual", "k0", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k0",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main()
+        )
         .unwrap()
         .is_none());
     let e1 = ingest_user(&mut store, &scope, &origin, 1, "我住在杭州");
     let e2 = ingest_user(&mut store, &scope, &origin, 2, "我对芒果过敏");
     let now = crate::now_rfc3339_pub().unwrap();
     let job = store
-        .dream_trigger(&scope, "manual", "k1", Some("agent-a"), None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            Some("agent-a"),
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(job.extract_version, DREAM_EXTRACT_V2);
     assert_eq!(job.status, "queued");
     // 同 key 重放：返回原 job（幂等 coalesce）。
     let replay = store
-        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(replay.id, job.id);
@@ -99,7 +132,15 @@ fn dream_trigger_snapshot_idempotent_and_freezes_inputs() {
     assert_ne!(pend, "assigned", "快照后新事件保持待处理");
     // 不同 key 新 trigger：新 job 只收 pending 的新事件。
     let job2 = store
-        .dream_trigger(&scope, "scheduled", "auto-2026-09-26", None, None, None)
+        .dream_trigger(
+            &scope,
+            "scheduled",
+            "auto-2026-09-26",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     let inputs3 = store.dream_input_evidence_ids(&scope, &job2.id).unwrap();
@@ -114,7 +155,15 @@ fn dream_submit_candidates_validates_spans_and_lifecycle() {
     let content = "我住在杭州，喜欢简短回答。";
     let e1 = ingest_user(&mut store, &scope, &origin, 1, content);
     let job = store
-        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
@@ -200,7 +249,15 @@ fn dream_recover_expired_and_provider_wait() {
     let (mut store, scope, origin) = setup("recover");
     let _ = ingest_user(&mut store, &scope, &origin, 1, "我住在杭州");
     let job = store
-        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。

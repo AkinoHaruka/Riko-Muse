@@ -6,7 +6,9 @@
 //! 不用 window_key 字符串序。claim_generation 在每次领取/恢复时原子递增，用于隔离
 //! 失去所有权的旧执行者。
 
-use memory_domain::{claim_sha256, fold_whitespace, normalize_v1, MemoryKind, Origin, ScopeKey};
+use memory_domain::{
+    claim_sha256, fold_whitespace, normalize_v1, DomainScope, MemoryKind, Origin, ScopeKey,
+};
 use memory_extract::{Admission, WindowEvent};
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
@@ -55,6 +57,8 @@ pub struct JobRow {
     pub admission_version: String,
     /// 当前执行权代际：每次领取/过期恢复原子 +1；旧代际的提交一律失效（doc4/02 §4—5）。
     pub claim_generation: i64,
+    /// V2-S1：作业归属记忆域；worker 按此构造 DomainScope（doc7/04 §2.4）。
+    pub domain_id: String,
 }
 
 /// 候选落库结果（审计/诊断用）。
@@ -83,6 +87,7 @@ impl Store {
         host_id: &str,
         session_id: &str,
         through_event_seq: i64,
+        dom: &DomainScope,
     ) -> Result<FlushOutcome, StoreError> {
         struct PendingWindow {
             through: i64,
@@ -165,6 +170,30 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
 
+        // V2-S1（doc7/04 §2.2）：窗口内事件映射域必须与写域一致（无映射按 user_main）；
+        // 提取窗口不得横跨未经授权的域。
+        let domain_mismatch: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM evidence_events e
+             WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.host_id=?3 AND e.session_id=?4
+               AND e.event_seq>?5 AND e.event_seq<=?6
+               AND COALESCE((SELECT d.domain_id FROM evidence_domain_map d
+                             WHERE d.tenant_id=e.tenant_id AND d.user_id=e.user_id
+                               AND d.evidence_id=e.id), 'user_main') != ?7",
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                host_id,
+                session_id,
+                last,
+                through_event_seq,
+                dom.write
+            ],
+            |r| r.get(0),
+        )?;
+        if domain_mismatch > 0 {
+            return Err(StoreError::StateConflict);
+        }
+
         // 贪心分组：按 seq 递增；加入下一事件会超 100 事件或 32 KiB 时先封闭当前组。
         let mut pending: Vec<PendingWindow> = Vec::new();
         let mut cur_count = 0usize;
@@ -231,8 +260,8 @@ impl Store {
                 "INSERT INTO extraction_jobs
                  (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
                   status, attempts, run_after, created_at, updated_at, prompt_version,
-                  admission_version, error_code)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13,?14)",
+                  admission_version, error_code, domain_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     job_id,
                     scope.tenant_id,
@@ -247,7 +276,8 @@ impl Store {
                     now,
                     memory_contract::EXTRACT_PROMPT_VERSION,
                     memory_contract::ADMISSION_VERSION,
-                    error_code
+                    error_code,
+                    dom.write
                 ],
             )?;
             Ok(job_id)
@@ -776,6 +806,8 @@ impl Store {
         c: &memory_extract::ModelCandidate,
         admission: Admission,
     ) -> Result<CandidateOutcome, StoreError> {
+        // V2-S1：候选与派生记忆归属作业域；准入查库按写域过滤（doc7/04 §2.4/§3）。
+        let dom = DomainScope::for_job(&job.domain_id);
         let quote = fold_whitespace(&c.quote);
         // doc7/03：extract_v4 rewrite 产出的命题成为记忆正文；quote 保持逐字原文。
         let claim_text = fold_whitespace(c.claim.as_deref().unwrap_or(&c.quote));
@@ -853,8 +885,8 @@ impl Store {
         tx.execute(
             "INSERT INTO memory_candidates
              (id, tenant_id, user_id, job_id, primary_evidence_id, kind, quote, quote_sha256, claim,
-              source_class, status, reason_code, model_confidence, occurred_at, valid_until, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              source_class, status, reason_code, model_confidence, occurred_at, valid_until, created_at, domain_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 candidate_id,
                 scope.tenant_id,
@@ -871,7 +903,8 @@ impl Store {
                 c.confidence,
                 c.occurred_at,
                 c.valid_until,
-                now
+                now,
+                dom.write
             ],
         )?;
         tx.execute(
@@ -893,8 +926,9 @@ impl Store {
             let existing_active: Option<(String, i64)> = tx
                 .query_row(
                     "SELECT id, version FROM memories
-                     WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND claim_sha256=?4 AND status='active'",
-                    params![scope.tenant_id, scope.user_id, kind.as_str(), claim_hash],
+                     WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND claim_sha256=?4 AND status='active'
+                       AND domain_id=?5",
+                    params![scope.tenant_id, scope.user_id, kind.as_str(), claim_hash, dom.write],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -912,8 +946,8 @@ impl Store {
                 let suppressed: bool = tx
                     .query_row(
                         "SELECT 1 FROM suppressed_sources
-                         WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3 AND claim_sha256=?4 LIMIT 1",
-                        params![scope.tenant_id, scope.user_id, c.source_event_id, claim_hash],
+                         WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?5 AND evidence_id=?3 AND claim_sha256=?4 LIMIT 1",
+                        params![scope.tenant_id, scope.user_id, c.source_event_id, claim_hash, dom.write],
                         |_| Ok(true),
                     )
                     .optional()?
@@ -924,7 +958,9 @@ impl Store {
                     };
                 } else {
                     // 规则 9：属性键相同而值不同的 active → held:POSSIBLE_CONFLICT。
-                    if let Some(conflict_id) = Self::attribute_conflict(&tx, scope, kind, &claim_text)? {
+                    if let Some(conflict_id) =
+                        Self::attribute_conflict(&tx, scope, kind, &claim_text, &dom)?
+                    {
                         let _ = conflict_id;
                         tx.execute(
                             "UPDATE memory_candidates SET status='held', reason_code='POSSIBLE_CONFLICT' WHERE id=?1",
@@ -940,12 +976,12 @@ impl Store {
                             "INSERT INTO memories
                              (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256, source_class,
                               status, version, occurred_at, valid_from, valid_until, origin_host_id, origin_agent_id,
-                              created_at, updated_at)
-                             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11)",
+                              created_at, updated_at, domain_id)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11,?12)",
                             params![
                                 memory_id, scope.tenant_id, scope.user_id, kind.as_str(),
                                 claim_text, normalize_v1(&claim_text), claim_hash,
-                                origin.host_id, origin.agent_id, now, now
+                                origin.host_id, origin.agent_id, now, now, dom.write
                             ],
                         )?;
                         tx.execute(
@@ -992,6 +1028,7 @@ impl Store {
         scope: &ScopeKey,
         kind: MemoryKind,
         quote: &str,
+        dom: &DomainScope,
     ) -> Result<Option<String>, StoreError> {
         let new_key = match extract_attr_key(quote, kind) {
             Some(k) => k,
@@ -999,10 +1036,10 @@ impl Store {
         };
         let mut stmt = conn.prepare(
             "SELECT id, claim FROM memories
-             WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND status='active'",
+             WHERE tenant_id=?1 AND user_id=?2 AND kind=?3 AND status='active' AND domain_id=?4",
         )?;
         let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, kind.as_str()],
+            params![scope.tenant_id, scope.user_id, kind.as_str(), dom.write],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )?;
         for row in rows {
@@ -1068,6 +1105,7 @@ fn job_row_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
             prompt_version: r.get(12)?,
             admission_version: r.get(13)?,
             claim_generation: r.get(14)?,
+            domain_id: r.get(15)?,
         })
     }
 }
@@ -1075,7 +1113,7 @@ fn job_row_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
 /// JobRow 查询列（与 job_row_mapper 的列序一一对应）。
 const JOB_ROW_COLUMNS: &str = "id, tenant_id, user_id, host_id, session_id, window_key, \
      through_event_seq, status, attempts, run_after, created_at, updated_at, prompt_version, \
-     admission_version, claim_generation";
+     admission_version, claim_generation, domain_id";
 
 use sha2::Digest;
 
@@ -1084,7 +1122,7 @@ mod tests {
     //! doc4/02 §6 的确定性检查：固定相对时钟 + 临时 SQLite；不涉及模型调用。
     use super::*;
     use crate::{Store, StoreError};
-    use memory_domain::{Origin, ScopeKey};
+    use memory_domain::{DomainScope, Origin, ScopeKey};
 
     fn migrations_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1126,12 +1164,30 @@ mod tests {
             session_id: session.into(),
         };
         store
-            .record_evidence(scope, &origin, seq, "user", "user", &t, content)
+            .record_evidence(
+                scope,
+                &origin,
+                seq,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
     }
 
     fn flush(store: &mut Store, scope: &ScopeKey, session: &str, through: i64) -> String {
-        match store.flush_window(scope, "dsh", session, through).unwrap() {
+        match store
+            .flush_window(
+                scope,
+                "dsh",
+                session,
+                through,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             other => panic!("应创建作业，实际 {other:?}"),
         }
@@ -1415,7 +1471,15 @@ mod tests {
         for seq in 1..=101 {
             ingest(&mut store, &scope, "s1", seq, &format!("事件{seq}"));
         }
-        let outcome = store.flush_window(&scope, "dsh", "s1", 101).unwrap();
+        let outcome = store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                101,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         let last_id = match &outcome {
             FlushOutcome::Created { job_id, status } => {
                 assert_eq!(status, "queued", "最后作业应 queued");
@@ -1472,7 +1536,16 @@ mod tests {
             "最后作业 ID = 请求 through 对应作业"
         );
         // 重放：同 ID/状态返回，不新增窗口。
-        match store.flush_window(&scope, "dsh", "s1", 101).unwrap() {
+        match store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                101,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Existing { job_id, .. } => assert_eq!(job_id, last_id),
             other => panic!("重放应 Existing，实际 {other:?}"),
         }
@@ -1497,7 +1570,15 @@ mod tests {
         let quoted = "\"".repeat(10_000);
         ingest(&mut store, &scope, "s1", 1, &quoted);
         ingest(&mut store, &scope, "s1", 2, &quoted);
-        store.flush_window(&scope, "dsh", "s1", 2).unwrap();
+        store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                2,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         let (jobs, statuses): (i64, String) = store
             .conn()
             .query_row(
@@ -1561,7 +1642,15 @@ mod tests {
         ingest(&mut store, &scope, "s1", 1, &big);
         ingest(&mut store, &scope, "s1", 2, "正常事件2");
         ingest(&mut store, &scope, "s1", 3, "正常事件3");
-        store.flush_window(&scope, "dsh", "s1", 3).unwrap();
+        store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                3,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         // L0 保留。
         let ev1: String = store
             .conn()
@@ -1703,7 +1792,15 @@ mod tests {
         let scope = scope_of(&store, "t", "u");
         let big = "是".repeat(13_500);
         ingest(&mut store, &scope, "s1", 1, &big);
-        store.flush_window(&scope, "dsh", "s1", 1).unwrap();
+        store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         let dead_id: String = store.conn().query_row(
             "SELECT id FROM extraction_jobs WHERE status='dead' AND error_code='WINDOW_TOO_LARGE'",
             [], |r| r.get(0),
@@ -1823,7 +1920,8 @@ mod tests {
                 occurred_at: None,
                 valid_until: None,
                 confidence: None,
-            claim: None,};
+                claim: None,
+            };
             store
                 .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
                 .unwrap()
@@ -1895,7 +1993,8 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        claim: None,};
+            claim: None,
+        };
         let out1 = store
             .save_candidate(&scope, &job, &origin, &c, memory_extract::Admission::Active)
             .unwrap();
@@ -1909,7 +2008,16 @@ mod tests {
         // 用户遗忘。
         let t = chrono::Utc::now();
         let forget_evid = match store
-            .record_evidence(&scope, &origin, 2, "user", "user", &t, "忘记我喜欢Rust")
+            .record_evidence(
+                &scope,
+                &origin,
+                2,
+                "user",
+                "user",
+                &t,
+                "忘记我喜欢Rust",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) => id,
@@ -1925,6 +2033,7 @@ mod tests {
                     user_evidence_id: forget_evid,
                     target_quote: "我喜欢Rust".into(),
                 },
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         // 同一旧证据的新作业重放同 quote → SUPPRESSED_SOURCE，不复活。
@@ -1950,7 +2059,15 @@ mod tests {
             },
             "A23"
         );
-        let (hits, _) = store.search_memories(&scope, "Rust", 5, false).unwrap();
+        let (hits, _) = store
+            .search_memories(
+                &scope,
+                "Rust",
+                5,
+                false,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(hits.is_empty(), "遗忘后不得复活");
     }
 
@@ -1962,7 +2079,16 @@ mod tests {
         let scope = scope_of(&store, "t", "u");
         ingest(&mut store, &scope, "s1", 1, "事件1");
         ingest(&mut store, &scope, "s1", 3, "事件3"); // 空洞：seq 2
-        match store.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        match store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, status } => {
                 assert_eq!(status, "queued");
                 let _ = job_id;
@@ -1970,7 +2096,16 @@ mod tests {
             other => panic!("应 Created，实际 {other:?}"),
         }
         // flush through 2 落在空洞：无事件 → succeeded checkpoint。
-        match store.flush_window(&scope, "dsh", "s1", 2).unwrap() {
+        match store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                2,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::NothingToExtract { job_id } => {
                 assert_eq!(job_field(&store, &job_id, "status"), "succeeded");
             }
@@ -1984,16 +2119,43 @@ mod tests {
             session_id: "s2".into(),
         };
         store
-            .record_evidence(&scope, &o, 1, "assistant", "assistant", &t, "助手消息不算")
+            .record_evidence(
+                &scope,
+                &o,
+                1,
+                "assistant",
+                "assistant",
+                &t,
+                "助手消息不算",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
-        match store.flush_window(&scope, "dsh", "s2", 1).unwrap() {
+        match store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s2",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::NothingToExtract { job_id } => {
                 assert_eq!(job_field(&store, &job_id, "status"), "succeeded");
             }
             other => panic!("assistant-only 范围应 checkpoint，实际 {other:?}"),
         }
         // 后续真实范围（through 3）可正常创建且包含事件 3。
-        match store.flush_window(&scope, "dsh", "s1", 3).unwrap() {
+        match store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                3,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { status, .. } => assert_eq!(status, "queued"),
             other => panic!("应 Created，实际 {other:?}"),
         }

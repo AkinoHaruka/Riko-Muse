@@ -4,7 +4,7 @@
 //! 对象状态/版本变化由业务事务同事务置 stale（correct/forget/归档），新建/更新
 //! 由服务端入队异步重算；索引失败不影响 L1 与 resident 的使用（doc6/02 §4）。
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -281,8 +281,9 @@ impl Store {
         model_id: &str,
         query: &[f32],
         top_k: usize,
+        dom: &DomainScope,
     ) -> Result<(Vec<(String, f32)>, usize), StoreError> {
-        self.semantic_scan_inner(scope, object_kind, model_id, query, top_k, None)
+        self.semantic_scan_inner(scope, object_kind, model_id, query, top_k, None, dom)
     }
 
     /// Query-time scan with an inclusive cosine relevance floor. This is for online
@@ -296,6 +297,7 @@ impl Store {
         query: &[f32],
         top_k: usize,
         min_similarity: f32,
+        dom: &DomainScope,
     ) -> Result<(Vec<(String, f32)>, usize), StoreError> {
         if !min_similarity.is_finite() || !(0.0..=1.0).contains(&min_similarity) {
             return Err(StoreError::InvalidPageField);
@@ -307,6 +309,7 @@ impl Store {
             query,
             top_k,
             Some(min_similarity),
+            dom,
         )
     }
 
@@ -318,15 +321,28 @@ impl Store {
         query: &[f32],
         top_k: usize,
         min_similarity: Option<f32>,
+        dom: &DomainScope,
     ) -> Result<(Vec<(String, f32)>, usize), StoreError> {
         if query.is_empty() || !query.iter().all(|v| v.is_finite()) {
             return Err(StoreError::InvalidPageField);
         }
         let dims = query.len() as i64;
+        // V2-S1：向量按父对象（memories/memory_pages）的域过滤，候选集不越读域集。
         let mut stmt = self.conn().prepare(
             "SELECT object_id, vector_blob FROM semantic_vectors
              WHERE tenant_id=?1 AND user_id=?2 AND object_kind=?3 AND model_id=?4
                AND status='ready' AND dimensions=?5
+               AND EXISTS (
+                 SELECT 1 FROM memories m
+                 WHERE m.tenant_id=semantic_vectors.tenant_id AND m.user_id=semantic_vectors.user_id
+                   AND m.id=semantic_vectors.object_id AND semantic_vectors.object_kind='memory'
+                   AND m.domain_id IN (SELECT value FROM json_each(?7))
+                 UNION ALL
+                 SELECT 1 FROM memory_pages pg
+                 WHERE pg.tenant_id=semantic_vectors.tenant_id AND pg.user_id=semantic_vectors.user_id
+                   AND pg.id=semantic_vectors.object_id AND semantic_vectors.object_kind='page'
+                   AND pg.domain_id IN (SELECT value FROM json_each(?7))
+               )
              LIMIT ?6",
         )?;
         let rows = stmt.query_map(
@@ -336,7 +352,8 @@ impl Store {
                 object_kind,
                 model_id,
                 dims,
-                memory_contract::SEMANTIC_SCAN_LIMIT as i64
+                memory_contract::SEMANTIC_SCAN_LIMIT as i64,
+                dom.read_json()
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
         )?;

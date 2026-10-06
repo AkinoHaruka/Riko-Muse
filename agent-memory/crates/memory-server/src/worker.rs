@@ -89,7 +89,16 @@ mod tests {
             session_id: "s1".into(),
         };
         match store
-            .record_evidence(scope, &origin, seq, "user", "user", &t, content)
+            .record_evidence(
+                scope,
+                &origin,
+                seq,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             memory_store_sqlite::IngestOutcome::Recorded(id)
@@ -115,6 +124,7 @@ mod tests {
             rerank: None,
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
+            domains_enabled: false,
         };
         {
             let mut g = store.lock().unwrap();
@@ -125,7 +135,16 @@ mod tests {
         }
         let job_id = {
             let mut g = store.lock().unwrap();
-            match g.flush_window(&scope, "dsh", "s1", 4).unwrap() {
+            match g
+                .flush_window(
+                    &scope,
+                    "dsh",
+                    "s1",
+                    4,
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap()
+            {
                 FlushOutcome::Created { job_id, .. } => job_id,
                 _ => panic!("应创建作业"),
             }
@@ -133,7 +152,16 @@ mod tests {
         // 幂等：同窗口重复 flush 返回同一 job。
         {
             let mut g = store.lock().unwrap();
-            match g.flush_window(&scope, "dsh", "s1", 4).unwrap() {
+            match g
+                .flush_window(
+                    &scope,
+                    "dsh",
+                    "s1",
+                    4,
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap()
+            {
                 FlushOutcome::Existing { job_id: id2, .. } => assert_eq!(job_id, id2),
                 _ => panic!("同 window_key 应幂等"),
             }
@@ -142,7 +170,13 @@ mod tests {
         {
             let mut g = store.lock().unwrap();
             assert!(matches!(
-                g.flush_window(&scope, "dsh", "s1", 99),
+                g.flush_window(
+                    &scope,
+                    "dsh",
+                    "s1",
+                    99,
+                    &memory_domain::DomainScope::user_main()
+                ),
                 Err(memory_store_sqlite::StoreError::StateConflict)
             ));
         }
@@ -196,7 +230,13 @@ mod tests {
         let (hits, _) = store
             .lock()
             .unwrap()
-            .search_memories(&scope, "中文", 5, false)
+            .search_memories(
+                &scope,
+                "中文",
+                5,
+                false,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].claim, "以后回答我用中文");
@@ -220,6 +260,7 @@ mod tests {
             rerank: None,
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
+            domains_enabled: false,
         };
         let ev = {
             let mut g = store.lock().unwrap();
@@ -227,7 +268,16 @@ mod tests {
         };
         let job_id = {
             let mut g = store.lock().unwrap();
-            match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+            match g
+                .flush_window(
+                    &scope,
+                    "dsh",
+                    "s1",
+                    1,
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap()
+            {
                 FlushOutcome::Created { job_id, .. } => job_id,
                 _ => panic!(),
             }
@@ -281,7 +331,16 @@ mod tests {
         let (store, scope) = setup("dedup");
         let mut g = store.lock().unwrap();
         let ev1 = ingest_user(&mut g, &scope, 1, "以后用中文回答");
-        let job1_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        let job1_id = match g
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
@@ -304,7 +363,8 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        claim: None,};
+            claim: None,
+        };
         let out1 = g
             .save_candidate(
                 &scope,
@@ -324,7 +384,16 @@ mod tests {
 
         // 规则 9：同属性键（response_language=以后用...回答）不同值 → POSSIBLE_CONFLICT held。
         let ev2 = ingest_user(&mut g, &scope, 2, "以后用英文回答");
-        let job2_id = match g.flush_window(&scope, "dsh", "s1", 2).unwrap() {
+        let job2_id = match g
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                2,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
@@ -341,7 +410,8 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        claim: None,};
+            claim: None,
+        };
         let out2 = g
             .save_candidate(
                 &scope,
@@ -358,7 +428,15 @@ mod tests {
             }
         );
         // 旧记忆仍 active，未被覆盖；新值停在 held。
-        let (hits, _) = g.search_memories(&scope, "中文", 5, false).unwrap();
+        let (hits, _) = g
+            .search_memories(
+                &scope,
+                "中文",
+                5,
+                false,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert_eq!(hits.len(), 1);
         let held_count = g
             .count_candidates_by_reason(&scope, "POSSIBLE_CONFLICT")
@@ -372,7 +450,16 @@ mod tests {
         let (store, scope) = setup("suppress");
         let mut g = store.lock().unwrap();
         let ev1 = ingest_user(&mut g, &scope, 1, "我喜欢Rust");
-        let job1_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        let job1_id = match g
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
@@ -394,7 +481,8 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        claim: None,};
+            claim: None,
+        };
         let out1 = g
             .save_candidate(
                 &scope,
@@ -425,6 +513,7 @@ mod tests {
                 "user",
                 &t,
                 "忘记我喜欢Rust，删除这条记忆",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         let forget_evid = match forget_msg {
@@ -441,11 +530,20 @@ mod tests {
                     user_evidence_id: forget_evid.clone(),
                     target_quote: "我喜欢Rust".into(),
                 },
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         assert_eq!(fout.version, 2);
         // 立即不可见。
-        let (hits, _) = g.search_memories(&scope, "Rust", 5, false).unwrap();
+        let (hits, _) = g
+            .search_memories(
+                &scope,
+                "Rust",
+                5,
+                false,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(hits.is_empty());
 
         // 幂等：同一遗忘请求再确认 → 200 同状态，不卡版本。
@@ -459,12 +557,22 @@ mod tests {
                     user_evidence_id: forget_evid,
                     target_quote: "我喜欢Rust".into(),
                 },
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         assert_eq!(fout2.version, 2);
 
         // 重放：同一旧证据同 quote 的新候选 → SUPPRESSED_SOURCE。
-        let job2 = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        let job2 = match g
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Existing { job_id, .. } => job_id,
             _ => panic!("同 window_key 应幂等返回旧 job"),
         };
@@ -476,13 +584,22 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        claim: None,};
+            claim: None,
+        };
         // 旧候选已存在（DUPLICATE_CANDIDATE 先触发也证明未复活）；用新 quote_sha 无法绕过——
         // 直接验证 suppressed_sources 行存在且搜索仍为空。
         let _ = (job2, c2);
         let suppressed: i64 = g.count_candidates_by_reason(&scope, "user_forget").unwrap();
         let _ = suppressed;
-        let (hits2, _) = g.search_memories(&scope, "Rust", 5, true).unwrap();
+        let (hits2, _) = g
+            .search_memories(
+                &scope,
+                "Rust",
+                5,
+                true,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(hits2.is_empty(), "forgotten 不得经历史查询返回");
     }
 
@@ -505,6 +622,7 @@ mod tests {
                 &ev1,
                 "我喜欢Rust",
                 memory_domain::MemoryKind::Preference,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         let memory_id = match created {
@@ -518,7 +636,16 @@ mod tests {
         // 1. 泛称"忘记那个"+已知 ID + target_quote 不在消息正文 → AmbiguousTarget。
         let t = chrono::Utc::now();
         let ev2 = g
-            .record_evidence(&scope, &o, 2, "user", "user", &t, "忘记那个")
+            .record_evidence(
+                &scope,
+                &o,
+                2,
+                "user",
+                "user",
+                &t,
+                "忘记那个",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         let evid2 = match ev2 {
             memory_store_sqlite::IngestOutcome::Recorded(id) => id,
@@ -533,6 +660,7 @@ mod tests {
                 user_evidence_id: evid2.clone(),
                 target_quote: "我喜欢Rust".into(),
             },
+            &memory_domain::DomainScope::user_main(),
         );
         assert!(
             matches!(r, Err(memory_store_sqlite::StoreError::AmbiguousTarget)),
@@ -549,6 +677,7 @@ mod tests {
                 user_evidence_id: evid2.clone(),
                 target_quote: "  ".into(),
             },
+            &memory_domain::DomainScope::user_main(),
         );
         assert!(matches!(
             r2,
@@ -566,6 +695,7 @@ mod tests {
                 "user",
                 &t2,
                 "忘记我喜欢Rust，不要再记得",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         let evid3 = match ev3 {
@@ -582,10 +712,19 @@ mod tests {
                     user_evidence_id: evid3,
                     target_quote: "我喜欢Rust".into(),
                 },
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         assert_eq!(fout.version, 2);
-        let (hits, _) = g.search_memories(&scope, "Rust", 5, false).unwrap();
+        let (hits, _) = g
+            .search_memories(
+                &scope,
+                "Rust",
+                5,
+                false,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -594,7 +733,16 @@ mod tests {
         let (store, scope) = setup("retry");
         let mut g = store.lock().unwrap();
         ingest_user(&mut g, &scope, 1, "我叫洛溪");
-        let job_id = match g.flush_window(&scope, "dsh", "s1", 1).unwrap() {
+        let job_id = match g
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
@@ -678,6 +826,7 @@ mod tests {
             rerank: None,
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
+            domains_enabled: false,
         };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
         for (session, content) in [
@@ -695,12 +844,30 @@ mod tests {
             store
                 .lock()
                 .unwrap()
-                .record_evidence(&scope, &origin, 1, "user", "user", &t, content)
+                .record_evidence(
+                    &scope,
+                    &origin,
+                    1,
+                    "user",
+                    "user",
+                    &t,
+                    content,
+                    &memory_domain::DomainScope::user_main(),
+                )
                 .unwrap();
         }
         let flush_job = |store: &Arc<Mutex<Store>>, session: &str| {
             let mut g = store.lock().unwrap();
-            let job_id = match g.flush_window(&scope, "dsh", session, 1).unwrap() {
+            let job_id = match g
+                .flush_window(
+                    &scope,
+                    "dsh",
+                    session,
+                    1,
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap()
+            {
                 FlushOutcome::Created { job_id, .. } => job_id,
                 _ => panic!(),
             };
@@ -855,6 +1022,7 @@ mod tests {
             rerank: None,
             semantic_min_similarity: crate::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "none",
+            domains_enabled: false,
         };
         for session in ["s_old", "s_new"] {
             let t = chrono::Utc::now();
@@ -874,6 +1042,7 @@ mod tests {
                     "user",
                     &t,
                     "我在杭州做后端开发。我主要写 Rust。",
+                    &memory_domain::DomainScope::user_main(),
                 )
                 .unwrap();
         }
@@ -899,7 +1068,15 @@ mod tests {
         .unwrap();
         {
             let g = store.lock().unwrap();
-            let (hits, _) = g.search_memories(&scope, "后端", 5, false).unwrap();
+            let (hits, _) = g
+                .search_memories(
+                    &scope,
+                    "后端",
+                    5,
+                    false,
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap();
             assert!(hits.is_empty(), "admit_v1 下旧判定不建 active");
             let held = g
                 .count_candidates_by_reason(&scope, "NOT_EXPLICIT")
@@ -912,7 +1089,15 @@ mod tests {
             .unwrap();
         {
             let g = store.lock().unwrap();
-            let (hits, _) = g.search_memories(&scope, "后端", 5, false).unwrap();
+            let (hits, _) = g
+                .search_memories(
+                    &scope,
+                    "后端",
+                    5,
+                    false,
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap();
             assert_eq!(hits.len(), 1, "admit_v2 下同一候选 active");
             assert_eq!(hits[0].claim, "我在杭州做后端开发");
         }
@@ -930,7 +1115,16 @@ mod tests {
         cfg: ModelConfig,
     ) -> Result<(), String> {
         let mut g = store.lock().unwrap();
-        let job_id = match g.flush_window(scope, "dsh", session, 1).unwrap() {
+        let job_id = match g
+            .flush_window(
+                scope,
+                "dsh",
+                session,
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             FlushOutcome::Created { job_id, .. } => job_id,
             _ => panic!(),
         };
@@ -1235,9 +1429,7 @@ async fn process_job_inner<M: ExtractModel>(
     let admission_version = match job.admission_version.as_str() {
         memory_contract::ADMISSION_VERSION_V1
         | memory_contract::ADMISSION_VERSION_V2
-        | memory_contract::ADMISSION_VERSION_V4 => {
-            job.admission_version.clone()
-        }
+        | memory_contract::ADMISSION_VERSION_V4 => job.admission_version.clone(),
         other => {
             let mut guard = state.store.lock().unwrap();
             let code = "UNKNOWN_ADMISSION_VERSION";
@@ -1360,9 +1552,11 @@ async fn process_job_inner<M: ExtractModel>(
                     // 输入序列化异常等内部问题统一走 BAD_JSON 失败路径（同输入重试不变）。
                     rewrite_result = Some(
                         match memory_extract::rewrite_input_json(&events, &held_refs) {
-                            Ok(input) => client
-                                .extract(memory_extract::REWRITE_SYSTEM_PROMPT_V4, &input)
-                                .await,
+                            Ok(input) => {
+                                client
+                                    .extract(memory_extract::REWRITE_SYSTEM_PROMPT_V4, &input)
+                                    .await
+                            }
                             Err(_) => Err(ExtractError::BadJson),
                         },
                     );
@@ -1409,8 +1603,7 @@ async fn process_job_inner<M: ExtractModel>(
                                     Ok(results) => {
                                         let mut audit_items: Vec<serde_json::Value> = Vec::new();
                                         for r in results {
-                                            let Some(c) =
-                                                ex.candidates.get_mut(r.candidate_index)
+                                            let Some(c) = ex.candidates.get_mut(r.candidate_index)
                                             else {
                                                 continue;
                                             };
@@ -1440,9 +1633,7 @@ async fn process_job_inner<M: ExtractModel>(
                                             "rewrites": audit_items,
                                         });
                                         if let Err(e) = guard.record_extraction_rewrite_audit(
-                                            &scope,
-                                            &job.id,
-                                            &audit,
+                                            &scope, &job.id, &audit,
                                         ) {
                                             eprintln!(
                                                 "[worker] rewrite 审计写入失败 job={}: {e}",

@@ -3,7 +3,7 @@
 //! 证据不可变，只追加；同键同 hash 返回原 ID，同键异 hash 硬失败。
 
 use chrono::{DateTime, Utc};
-use memory_domain::{Origin, ScopeKey};
+use memory_domain::{DomainScope, Origin, ScopeKey, USER_MAIN_DOMAIN};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -94,6 +94,8 @@ impl Store {
     }
 
     /// doc/13 §2 幂等接收伪代码的实现。`occurred_at` 已由 handler 转 UTC。
+    /// V2-S1：写域来自服务端会话绑定解析；side 域事件写 evidence_domain_map
+    /// （doc7/04 §1.1——user_main 不写行，无映射按 user_main 处理）。
     pub fn record_evidence(
         &mut self,
         scope: &ScopeKey,
@@ -103,6 +105,7 @@ impl Store {
         source_kind: &str,
         occurred_at: &DateTime<Utc>,
         content: &str,
+        dom: &DomainScope,
     ) -> Result<IngestOutcome, StoreError> {
         let content_hash = hex::encode(Sha256::digest(content.as_bytes()));
         let occurred = occurred_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -131,10 +134,11 @@ impl Store {
         }
         // D6-9：purge 墓碑（按 scope+content sha，无正文）阻止已删除事件经 spool
         // 重放复活（doc6/02 §7）；suppressed_sources 只覆盖 forget，purge 后行已删。
+        // V2-S1：墓碑按写域匹配，main purge 不拦 side 域重放（doc7/04 §3）。
         let tombstoned: i64 = tx.query_row(
             "SELECT COUNT(*) FROM purge_tombstones
-             WHERE tenant_id=?1 AND user_id=?2 AND source_kind='evidence' AND source_id=?3",
-            rusqlite::params![scope.tenant_id, scope.user_id, content_hash],
+             WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND source_kind='evidence' AND source_id=?4",
+            rusqlite::params![scope.tenant_id, scope.user_id, dom.write, content_hash],
             |r| r.get(0),
         )?;
         if tombstoned > 0 {
@@ -163,6 +167,13 @@ impl Store {
                 content_hash
             ],
         )?;
+        if dom.write != USER_MAIN_DOMAIN {
+            tx.execute(
+                "INSERT INTO evidence_domain_map (tenant_id, user_id, evidence_id, domain_id, created_at)
+                 VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![scope.tenant_id, scope.user_id, id, dom.write, received],
+            )?;
+        }
         // 审计不写正文（doc/09）。
         tx.execute(
             "INSERT INTO audit_events (id, tenant_id, user_id, actor_kind, actor_id, action, target_id, occurred_at, detail_json)
@@ -220,19 +231,46 @@ mod tests {
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
         let r1 = store
-            .record_evidence(&scope, &o, 1, "user", "user", &t, "你好")
+            .record_evidence(
+                &scope,
+                &o,
+                1,
+                "user",
+                "user",
+                &t,
+                "你好",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         let id1 = match r1 {
             IngestOutcome::Recorded(id) => id,
             _ => panic!("首次应 Recorded"),
         };
         let r2 = store
-            .record_evidence(&scope, &o, 1, "user", "user", &t, "你好")
+            .record_evidence(
+                &scope,
+                &o,
+                1,
+                "user",
+                "user",
+                &t,
+                "你好",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         assert_eq!(r2, IngestOutcome::AlreadyRecorded(id1));
         // 同键异文 → 冲突
         let err = store
-            .record_evidence(&scope, &o, 1, "user", "user", &t, "篡改内容")
+            .record_evidence(
+                &scope,
+                &o,
+                1,
+                "user",
+                "user",
+                &t,
+                "篡改内容",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap_err();
         assert!(matches!(err, StoreError::EventConflict));
         // 行数只有 1
@@ -249,17 +287,53 @@ mod tests {
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
         store
-            .record_evidence(&scope, &o, 0, "user", "user", &t, "第一句")
+            .record_evidence(
+                &scope,
+                &o,
+                0,
+                "user",
+                "user",
+                &t,
+                "第一句",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         store
-            .record_evidence(&scope, &o, 1, "assistant", "assistant", &t, "助手回复")
+            .record_evidence(
+                &scope,
+                &o,
+                1,
+                "assistant",
+                "assistant",
+                &t,
+                "助手回复",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         // plugin 来源的 user 消息不算用户证据（doc/05 §1）
         store
-            .record_evidence(&scope, &o, 2, "user", "plugin", &t, "注入的记忆块")
+            .record_evidence(
+                &scope,
+                &o,
+                2,
+                "user",
+                "plugin",
+                &t,
+                "注入的记忆块",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         store
-            .record_evidence(&scope, &o, 3, "user", "user", &t, "第二句")
+            .record_evidence(
+                &scope,
+                &o,
+                3,
+                "user",
+                "user",
+                &t,
+                "第二句",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         let (id, seq, content) = store
             .latest_user_event(&scope, "dsh", "s1")
@@ -275,7 +349,13 @@ mod tests {
         // 回归：MAX(event_seq) 对无事件会话返回 NULL 行，此前按 i64 直取
         // 触发 rusqlite InvalidColumnType → HTTP 500；应返回 StateConflict（doc/13 §3）。
         let (mut store, scope) = setup("flush-empty");
-        let err = match store.flush_window(&scope, "dsh", "session-unknown", 8) {
+        let err = match store.flush_window(
+            &scope,
+            "dsh",
+            "session-unknown",
+            8,
+            &memory_domain::DomainScope::user_main(),
+        ) {
             Err(e) => e,
             Ok(_) => panic!("空会话 flush 应返回 StateConflict，不应触达数据库错误"),
         };
@@ -284,9 +364,26 @@ mod tests {
         let t = chrono::Utc.with_ymd_and_hms(2026, 9, 24, 12, 0, 0).unwrap();
         let o = origin();
         store
-            .record_evidence(&scope, &o, 8, "user", "user", &t, "你好")
+            .record_evidence(
+                &scope,
+                &o,
+                8,
+                "user",
+                "user",
+                &t,
+                "你好",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
-        let outcome = store.flush_window(&scope, "dsh", "s1", 8).unwrap();
+        let outcome = store
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                8,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(matches!(outcome, crate::jobs::FlushOutcome::Created { .. }));
     }
 }

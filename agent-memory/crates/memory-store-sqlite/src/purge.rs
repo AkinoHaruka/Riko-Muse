@@ -6,7 +6,7 @@
 //! 完成后清除 confirmation 与 job 中可反查目标的 ID；两张审计表匹配行随闭包
 //! 删除；删 evidence 时以 purge_tombstones 防止 spool 重放复活。
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -62,8 +62,9 @@ impl Store {
         scope: &ScopeKey,
         memory_id: &str,
         idempotency_key: &str,
+        dom: &DomainScope,
     ) -> Result<(String, PurgePreview), StoreError> {
-        let mut preview = self.purge_closure(scope, memory_id)?;
+        let mut preview = self.purge_closure(scope, memory_id, dom)?;
         let fingerprint = preview.dependency_fingerprint.clone();
         let target_version = preview_version(self, scope, memory_id)?;
         // 只写确认元数据（明文 token 只返回一次）。
@@ -101,6 +102,7 @@ impl Store {
         scope: &ScopeKey,
         token: &str,
         idempotency_key: &str,
+        dom: &DomainScope,
     ) -> Result<PurgeOutcome, StoreError> {
         let token_sha = sha256_hex(token);
         // 先查未消费确认（token+幂等键）；再查已消费幂等记录（同键重放 → 无正文结果）。
@@ -135,9 +137,21 @@ impl Store {
             return Err(StoreError::StateConflict); // 过期确认作废
         }
         // 指纹复核：闭包在 preview/confirm 之间变化（如新增共享引用）→ 拒绝执行。
-        let current = self.purge_closure(scope, &target)?;
+        let current = self.purge_closure(scope, &target, dom)?;
         if current.dependency_fingerprint != frozen_fp {
             return Err(StoreError::StateConflict); // fingerprint 变化，需重新 preview
+        }
+        // V2-S1：确认执行前复核目标仍在写域内（预览后目标不可迁移域）。
+        let target_domain: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT domain_id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, target],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if target_domain.as_deref() != Some(dom.write.as_str()) {
+            return Err(StoreError::MemoryNotFound);
         }
         // 执行闭包（单事务）+ 原子消费 token。
         let job_id = Uuid::now_v7().to_string();
@@ -172,16 +186,20 @@ impl Store {
         &self,
         scope: &ScopeKey,
         memory_id: &str,
+        dom: &DomainScope,
     ) -> Result<PurgePreview, StoreError> {
-        let exists: Option<i64> = self
+        // V2-S1：purge 作用域=写域；跨域目标按不存在处理（doc7/04 §3）。
+        let (exists, target_domain): (Option<i64>, Option<String>) = self
             .conn()
             .query_row(
-                "SELECT 1 FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                "SELECT 1, domain_id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, memory_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?;
-        if exists.is_none() {
+            .optional()?
+            .map(|(a, b)| (Some(a), Some(b)))
+            .unwrap_or((None, None));
+        if exists.is_none() || target_domain.as_deref() != Some(dom.write.as_str()) {
             return Err(StoreError::MemoryNotFound);
         }
         let mut p = PurgePreview {
@@ -266,22 +284,36 @@ impl Store {
         consumed_confirmation_sha: Option<&str>,
     ) -> Result<serde_json::Value, StoreError> {
         let now = now_rfc3339()?;
+        // V2-S1：墓碑记目标记忆自身域；共享证据按其映射域记墓碑（无映射按 user_main）。
+        let target_domain: String = tx.query_row(
+            "SELECT domain_id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+            |r| r.get(0),
+        )?;
         // 1. 收集本记忆的 evidence（id + content sha；墓碑按 sha 防重放）。
-        let evidence_ids: Vec<(String, String)> = {
+        let evidence_ids: Vec<(String, String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT i.evidence_id, e.content_sha256 FROM memory_evidence i
+                "SELECT i.evidence_id, e.content_sha256,
+                        COALESCE(d.domain_id, 'user_main')
+                 FROM memory_evidence i
                  JOIN evidence_events e ON e.tenant_id=i.tenant_id AND e.user_id=i.user_id AND e.id=i.evidence_id
+                 LEFT JOIN evidence_domain_map d
+                   ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
                  WHERE i.tenant_id=?1 AND i.user_id=?2 AND i.memory_id=?3",
             )?;
             let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, memory_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut closure_ids: HashSet<String> = HashSet::from([memory_id.to_owned()]);
         // 2. 逐 evidence 判共享（其他记忆引用即共享，保留 evidence 本体）。
         let mut deleted_evidence: Vec<String> = Vec::new();
-        for (eid, ev_sha) in &evidence_ids {
+        for (eid, ev_sha, ev_domain) in &evidence_ids {
             // 先删本记忆的链接（FK 到 evidence_events），共享判定只看其他对象。
             tx.execute(
                 "DELETE FROM memory_evidence WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3 AND evidence_id=?4",
@@ -439,9 +471,9 @@ impl Store {
                 params![scope.tenant_id, scope.user_id, eid],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, source_kind, source_id, created_at)
-                 VALUES (?1,?2,'evidence',?3,?4)",
-                params![scope.tenant_id, scope.user_id, ev_sha, now],
+                "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, domain_id, source_kind, source_id, created_at)
+                 VALUES (?1,?2,?3,'evidence',?4,?5)",
+                params![scope.tenant_id, scope.user_id, ev_domain, ev_sha, now],
             )?;
             deleted_evidence.push(eid.clone());
         }
@@ -625,9 +657,9 @@ impl Store {
         )?;
         // 8. 记忆墓碑。
         tx.execute(
-            "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, source_kind, source_id, created_at)
-             VALUES (?1,?2,'memory',?3,?4)",
-            params![scope.tenant_id, scope.user_id, memory_id, now],
+            "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, domain_id, source_kind, source_id, created_at)
+             VALUES (?1,?2,?3,'memory',?4,?5)",
+            params![scope.tenant_id, scope.user_id, target_domain, memory_id, now],
         )?;
         Self::mark_index_dirty(tx)?;
         Ok(serde_json::json!({
@@ -791,11 +823,14 @@ impl Store {
         }
         // 目标 3：按 received_at（记录时间）和策略生效时间选旧 user evidence。
         // assigned 或仍被可恢复 job 使用的证据不能进入物理清理。
-        let mut raw_evidence: Vec<(String, String)> = Vec::new(); // (id, content sha)
+        let mut raw_evidence: Vec<(String, String, String)> = Vec::new(); // (id, content sha, domain)
         if raw_days > 0 {
             let cutoff_ev = cutoff(raw_days)?;
             let mut stmt = tx.prepare(
-                "SELECT e.id, e.content_sha256 FROM evidence_events e
+                "SELECT e.id, e.content_sha256, COALESCE(d.domain_id, 'user_main')
+                 FROM evidence_events e
+                 LEFT JOIN evidence_domain_map d
+                   ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
                  WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
                    AND e.received_at>=?4 AND e.received_at < ?3
                    AND NOT EXISTS (SELECT 1 FROM dream_evidence_state s
@@ -819,18 +854,24 @@ impl Store {
                     effective_at,
                     RETENTION_BATCH_MAX_OBJECTS as i64
                 ],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )?;
             raw_evidence.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         raw_evidence.sort();
         raw_evidence.dedup();
         let expiring_evidence: HashSet<String> =
-            raw_evidence.iter().map(|(id, _)| id.clone()).collect();
+            raw_evidence.iter().map(|(id, _, _)| id.clone()).collect();
         // Expiring a source that is the last valid support for an active memory
         // purges that memory and its derived pages. Otherwise only the expired
         // source relation is removed and the memory remains supported.
-        for (evidence_id, _) in &raw_evidence {
+        for (evidence_id, _, _) in &raw_evidence {
             let mut stmt = tx.prepare(
                 "SELECT DISTINCT m.id FROM memory_evidence me JOIN memories m
                  ON m.tenant_id=me.tenant_id AND m.user_id=me.user_id AND m.id=me.memory_id
@@ -877,7 +918,7 @@ impl Store {
         }
         // 批次 fingerprint 幂等。
         let mut fp_src: Vec<String> = targets.clone();
-        fp_src.extend(raw_evidence.iter().map(|(id, _)| id.clone()));
+        fp_src.extend(raw_evidence.iter().map(|(id, _, _)| id.clone()));
         fp_src.push(format!("v{version}"));
         fp_src.sort();
         let fingerprint = sha256_hex(&fp_src.join("\u{0}"));
@@ -958,7 +999,7 @@ impl Store {
         let mut raw_deleted = 0usize;
         let target_set: HashSet<String> = targets.iter().cloned().collect();
         let mut detached_audits: Vec<(String, i64)> = Vec::new();
-        for (eid, ev_sha) in &raw_evidence {
+        for (eid, ev_sha, ev_domain) in &raw_evidence {
             let exists:bool=tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM evidence_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3)",
                 params![scope.tenant_id,scope.user_id,eid],|r|r.get(0))?;
@@ -1044,9 +1085,9 @@ impl Store {
                 params![scope.tenant_id, scope.user_id, eid],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, source_kind, source_id, created_at)
-                 VALUES (?1,?2,'evidence',?3,?4)",
-                params![scope.tenant_id, scope.user_id, ev_sha, now],
+                "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, domain_id, source_kind, source_id, created_at)
+                 VALUES (?1,?2,?3,'evidence',?4,?5)",
+                params![scope.tenant_id, scope.user_id, ev_domain, ev_sha, now],
             )?;
             raw_deleted += 1;
         }

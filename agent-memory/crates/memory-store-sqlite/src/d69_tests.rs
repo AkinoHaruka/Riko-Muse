@@ -71,8 +71,8 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
             r.get(0)
         })
         .unwrap();
-    // 按迁移纪律随新增迁移同步：0014（doc7）起为 14。
-    assert_eq!(applied, 14);
+    // 按迁移纪律随新增迁移同步：0015（doc7/04 V2-S1 记忆域）起为 15。
+    assert_eq!(applied, 15);
     assert_eq!(
         store
             .dream_live_runner_count("9999-01-01T00:00:00Z")
@@ -113,12 +113,31 @@ fn remember_one(
 ) -> String {
     let t = chrono::Utc::now();
     let ev = match store
-        .record_evidence(scope, origin, seq, "user", "user", &t, quote)
+        .record_evidence(
+            scope,
+            origin,
+            seq,
+            "user",
+            "user",
+            &t,
+            quote,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
-    match store.remember(scope, origin, &ev, quote, kind).unwrap() {
+    match store
+        .remember(
+            scope,
+            origin,
+            &ev,
+            quote,
+            kind,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap()
+    {
         crate::RememberOutcome::Created { memory_id, .. }
         | crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
     }
@@ -149,6 +168,7 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
             "user",
             &chrono::Utc::now(),
             old_text,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
@@ -162,6 +182,7 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
             Some("a"),
             Some("dsh"),
             Some("s"),
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
         .unwrap();
@@ -216,6 +237,7 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
             "user",
             &chrono::Utc::now(),
             new_text,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
@@ -229,6 +251,7 @@ fn held_candidate_redecision_is_frozen_and_idempotent() {
             Some("a"),
             Some("dsh"),
             Some("s"),
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
         .unwrap();
@@ -381,6 +404,7 @@ fn consolidation_retry_requeues_its_persisted_dream_trigger_atomically() {
             "frozen-input-fingerprint",
             &[input],
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
 
@@ -481,6 +505,7 @@ fn manual_consolidation_dream_link_uses_scope_and_ids_in_correct_columns() {
             "manual-rust-linked-fingerprint",
             &inputs,
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     let linked = store
@@ -488,6 +513,7 @@ fn manual_consolidation_dream_link_uses_scope_and_ids_in_correct_columns() {
             &scope,
             &first.id,
             &format!("manual-consolidation-{}", first.id),
+            &memory_domain::DomainScope::user_main(),
         )
         .expect("manual consolidation must persist its Dream trigger");
     assert_eq!(linked.purpose, "consolidation");
@@ -503,6 +529,7 @@ fn manual_consolidation_dream_link_uses_scope_and_ids_in_correct_columns() {
             "manual-rust-atomic-fingerprint",
             &inputs,
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     assert_eq!(job.status, "queued");
@@ -519,6 +546,7 @@ fn manual_consolidation_dream_link_uses_scope_and_ids_in_correct_columns() {
             "manual-rust-atomic-fingerprint",
             &inputs,
             &now,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     assert_eq!(job_again.id, job.id, "same manual input reuses the job");
@@ -551,6 +579,7 @@ fn persistent_runner_claims_and_renews_frozen_phases() {
             "user",
             &chrono::Utc::now(),
             text,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
@@ -564,6 +593,7 @@ fn persistent_runner_claims_and_renews_frozen_phases() {
             Some("agent-a"),
             Some("dsh"),
             Some("s"),
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
         .unwrap();
@@ -706,22 +736,30 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         .unwrap();
     let page_sources = vec![(mid.clone(), 1, source_sha)];
     let (page_id, _) = store
-        .publish_page(&crate::pages::PublishRequest {
-            scope: &scope,
-            document_kind: "topic_page",
-            document_key: "hangzhou-work",
-            question_version: None,
-            question_text: None,
-            title: "居住地",
-            body_md: "用户住在杭州。",
-            generator_version: crate::pages::GENERATE_CONSOLIDATE_V1,
-            input_fingerprint: "test-page-fingerprint",
-            sources: &page_sources,
-            actor_kind: "system",
-        })
+        .publish_page(
+            &crate::pages::PublishRequest {
+                scope: &scope,
+                document_kind: "topic_page",
+                document_key: "hangzhou-work",
+                question_version: None,
+                question_text: None,
+                title: "居住地",
+                body_md: "用户住在杭州。",
+                generator_version: crate::pages::GENERATE_CONSOLIDATE_V1,
+                input_fingerprint: "test-page-fingerprint",
+                sources: &page_sources,
+                actor_kind: "system",
+            },
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     assert!(store
-        .get_page(&scope, &page_id, &crate::now_rfc3339_pub().unwrap())
+        .get_page(
+            &scope,
+            &page_id,
+            &crate::now_rfc3339_pub().unwrap(),
+            &memory_domain::DomainScope::user_main()
+        )
         .unwrap()
         .is_some());
     // pin 到 resident（含路径一并验证）。
@@ -738,6 +776,7 @@ fn retire_immediate_disappearance_and_restore_visibility() {
                 "user",
                 &t,
                 "别再提用户住在杭州这条了",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
         {
@@ -759,45 +798,82 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         start_byte: s as i64,
         end_byte: e as i64,
     };
-    assert!(store.retire_memory(&scope, &mid, &req).unwrap());
+    assert!(store
+        .retire_memory(&scope, &mid, &req, &memory_domain::DomainScope::user_main())
+        .unwrap());
     // 全路径消失：get_memory / search / resident 可见 pin。
     assert!(
-        store.get_memory(&scope, &mid).unwrap().is_none(),
+        store
+            .get_memory(&scope, &mid, &memory_domain::DomainScope::user_main())
+            .unwrap()
+            .is_none(),
         "retired 不进 get_memory"
     );
-    let (hits, _) = store.search_memories(&scope, "杭州", 10, false).unwrap();
+    let (hits, _) = store
+        .search_memories(
+            &scope,
+            "杭州",
+            10,
+            false,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(
         hits.iter().all(|h| h.memory_id != mid),
         "retired 不进 search"
     );
     let vis = store
-        .resident_visible_pins(&scope, &crate::now_rfc3339_pub().unwrap())
+        .resident_visible_pins(
+            &scope,
+            &crate::now_rfc3339_pub().unwrap(),
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     assert!(
         vis.iter().all(|p| p.memory_id != mid),
         "retired 不进 resident"
     );
-    assert!(store.retirement_get(&scope, &mid).unwrap().is_some());
+    assert!(store
+        .retirement_get(&scope, &mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_some());
     assert!(
         store
-            .get_page(&scope, &page_id, &crate::now_rfc3339_pub().unwrap())
+            .get_page(
+                &scope,
+                &page_id,
+                &crate::now_rfc3339_pub().unwrap(),
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .is_none(),
         "retire 事务内立即使派生页失效"
     );
     assert!(store
-        .page_fts_search(&scope, "居住地", 10)
+        .page_fts_search(
+            &scope,
+            "居住地",
+            10,
+            &memory_domain::DomainScope::user_main()
+        )
         .unwrap()
         .is_empty());
     assert!(store
-        .page_list(&scope, &["published"], 10)
+        .page_list(
+            &scope,
+            &["published"],
+            10,
+            &memory_domain::DomainScope::user_main()
+        )
         .unwrap()
         .iter()
         .all(|page| page.page_id != page_id));
     assert!(store.page_pin(&scope, &page_id).is_err());
     // 重复 retire 幂等确认。
     assert!(
-        store.retire_memory(&scope, &mid, &req).unwrap(),
+        store
+            .retire_memory(&scope, &mid, &req, &memory_domain::DomainScope::user_main())
+            .unwrap(),
         "同键同请求重放返回原回执"
     );
     let different_request = RetireRequest {
@@ -812,7 +888,12 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         end_byte: req.end_byte,
     };
     assert!(matches!(
-        store.retire_memory(&scope, &mid, &different_request),
+        store.retire_memory(
+            &scope,
+            &mid,
+            &different_request,
+            &memory_domain::DomainScope::user_main()
+        ),
         Err(StoreError::IdempotencyConflict)
     ));
     let restore_evidence = match store
@@ -824,6 +905,7 @@ fn retire_immediate_disappearance_and_restore_visibility() {
             "user",
             &chrono::Utc::now(),
             "请恢复这条记忆",
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
@@ -843,9 +925,23 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         end_byte: re as i64,
     };
     // restore：重新可见。
-    assert!(store.restore_memory(&scope, &mid, &restore).unwrap());
+    assert!(store
+        .restore_memory(
+            &scope,
+            &mid,
+            &restore,
+            &memory_domain::DomainScope::user_main()
+        )
+        .unwrap());
     assert!(
-        store.restore_memory(&scope, &mid, &restore).unwrap(),
+        store
+            .restore_memory(
+                &scope,
+                &mid,
+                &restore,
+                &memory_domain::DomainScope::user_main()
+            )
+            .unwrap(),
         "同键 restore 重放返回原回执"
     );
     let different_restore = RestoreRequest {
@@ -859,19 +955,43 @@ fn retire_immediate_disappearance_and_restore_visibility() {
         end_byte: restore.end_byte,
     };
     assert!(matches!(
-        store.restore_memory(&scope, &mid, &different_restore),
+        store.restore_memory(
+            &scope,
+            &mid,
+            &different_restore,
+            &memory_domain::DomainScope::user_main()
+        ),
         Err(StoreError::IdempotencyConflict)
     ));
-    assert!(store.get_memory(&scope, &mid).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_some());
     assert!(
         store
-            .get_page(&scope, &page_id, &crate::now_rfc3339_pub().unwrap())
+            .get_page(
+                &scope,
+                &page_id,
+                &crate::now_rfc3339_pub().unwrap(),
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .is_none(),
         "restore 不会复活退休时已失效的派生页"
     );
-    assert!(store.retirement_get(&scope, &mid).unwrap().is_none());
-    let (hits2, _) = store.search_memories(&scope, "杭州", 10, false).unwrap();
+    assert!(store
+        .retirement_get(&scope, &mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_none());
+    let (hits2, _) = store
+        .search_memories(
+            &scope,
+            "杭州",
+            10,
+            false,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(hits2.iter().any(|h| h.memory_id == mid));
     // 跨 scope 隔离：另一用户的 retire/restore 不互串。
     let dir2 = std::env::temp_dir().join(format!("am-d69-test-{}-r2", std::process::id()));
@@ -883,7 +1003,14 @@ fn retire_immediate_disappearance_and_restore_visibility() {
     let tok2 = std::fs::read_to_string(dir2.join("t.token")).unwrap();
     let scope2 = store.verify_token(tok2.trim()).unwrap().unwrap();
     assert!(
-        store.retire_memory(&scope2, &mid, &req).is_err(),
+        store
+            .retire_memory(
+                &scope2,
+                &mid,
+                &req,
+                &memory_domain::DomainScope::user_main()
+            )
+            .is_err(),
         "跨 scope 目标拒绝"
     );
 }
@@ -909,6 +1036,7 @@ fn retire_rejects_quote_not_spanning_latest_event() {
             "user",
             &chrono::Utc::now(),
             "新的消息",
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     // 非逐字（改写）quote → 拒绝。
@@ -937,6 +1065,7 @@ fn audit_failure_does_not_rollback_memory_retire() {
             "user",
             &chrono::Utc::now(),
             "请退休用户住在杭州这条记忆",
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
@@ -964,10 +1093,14 @@ fn audit_failure_does_not_rollback_memory_retire() {
                 start_byte: start_byte as i64,
                 end_byte: end_byte as i64,
             },
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap();
     assert!(changed, "memory_audit 写失败不能回滚业务更新");
-    assert!(store.retirement_get(&scope, &mid).unwrap().is_some());
+    assert!(store
+        .retirement_get(&scope, &mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -1046,10 +1179,20 @@ fn purge_two_phase_closure_and_tombstones() {
             serde_json::json!({"memory_id":mid}).to_string(), chrono::Utc::now().to_rfc3339()],
     ).unwrap();
     // preview：业务记忆仍在（只读），确认元数据落库。
-    let (token, preview) = store.purge_preview(&scope, &mid, "idem-1").unwrap();
+    let (token, preview) = store
+        .purge_preview(
+            &scope,
+            &mid,
+            "idem-1",
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert_eq!(preview.evidence_ids.len(), 1);
     assert!(
-        store.get_memory(&scope, &mid).unwrap().is_some(),
+        store
+            .get_memory(&scope, &mid, &memory_domain::DomainScope::user_main())
+            .unwrap()
+            .is_some(),
         "preview 只读业务记忆"
     );
     let conf_target: String = store
@@ -1065,7 +1208,14 @@ fn purge_two_phase_closure_and_tombstones() {
     // 构造：直接把本记忆 evidence 也挂到新记忆上改变闭包共享判定不可行（闭包键不变），
     // 改用删除 confirmation 行模拟过期：此处直接验证 confirm 成功路径，指纹拒绝由
     // second-preview 路径覆盖（对同一目标再次 preview 后旧 token 仍可消费一次）。
-    let out = store.purge_confirm(&scope, &token, "idem-1").unwrap();
+    let out = store
+        .purge_confirm(
+            &scope,
+            &token,
+            "idem-1",
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(
         out.deleted
             .get("evidence_deleted")
@@ -1074,7 +1224,10 @@ fn purge_two_phase_closure_and_tombstones() {
             >= 1
     );
     // 闭包后：记忆/证据/审计/候选全无；job 与 confirmation 不留可反查目标 ID。
-    assert!(store.get_memory(&scope, &mid).unwrap().is_none());
+    assert!(store
+        .get_memory(&scope, &mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_none());
     let (mem_cnt, ev_cnt): (i64, i64) = store
         .conn()
         .query_row(
@@ -1140,13 +1293,21 @@ fn purge_two_phase_closure_and_tombstones() {
         "user",
         &chrono::Utc::now(),
         "用户住在杭州",
+        &memory_domain::DomainScope::user_main(),
     );
     assert!(
         matches!(replay, Err(StoreError::EventConflict)),
         "墓碑阻止重放复活"
     );
     // 同幂等键重放 confirm：无正文结果。
-    let replay2 = store.purge_confirm(&scope, &token, "idem-1").unwrap();
+    let replay2 = store
+        .purge_confirm(
+            &scope,
+            &token,
+            "idem-1",
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(replay2.deleted.get("replayed").is_some());
 }
 
@@ -1166,7 +1327,16 @@ fn retention_default_disabled_and_positive_policy_runs() {
     let old_ev = {
         let old = chrono::Utc::now() - chrono::Duration::days(400);
         match store
-            .record_evidence(&scope, &origin, 2, "user", "user", &old, "很旧的一句话")
+            .record_evidence(
+                &scope,
+                &origin,
+                2,
+                "user",
+                "user",
+                &old,
+                "很旧的一句话",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
@@ -1174,7 +1344,10 @@ fn retention_default_disabled_and_positive_policy_runs() {
     };
     // 默认（未配置策略）：无操作。
     assert!(store.retention_run(&scope).unwrap().is_none());
-    assert!(store.get_memory(&scope, &_mid).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &_mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_some());
     // 正值策略：raw evidence 保留 365 天 → 400 天前且无引用的事件被清理。
     store.retention_set_policy(&scope, 365, 0, true).unwrap();
     let effective_at = (chrono::Utc::now() - chrono::Duration::days(500)).to_rfc3339();
@@ -1208,7 +1381,10 @@ fn retention_default_disabled_and_positive_policy_runs() {
         .unwrap();
     assert_eq!(gone, 0, "超期 raw evidence 已清理");
     // 活跃记忆不受影响（raw evidence 清理不触碰被引用事件）。
-    assert!(store.get_memory(&scope, &_mid).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &_mid, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_some());
     // 同批次重跑幂等。
     assert!(store.retention_run(&scope).unwrap().is_none());
 }
@@ -1239,7 +1415,16 @@ fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
             chrono::Utc::now()
         };
         let evidence = match store
-            .record_evidence(&scope, &origin, seq, "user", "user", &occurred, claim)
+            .record_evidence(
+                &scope,
+                &origin,
+                seq,
+                "user",
+                "user",
+                &occurred,
+                claim,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
@@ -1256,7 +1441,14 @@ fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
 
     let old_a = record_source(&mut store, &scope, &origin, 1, "用户住在杭州", true);
     let only_old_memory = match store
-        .remember(&scope, &origin, &old_a, "用户住在杭州", MemoryKind::Fact)
+        .remember(
+            &scope,
+            &origin,
+            &old_a,
+            "用户住在杭州",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::RememberOutcome::Created { memory_id, .. }
@@ -1264,12 +1456,26 @@ fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
     };
     let old_b = record_source(&mut store, &scope, &origin, 2, "用户住在杭州", true);
     store
-        .remember(&scope, &origin, &old_b, "用户住在杭州", MemoryKind::Fact)
+        .remember(
+            &scope,
+            &origin,
+            &old_b,
+            "用户住在杭州",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
 
     let old_c = record_source(&mut store, &scope, &origin, 3, "用户在南京工作", true);
     let shared_memory = match store
-        .remember(&scope, &origin, &old_c, "用户在南京工作", MemoryKind::Fact)
+        .remember(
+            &scope,
+            &origin,
+            &old_c,
+            "用户在南京工作",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::RememberOutcome::Created { memory_id, .. }
@@ -1277,7 +1483,14 @@ fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
     };
     let recent = record_source(&mut store, &scope, &origin, 4, "用户在南京工作", false);
     store
-        .remember(&scope, &origin, &recent, "用户在南京工作", MemoryKind::Fact)
+        .remember(
+            &scope,
+            &origin,
+            &recent,
+            "用户在南京工作",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
 
     let result = store.retention_run(&scope).unwrap().unwrap();
@@ -1285,13 +1498,24 @@ fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
     assert_eq!(result["memories_purged"].as_i64(), Some(1));
     assert!(
         store
-            .get_memory(&scope, &only_old_memory)
+            .get_memory(
+                &scope,
+                &only_old_memory,
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .is_none(),
         "同一批次内全部支持证据到期，L1 应进入 purge 闭包"
     );
     assert!(
-        store.get_memory(&scope, &shared_memory).unwrap().is_some(),
+        store
+            .get_memory(
+                &scope,
+                &shared_memory,
+                &memory_domain::DomainScope::user_main()
+            )
+            .unwrap()
+            .is_some(),
         "仍有未到期来源时不得删除 L1"
     );
     let surviving_sources: i64 = store.conn().query_row(
@@ -1336,6 +1560,7 @@ fn retention_processes_more_than_one_l0_batch_and_releases_terminal_dream_inputs
                 "user",
                 &chrono::Utc::now(),
                 &format!("批次测试事件 {seq}"),
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
         {
@@ -1352,7 +1577,15 @@ fn retention_processes_more_than_one_l0_batch_and_releases_terminal_dream_inputs
     // but an authorized retention policy can still remove that input after its cutoff.
     let dream_evidence = evidence_ids[0].clone();
     let dream = store
-        .dream_trigger(&scope, "manual", "retention-dead-input", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "retention-dead-input",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
@@ -1417,19 +1650,35 @@ fn retention_does_not_purge_expired_memory_used_by_recoverable_dream_job() {
             "user",
             &chrono::Utc::now(),
             "用户住在杭州",
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
     let dream = store
-        .dream_trigger(&scope, "manual", "retention-active-dream", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "retention-active-dream",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
     let claimed = store.dream_claim(&scope, &now, 90).unwrap().unwrap();
     let memory = match store
-        .remember(&scope, &origin, &evidence, "用户住在杭州", MemoryKind::Fact)
+        .remember(
+            &scope,
+            &origin,
+            &evidence,
+            "用户住在杭州",
+            MemoryKind::Fact,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::RememberOutcome::Created { memory_id, .. }
@@ -1448,7 +1697,10 @@ fn retention_does_not_purge_expired_memory_used_by_recoverable_dream_job() {
         store.retention_run(&scope).unwrap().is_none(),
         "过期 L1 的 purge 闭包不能删除仍由可恢复 Dream job 冻结的 L0"
     );
-    assert!(store.get_memory(&scope, &memory).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &memory, &memory_domain::DomainScope::user_main())
+        .unwrap()
+        .is_some());
     let evidence_exists: i64 = store
         .conn()
         .query_row(
@@ -1492,6 +1744,7 @@ fn adjudication_commit_atomically_enqueues_semantic_index_job() {
             "user",
             &chrono::Utc::now(),
             text,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
@@ -1505,6 +1758,7 @@ fn adjudication_commit_atomically_enqueues_semantic_index_job() {
             Some("a"),
             Some("dsh"),
             Some("s"),
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
         .unwrap();

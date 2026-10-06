@@ -5,7 +5,7 @@
 //! 所有 read/query path 在排序前排除 retired（doc6/09 卡要求）。purge 只经
 //! 可信 UI/CLI 两阶段 preview+confirm，不注册 Agent/Dream 工具。
 
-use memory_domain::{Origin, ScopeKey};
+use memory_domain::{DomainScope, Origin, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -56,7 +56,10 @@ impl Store {
         scope: &ScopeKey,
         memory_id: &str,
         req: &RetireRequest,
+        dom: &DomainScope,
     ) -> Result<bool, StoreError> {
+        // V2-S1：仅写域内对象可 retire（doc7/04 §3）。
+        Self::require_memory_in_write_domain(self, scope, memory_id, dom)?;
         let now = now_rfc3339()?;
         let tx = self.conn_mut().transaction()?;
         let request_sha = request_sha256(&serde_json::json!({
@@ -187,7 +190,10 @@ impl Store {
         scope: &ScopeKey,
         memory_id: &str,
         req: &RestoreRequest,
+        dom: &DomainScope,
     ) -> Result<bool, StoreError> {
+        // V2-S1：仅写域内对象可 restore（doc7/04 §3）。
+        Self::require_memory_in_write_domain(self, scope, memory_id, dom)?;
         let now = now_rfc3339()?;
         let tx = self.conn_mut().transaction()?;
         let request_sha = request_sha256(&serde_json::json!({
@@ -294,12 +300,17 @@ impl Store {
         &self,
         scope: &ScopeKey,
         memory_id: &str,
+        dom: &DomainScope,
     ) -> Result<Option<RetireOverrideRow>, StoreError> {
+        let dom_json = dom.read_json();
         self.conn()
             .query_row(
-                "SELECT memory_id, memory_version, actor_kind, reason_code, retired_at
-                 FROM memory_retirements WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
-                params![scope.tenant_id, scope.user_id, memory_id],
+                "SELECT r.memory_id, r.memory_version, r.actor_kind, r.reason_code, r.retired_at
+                 FROM memory_retirements r
+                 JOIN memories m ON m.tenant_id=r.tenant_id AND m.user_id=r.user_id AND m.id=r.memory_id
+                 WHERE r.tenant_id=?1 AND r.user_id=?2 AND r.memory_id=?3
+                   AND m.domain_id IN (SELECT value FROM json_each(?4))",
+                params![scope.tenant_id, scope.user_id, memory_id, dom_json],
                 |r| {
                     Ok(RetireOverrideRow {
                         memory_id: r.get(0)?,
@@ -315,15 +326,44 @@ impl Store {
     }
 
     /// 退休 memory ID 集合（search/resident 组装后过滤用；有界 scope 内集合）。
+    /// V2-S1：仅收集读域集内记忆的退休记录。
     pub fn retired_ids(
         &self,
         scope: &ScopeKey,
+        dom: &DomainScope,
     ) -> Result<std::collections::HashSet<String>, StoreError> {
         let mut stmt = self.conn().prepare(
-            "SELECT memory_id FROM memory_retirements WHERE tenant_id=?1 AND user_id=?2",
+            "SELECT r.memory_id FROM memory_retirements r
+             JOIN memories m ON m.tenant_id=r.tenant_id AND m.user_id=r.user_id AND m.id=r.memory_id
+             WHERE r.tenant_id=?1 AND r.user_id=?2
+               AND m.domain_id IN (SELECT value FROM json_each(?3))",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| r.get(0))?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, dom.read_json()],
+            |r| r.get(0),
+        )?;
         Ok(rows.collect::<Result<std::collections::HashSet<_>, _>>()?)
+    }
+
+    /// V2-S1 写域闸：目标记忆必须属于写域，否则按不存在处理。
+    fn require_memory_in_write_domain(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+        dom: &DomainScope,
+    ) -> Result<(), StoreError> {
+        let d: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT domain_id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                rusqlite::params![scope.tenant_id, scope.user_id, memory_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match d {
+            Some(d) if d == dom.write => Ok(()),
+            _ => Err(StoreError::MemoryNotFound),
+        }
     }
 }
 

@@ -87,6 +87,7 @@ mod probes {
                 "user",
                 &t,
                 message,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
         {
@@ -95,7 +96,14 @@ mod probes {
             other => panic!("意外 ingest 结果: {other:?}"),
         };
         match store
-            .remember(scope, &origin(session, "agent-a"), &ev, quote, kind)
+            .remember(
+                scope,
+                &origin(session, "agent-a"),
+                &ev,
+                quote,
+                kind,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             RememberOutcome::Created { memory_id, .. }
@@ -111,7 +119,14 @@ mod probes {
         max_chars: usize,
     ) -> (Vec<String>, bool, String) {
         let r = store
-            .compose_context(scope, "agent-b", query, max_items, max_chars)
+            .compose_context(
+                scope,
+                "agent-b",
+                query,
+                max_items,
+                max_chars,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap();
         (
             r.items.into_iter().map(|(id, _)| id).collect(),
@@ -283,6 +298,7 @@ mod probes {
                     "user",
                     &t,
                     "过去我住在杭州，现在我住在成都",
+                    &memory_domain::DomainScope::user_main(),
                 )
                 .unwrap()
             {
@@ -300,12 +316,19 @@ mod probes {
                         old_quote: "我住在杭州".into(),
                         replacement_quote: "我住在成都".into(),
                     },
+                    &memory_domain::DomainScope::user_main(),
                 )
                 .unwrap();
         }
         let (ids_after, _, _) = compose_ids(&store, &u2(), "杭州", 5, 2000);
         let hist = store
-            .search_memories(&u2(), "我住在杭州", 5, true)
+            .search_memories(
+                &u2(),
+                "我住在杭州",
+                5,
+                true,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
             .0;
         let p4b = ProbeRecord {
@@ -370,6 +393,7 @@ mod probes {
                     "user",
                     &t,
                     "忘记我喜欢手工咖啡",
+                    &memory_domain::DomainScope::user_main(),
                 )
                 .unwrap()
             {
@@ -386,12 +410,29 @@ mod probes {
                         user_evidence_id: ev,
                         target_quote: "我喜欢手工咖啡".into(),
                     },
+                    &memory_domain::DomainScope::user_main(),
                 )
                 .unwrap();
         }
         // 过期与遗忘都不得出现在 search/compose；历史查询也不得复活 forgotten。
-        let (search_ids, _) = store.search_memories(&u2(), "通勤", 20, false).unwrap();
-        let (hist_ids, _) = store.search_memories(&u2(), "通勤", 20, true).unwrap();
+        let (search_ids, _) = store
+            .search_memories(
+                &u2(),
+                "通勤",
+                20,
+                false,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
+        let (hist_ids, _) = store
+            .search_memories(
+                &u2(),
+                "通勤",
+                20,
+                true,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         let (c_ids, _, _) = compose_ids(&store, &u2(), "通勤 咖啡", 5, 2000);
         let p5 = ProbeRecord {
             probe_id: "P5_expired_forgotten_suppressed_invisible",

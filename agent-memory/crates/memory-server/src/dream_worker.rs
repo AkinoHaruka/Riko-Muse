@@ -493,10 +493,24 @@ async fn freeze_manual_redecision(
             };
             let hash = claim_sha256(kind, &fold_whitespace(&candidate.claim));
             for (id, _) in g
-                .memories_by_exact_hash(scope, kind.as_str(), &hash, k)
+                .memories_by_exact_hash(
+                    scope,
+                    kind.as_str(),
+                    &hash,
+                    k,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(FreezeError::Store)?
             {
-                if let Some(memory) = g.get_memory(scope, &id).map_err(FreezeError::Store)? {
+                if let Some(memory) = g
+                    .get_memory(
+                        scope,
+                        &id,
+                        /*DOM:dream-job-domain-pending*/
+                        &memory_domain::DomainScope::user_main(),
+                    )
+                    .map_err(FreezeError::Store)?
+                {
                     recalls.push(AdjudicationRecall {
                         candidate_id: candidate.candidate_id.clone(),
                         target_memory_id: id,
@@ -505,7 +519,13 @@ async fn freeze_manual_redecision(
                     });
                 }
             }
-            if let Ok((hits, _)) = g.search_memories(scope, &candidate.claim, k, false) {
+            if let Ok((hits, _)) = g.search_memories(
+                scope,
+                &candidate.claim,
+                k,
+                false,
+                /*DOM:dream-job-domain-pending*/ &memory_domain::DomainScope::user_main(),
+            ) {
                 recalls.extend(hits.into_iter().map(|hit| AdjudicationRecall {
                     candidate_id: candidate.candidate_id.clone(),
                     target_memory_id: hit.memory_id,
@@ -514,12 +534,24 @@ async fn freeze_manual_redecision(
                 }));
             }
             if let Some(vector) = vectors.get(index) {
-                if let Ok((hits, _)) =
-                    g.semantic_scan(scope, "memory", embedding.model_id(), vector, k)
-                {
+                if let Ok((hits, _)) = g.semantic_scan(
+                    scope,
+                    "memory",
+                    embedding.model_id(),
+                    vector,
+                    k,
+                    /*DOM:dream-job-domain-pending*/
+                    &memory_domain::DomainScope::user_main(),
+                ) {
                     for (id, _) in hits {
-                        if let Some(memory) =
-                            g.get_memory(scope, &id).map_err(FreezeError::Store)?
+                        if let Some(memory) = g
+                            .get_memory(
+                                scope,
+                                &id,
+                                /*DOM:dream-job-domain-pending*/
+                                &memory_domain::DomainScope::user_main(),
+                            )
+                            .map_err(FreezeError::Store)?
                         {
                             recalls.push(AdjudicationRecall {
                                 candidate_id: candidate.candidate_id.clone(),
@@ -691,10 +723,24 @@ async fn freeze_adjudication(
             };
             let hash = claim_sha256(kind, &fold_whitespace(&c.claim));
             let hits = g
-                .memories_by_exact_hash(scope, kind.as_str(), &hash, k)
+                .memories_by_exact_hash(
+                    scope,
+                    kind.as_str(),
+                    &hash,
+                    k,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(FreezeError::Store)?;
             for (mid, _v) in hits {
-                if let Some(v) = g.get_memory(scope, &mid).map_err(FreezeError::Store)? {
+                if let Some(v) = g
+                    .get_memory(
+                        scope,
+                        &mid,
+                        /*DOM:dream-job-domain-pending*/
+                        &memory_domain::DomainScope::user_main(),
+                    )
+                    .map_err(FreezeError::Store)?
+                {
                     recalls.push(AdjudicationRecall {
                         candidate_id: c.candidate_id.clone(),
                         target_memory_id: mid.clone(),
@@ -720,7 +766,13 @@ async fn freeze_adjudication(
     {
         let g = state.store.lock().unwrap();
         for (i, (c, _)) in accepted.iter().enumerate() {
-            if let Ok((hits, _)) = g.search_memories(scope, &c.claim, k, false) {
+            if let Ok((hits, _)) = g.search_memories(
+                scope,
+                &c.claim,
+                k,
+                false,
+                /*DOM:dream-job-domain-pending*/ &memory_domain::DomainScope::user_main(),
+            ) {
                 for h in hits.iter().take(k) {
                     recalls.push(AdjudicationRecall {
                         candidate_id: c.candidate_id.clone(),
@@ -731,9 +783,25 @@ async fn freeze_adjudication(
                 }
             }
             if let Some(qv) = query_vecs.get(i) {
-                if let Ok((vhits, _n)) = g.semantic_scan(scope, "memory", emb.model_id(), qv, k) {
+                if let Ok((vhits, _n)) = g.semantic_scan(
+                    scope,
+                    "memory",
+                    emb.model_id(),
+                    qv,
+                    k,
+                    /*DOM:dream-job-domain-pending*/
+                    &memory_domain::DomainScope::user_main(),
+                ) {
                     for (mid, _sim) in vhits {
-                        if let Some(v) = g.get_memory(scope, &mid).map_err(FreezeError::Store)? {
+                        if let Some(v) = g
+                            .get_memory(
+                                scope,
+                                &mid,
+                                /*DOM:dream-job-domain-pending*/
+                                &memory_domain::DomainScope::user_main(),
+                            )
+                            .map_err(FreezeError::Store)?
+                        {
                             recalls.push(AdjudicationRecall {
                                 candidate_id: c.candidate_id.clone(),
                                 target_memory_id: mid.clone(),
@@ -813,7 +881,15 @@ async fn process_adjudication<M: ExtractModel>(
     {
         let g = state.store.lock().unwrap();
         for r in &recalls {
-            if let Some(m) = g.get_memory(scope, &r.target_memory_id).unwrap_or(None) {
+            if let Some(m) = g
+                .get_memory(
+                    scope,
+                    &r.target_memory_id,
+                    /*DOM:dream-job-domain-pending*/
+                    &memory_domain::DomainScope::user_main(),
+                )
+                .unwrap_or(None)
+            {
                 target_scope_ok.insert(r.target_memory_id.clone());
                 targets_json.push(serde_json::json!({
                     "candidate_id": r.candidate_id,
@@ -1047,7 +1123,11 @@ async fn process_semantic_index(
     let text = {
         let mut g = state.store.lock().unwrap();
         match job.object_kind.as_str() {
-            "memory" => match g.get_memory(scope, &job.object_id) {
+            "memory" => match g.get_memory(
+                scope,
+                &job.object_id,
+                /*DOM:dream-job-domain-pending*/ &memory_domain::DomainScope::user_main(),
+            ) {
                 Ok(Some(m)) => semantic_index_text("memory", None, &m.claim),
                 _ => {
                     let _ = g.semantic_job_finish(
@@ -1061,7 +1141,12 @@ async fn process_semantic_index(
                     return;
                 }
             },
-            "page" => match g.get_page(scope, &job.object_id, &now_rfc()) {
+            "page" => match g.get_page(
+                scope,
+                &job.object_id,
+                &now_rfc(),
+                /*DOM:dream-job-domain-pending*/ &memory_domain::DomainScope::user_main(),
+            ) {
                 Ok(Some(p)) => memory_store_sqlite::semantic_index::semantic_index_page_text(
                     &p.title,
                     &p.description,

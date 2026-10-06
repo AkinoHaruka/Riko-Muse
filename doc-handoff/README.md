@@ -1,6 +1,8 @@
 # Agent-Memory 实施交接说明（给下一个 Harness）
 
-> **Riko-Muse 当前交付（2026-10-06，分支 `Riko-Muse`）**：M1—M3（schema 14、迁移 0014、expire/rupture/repair/alignment）见 [24](24-Riko-Muse交付记录.md)；M4 `extract_v4/admit_v4` rewrite 已在 HEAD `8c02a68` 实施，同语料 Gemini 观察从 v3 的 0/14 active 到 v4 的 7/15 active，含检索/注入验证，详见 [25 §9](25-Riko-Muse真实模型验收.md)。该样本不代表整体记忆质量验收。真实 DSH 宿主闭环及 adapter 消费 alignment 仍未接线；dana/realtest 原库未触碰。当前工作树另有 Bridge `0.1.2` 修改，尚未验证或部署。
+> **V2-S1 记忆域（2026-10-06 晚，分支 `Riko-Muse`）**：V2 迭代第一张卡 V2-S1 已实施——迁移 `0015_memory_domains.sql`（schema 15）、域注册/会话绑定/跨域授权/证据域映射存储层、`DomainScope` 读域集闭包、`[domains] enabled` 开关、7 个 `/v1/domains*` 管理端点、写路径与读路径接线，以及 8 项 `v2_domain_tests`。`cargo test --workspace` **168 passed / 0 failed**；临时库 HTTP 冒烟确认「主域猜 ID 读不到 side、授权后才可跨读、关闭域 409」。完整证据、接手时 208 个编译错误的修复过程、5 个真实缺陷与一次文件损坏事故的恢复验证见 [26](26-V2-S1记忆域交付记录.md)。**未接线**：Dream 作业域（`dream_worker.rs` 13 处标记）、CLI 子命令（17 处标记）；真实 DSH 闭环、真实模型、部署均未验证。dana/realtest 原库未打开、未升级。
+>
+> **Riko-Muse M1—M4（2026-10-06，分支 `Riko-Muse`）**：M1—M3（schema 14、迁移 0014、expire/rupture/repair/alignment）见 [24](24-Riko-Muse交付记录.md)；M4 `extract_v4/admit_v4` rewrite 已在 HEAD `8c02a68` 实施，同语料 Gemini 观察从 v3 的 0/14 active 到 v4 的 7/15 active，含检索/注入验证，详见 [25 §9](25-Riko-Muse真实模型验收.md)。该样本不代表整体记忆质量验收。真实 DSH 宿主闭环及 adapter 消费 alignment 仍未接线。当前工作树另有 Bridge `0.1.2` 修改，尚未验证或部署。
 
 > **当前实施更新（2026-09-29）**：D6-11—D6-15 已实施并提交，schema 13。当前 Rust workspace `fmt/test/build` 均通过；适配器 `npm test` 20/20 通过。官方 DSH + 本地固定响应验证了受限 Dream child 的提取/裁决，以及主题页创建和基于已读页面版本的更新。Android 模型设置 Bridge `0.1.1` 已部署到生产 DSH `web` profile；补齐 profile 配置后重启了 DSH runtime。Android 模拟器现已通过认证连接线上 Riko preset，读取 health、model catalog、model-settings 与提供商状态成功。未调用模型 API；尚未验证 Android 中密钥写入、自定义提供商保存/发现后实际发起模型对话。dana/realtest 原库未触碰。详见 [23](23-Android-Bridge生产部署与连通验证.md)。
 
@@ -47,13 +49,14 @@
 | [23 Android Bridge 生产部署与连通验证](23-Android-Bridge生产部署与连通验证.md) | 生产 DSH profile 更新、缺失配置修复、回滚备份与 Android 模拟器连接验证 |
 | [24 Riko-Muse 交付记录](24-Riko-Muse交付记录.md) | doc7（M1/M2/M3）交付：迁移 0014、rupture/repair、alignment synthesis、compose opt-in、purge 闭包扩展、验证档位与未接线边界 |
 | [25 Riko-Muse 真实模型验收](25-Riko-Muse真实模型验收.md) | 三轮真实模型观察；含 extract_v3 的 0-active 问题、extract_v4 的同语料 7/15 active 结果、保护门核对与清理记录 |
+| [26 V2-S1 记忆域交付记录](26-V2-S1记忆域交付记录.md) | **最新**：接手上一轮中断（208 编译错误）后的修复、V2-S1 内核与 HTTP 层实施、5 个真实缺陷、168 项测试与临时库 HTTP 冒烟证据、未接线边界 |
 
 ## 30 秒状态
 
 ```
-根仓库 branch/HEAD：开工现场检查；本次观察时为 `Riko-Muse` / `8c02a68`。官方 DSH HEAD `639ed015397290b3745d163aafe02ffee4aa3f84`（0.2.0-rc.2）。
-当前实现：schema 14，Muse M1—M4 已实施；extract_v4 同语料 Gemini 真实模型验收记录见 [25 §9](25-Riko-Muse真实模型验收.md)。Bridge `0.1.2` 正在工作树修改中，尚未验证/部署；生产仍为 `0.1.1`，状态和边界见 [23](23-Android-Bridge生产部署与连通验证.md)。
-验证：M1—M3 的 Rust 172 项测试、构建和临时库 CLI/HTTP 冒烟见 [24](24-Riko-Muse交付记录.md)；M4 的实施验证及 156 项 workspace 测试记录见 [25 §9](25-Riko-Muse真实模型验收.md)。本次 review 未运行验证命令。未验证：真实 DSH 宿主闭环、adapter 对 alignment 的消费、整体记忆质量、规模性能、dana/realtest 用户库升级和 memoryd 生产部署。dana/realtest 原库未打开、未升级。
+根仓库 branch/HEAD：开工现场检查；本次观察时为 `Riko-Muse` / `2033da9`（V2-S1 交付尚未提交）。官方 DSH HEAD `639ed015397290b3745d163aafe02ffee4aa3f84`（0.2.0-rc.2）。
+当前实现：schema 15。Muse M1—M4 已提交（详见 [24](24-Riko-Muse交付记录.md)、[25 §9](25-Riko-Muse真实模型验收.md)）；**V2-S1 记忆域已实施但未提交**，见 [26](26-V2-S1记忆域交付记录.md)。Bridge `0.1.2` 正在工作树修改中，尚未验证/部署；生产仍为 `0.1.1`，状态和边界见 [23](23-Android-Bridge生产部署与连通验证.md)。
+验证：`cargo test --workspace` **168 passed / 0 failed**（含 V2-S1 的 8 项 `v2_domain_tests`）；`cargo fmt --all`、`cargo build --workspace` 通过；V2-S1 另有临时库 HTTP 冒烟（域管理端点、域头读、绑定写路径、授权跨读）。历史档位：M1—M3 的 172 项测试见 [24](24-Riko-Muse交付记录.md)，M4 的 156 项记录见 [25 §9](25-Riko-Muse真实模型验收.md)。未验证：真实 DSH 宿主闭环、adapter 对 alignment/域选择器的消费、Dream 作业域接线、整体记忆质量、规模性能、dana/realtest 用户库升级和 memoryd 生产部署。dana/realtest 原库未打开、未升级。
 数据库边界：dana/realtest 原库未打开或升级；任何迁移演练只用临时库/副本
 用户工作区：官方 `deepseek-harness/` 已重克隆为干净 rc.2 clone，保持未跟踪/只读；原有带删除状态的 clone 完整保留在 `%LOCALAPPDATA%\Temp\deepseek-harness-prior-20260929`。`MiMo-Code/`、`doc2/`、`doc3/`、`doc5/` 仍为本地参考目录，不纳入本项目提交。Riko-App 根目录不是 Git 仓库，其本地 Android 源码不在本仓库提交范围内；其 debug APK 已安装于 `emulator-5554` 并成功连通生产 Bridge（详细边界见 23）。
 ```

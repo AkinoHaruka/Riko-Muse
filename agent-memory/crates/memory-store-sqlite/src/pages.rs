@@ -6,7 +6,7 @@
 //! stale 并移除索引（`stale_pages_for_memory`）；读路径每次复核来源
 //! （doc6/05 §4：后台修复只改善可用性，不承担撤销正确性）。
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use memory_recall::cjk_bigrams;
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
@@ -321,8 +321,12 @@ impl Store {
     /// 发布：单事务核全部来源当前 active/同版/哈希一致；CAS 版本替换旧
     /// published（旧版留 revisions）；同事务更新 FTS/grams。任一来源失效 →
     /// StaleInput 整批不发布（doc6/05 §4：不做部分发布）。
-    pub fn publish_page(&mut self, req: &PublishRequest<'_>) -> Result<(String, i64), StoreError> {
-        self.publish_page_inner(req, "", false)
+    pub fn publish_page(
+        &mut self,
+        req: &PublishRequest<'_>,
+        dom: &DomainScope,
+    ) -> Result<(String, i64), StoreError> {
+        self.publish_page_inner(req, "", false, dom)
     }
 
     /// Versioned topic-page publish with a searchable descriptive sentence.
@@ -330,8 +334,9 @@ impl Store {
         &mut self,
         req: &PublishRequest<'_>,
         description: &str,
+        dom: &DomainScope,
     ) -> Result<(String, i64), StoreError> {
-        self.publish_page_inner(req, description, false)
+        self.publish_page_inner(req, description, false, dom)
     }
 
     /// DSH runner submit 重放专用：同一冻结输入、输出和来源集合已发布时
@@ -339,16 +344,18 @@ impl Store {
     pub fn publish_page_idempotent(
         &mut self,
         req: &PublishRequest<'_>,
+        dom: &DomainScope,
     ) -> Result<(String, i64), StoreError> {
-        self.publish_page_inner(req, "", true)
+        self.publish_page_inner(req, "", true, dom)
     }
 
     pub fn publish_page_with_description_idempotent(
         &mut self,
         req: &PublishRequest<'_>,
         description: &str,
+        dom: &DomainScope,
     ) -> Result<(String, i64), StoreError> {
-        self.publish_page_inner(req, description, true)
+        self.publish_page_inner(req, description, true, dom)
     }
 
     fn publish_page_inner(
@@ -356,6 +363,7 @@ impl Store {
         req: &PublishRequest<'_>,
         description: &str,
         idempotent_replay: bool,
+        dom: &DomainScope,
     ) -> Result<(String, i64), StoreError> {
         if req.title.is_empty() || req.title.chars().count() > PAGE_TITLE_MAX_CHARS {
             return Err(StoreError::InvalidPageField);
@@ -388,16 +396,20 @@ impl Store {
                 _ => return Err(StoreError::StaleInput),
             }
         }
+        // V2-S1（doc7/04 §3）：页面身份含域；同 key 在 main 与 side 各有一行，
+        // 不做跨域「找到既有页再原地升级」。
         let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT id, version FROM memory_pages
-                 WHERE tenant_id=?1 AND user_id=?2 AND document_kind=?3 AND document_key=?4
+                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?5
+                   AND document_kind=?3 AND document_key=?4
                    AND status IN ('published','stale') LIMIT 1",
                 params![
                     req.scope.tenant_id,
                     req.scope.user_id,
                     req.document_kind,
-                    req.document_key
+                    req.document_key,
+                    dom.write
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -487,8 +499,8 @@ impl Store {
                 "INSERT INTO memory_pages
                     (id, tenant_id, user_id, document_kind, document_key, question_version,
                     question_text, title, description, body_md, status, version, generator_version,
-                    input_fingerprint, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'published', 1, ?11, ?12, ?13, ?13)",
+                    input_fingerprint, created_at, updated_at, domain_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'published', 1, ?11, ?12, ?13, ?13, ?14)",
                 params![
                     page_id,
                     req.scope.tenant_id,
@@ -502,7 +514,8 @@ impl Store {
                     req.body_md,
                     req.generator_version,
                     req.input_fingerprint,
-                    now
+                    now,
+                    dom.write
                 ],
             )?;
         }
@@ -600,14 +613,16 @@ impl Store {
         scope: &ScopeKey,
         page_id: &str,
         now: &str,
+        dom: &DomainScope,
     ) -> Result<Option<PageRow>, StoreError> {
         let base: Option<PageRow> = self
             .conn()
             .query_row(
                 "SELECT id, document_kind, document_key, question_version, question_text,
                         title, description, body_md, status, version, generator_version, input_fingerprint, updated_at
-                 FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
-                params![scope.tenant_id, scope.user_id, page_id],
+                 FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND id=?3
+                   AND domain_id IN (SELECT value FROM json_each(?4))",
+                params![scope.tenant_id, scope.user_id, page_id, dom.read_json()],
                 |r| {
                     Ok(PageRow {
                         page_id: r.get(0)?,
@@ -716,6 +731,7 @@ impl Store {
         scope: &ScopeKey,
         statuses: &[&str],
         limit: usize,
+        dom: &DomainScope,
     ) -> Result<Vec<PageRow>, StoreError> {
         let status_clause = if statuses.is_empty() {
             "status IN ('published','stale','archived')".to_string()
@@ -732,6 +748,7 @@ impl Store {
             "SELECT id, document_kind, document_key, question_version, question_text,
                     title, description, body_md, status, version, generator_version, input_fingerprint, updated_at
              FROM memory_pages p WHERE tenant_id=?1 AND user_id=?2 AND {status_clause}
+               AND p.domain_id IN (SELECT value FROM json_each(?5))
                AND EXISTS (SELECT 1 FROM page_sources ps
                  WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
                AND NOT EXISTS (SELECT 1 FROM page_sources ps
@@ -744,7 +761,13 @@ impl Store {
              ORDER BY updated_at DESC LIMIT ?3"
         ))?;
         let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, limit as i64, now],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                limit as i64,
+                now,
+                dom.read_json()
+            ],
             |r| {
                 Ok(PageRow {
                     page_id: r.get(0)?,
@@ -818,6 +841,7 @@ impl Store {
         scope: &ScopeKey,
         query: &str,
         limit: usize,
+        dom: &DomainScope,
     ) -> Result<Vec<String>, StoreError> {
         let grams = cjk_bigrams(query);
         if grams.is_empty() {
@@ -825,13 +849,21 @@ impl Store {
         }
         let placeholders = vec!["?"; grams.len()].join(",");
         let now = now_rfc3339()?;
-        let mut bind_values: Vec<String> = vec![scope.tenant_id.clone(), scope.user_id.clone()];
+        // V2-S1（doc7/04 §3）：域过滤与其它参数一律用无名占位符，绑定序与 SQL 文本
+        // 出现顺序严格一致（混用 ?N 与无名 ? 时 SQLite 的编号规则会错位）。
+        // 绑定序：tenant, user, 读域集, grams..., now, limit。
+        let mut bind_values: Vec<String> = vec![
+            scope.tenant_id.clone(),
+            scope.user_id.clone(),
+            dom.read_json(),
+        ];
         bind_values.extend(grams.clone());
         bind_values.push(now);
         let sql = format!(
             "SELECT DISTINCT g.page_id FROM page_grams g
              JOIN memory_pages p ON p.id=g.page_id AND p.tenant_id=g.tenant_id AND p.user_id=g.user_id
-             WHERE g.tenant_id=?1 AND g.user_id=?2 AND p.status='published'
+             WHERE g.tenant_id=? AND g.user_id=? AND p.status='published'
+               AND p.domain_id IN (SELECT value FROM json_each(?))
                AND g.gram IN ({placeholders})
                AND EXISTS (SELECT 1 FROM page_sources ps
                    WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id)
@@ -839,15 +871,13 @@ impl Store {
                    JOIN memories m ON m.tenant_id=ps.tenant_id AND m.user_id=ps.user_id AND m.id=ps.memory_id
                    WHERE ps.tenant_id=p.tenant_id AND ps.user_id=p.user_id AND ps.page_id=p.id
                      AND (m.status<>'active' OR m.version<>ps.memory_version OR m.claim_sha256<>ps.claim_sha256
-                       OR (m.valid_until IS NOT NULL AND m.valid_until<=?{})
+                       OR (m.valid_until IS NOT NULL AND m.valid_until<=?)
                        OR EXISTS (SELECT 1 FROM memory_retirements r
                            WHERE r.tenant_id=m.tenant_id AND r.user_id=m.user_id AND r.memory_id=m.id)
                        OR EXISTS (SELECT 1 FROM purge_jobs pj
                            WHERE pj.tenant_id=m.tenant_id AND pj.user_id=m.user_id AND pj.target_id=m.id
                              AND pj.status IN ('pending','running'))))
-             ORDER BY g.page_id LIMIT ?{}",
-            grams.len() + 3,
-            grams.len() + 4
+             ORDER BY g.page_id LIMIT ?"
         );
         bind_values.push((limit as i64).to_string());
         let mut stmt = self.conn().prepare(&sql)?;

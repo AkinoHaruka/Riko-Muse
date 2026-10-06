@@ -40,12 +40,31 @@ fn remember_one(
 ) -> String {
     let t = chrono::Utc::now();
     let ev = match store
-        .record_evidence(scope, origin, seq, "user", "user", &t, quote)
+        .record_evidence(
+            scope,
+            origin,
+            seq,
+            "user",
+            "user",
+            &t,
+            quote,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
-    match store.remember(scope, origin, &ev, quote, kind).unwrap() {
+    match store
+        .remember(
+            scope,
+            origin,
+            &ev,
+            quote,
+            kind,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap()
+    {
         crate::RememberOutcome::Created { memory_id, .. }
         | crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
     }
@@ -137,7 +156,14 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
     }
     // 扫描：query=[0.95,0.15] → m_near 余弦更高（按 memory ID 断言排名）。
     let (hits, count) = store
-        .semantic_scan(&scope, "memory", "m1", &[0.95, 0.15], 10)
+        .semantic_scan(
+            &scope,
+            "memory",
+            "m1",
+            &[0.95, 0.15],
+            10,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     assert_eq!((hits.len(), count), (2, 2));
     assert_eq!(hits[0].0, m_near, "余弦降序：近邻在前");
@@ -145,23 +171,54 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
     // Online retrieval can apply an inclusive relevance floor before top-K; the
     // existing semantic_scan remains unchanged for Dream candidate generation.
     let (qualified, qualified_count) = store
-        .semantic_scan_with_floor(&scope, "memory", "m1", &[0.95, 0.15], 10, 0.98)
+        .semantic_scan_with_floor(
+            &scope,
+            "memory",
+            "m1",
+            &[0.95, 0.15],
+            10,
+            0.98,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     assert_eq!(qualified_count, 2, "floor 不改变 ready 向量总数诊断");
     assert_eq!(qualified.len(), 1, "qualified hits: {qualified:?}");
     assert_eq!(qualified[0].0, m_near);
     let (inclusive, _) = store
-        .semantic_scan_with_floor(&scope, "memory", "m1", &[1.0, 0.0], 10, 1.0)
+        .semantic_scan_with_floor(
+            &scope,
+            "memory",
+            "m1",
+            &[1.0, 0.0],
+            10,
+            1.0,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     assert_eq!(inclusive.len(), 1, "相似度等于 floor 时保留");
     assert_eq!(inclusive[0].0, m_near);
     assert!(store
-        .semantic_scan_with_floor(&scope, "memory", "m1", &[1.0, 0.0], 10, 1.01)
+        .semantic_scan_with_floor(
+            &scope,
+            "memory",
+            "m1",
+            &[1.0, 0.0],
+            10,
+            1.01,
+            &memory_domain::DomainScope::user_main()
+        )
         .is_err());
     // model_id 隔离：不同模型不混算。
     assert_eq!(
         store
-            .semantic_scan(&scope, "memory", "m2", &[1.0, 0.0], 10)
+            .semantic_scan(
+                &scope,
+                "memory",
+                "m2",
+                &[1.0, 0.0],
+                10,
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .0
             .len(),
@@ -189,7 +246,14 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
         .unwrap();
     assert_eq!(
         store
-            .semantic_scan(&scope, "memory", "m3", &[1.0, 0.0], 10)
+            .semantic_scan(
+                &scope,
+                "memory",
+                "m3",
+                &[1.0, 0.0],
+                10,
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .0
             .len(),
@@ -211,6 +275,7 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
                 "user",
                 &t,
                 "用户住在杭州？不，我搬到上海了",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
         {
@@ -224,9 +289,23 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
         old_quote: "用户住在杭州".into(),
         replacement_quote: "我搬到上海了".into(),
     };
-    store.correct_memory(&scope, &m_near, &req).unwrap();
+    store
+        .correct_memory(
+            &scope,
+            &m_near,
+            &req,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     let (hits2, _) = store
-        .semantic_scan(&scope, "memory", "m1", &[1.0, 0.0], 10)
+        .semantic_scan(
+            &scope,
+            "memory",
+            "m1",
+            &[1.0, 0.0],
+            10,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap();
     assert!(
         hits2.iter().all(|(id, _)| *id != m_near),
@@ -243,7 +322,14 @@ fn semantic_vector_lifecycle_scan_order_and_stale() {
     let scope2 = store.verify_token(tok2.trim()).unwrap().unwrap();
     assert_eq!(
         store
-            .semantic_scan(&scope2, "memory", "m1", &[1.0, 0.0], 10)
+            .semantic_scan(
+                &scope2,
+                "memory",
+                "m1",
+                &[1.0, 0.0],
+                10,
+                &memory_domain::DomainScope::user_main()
+            )
             .unwrap()
             .0
             .len(),
@@ -297,14 +383,31 @@ fn adjudication_apply_pairwise_fixed_set() {
     let ev = {
         let t = chrono::Utc::now();
         match store
-            .record_evidence(&scope, &origin, 2, "user", "user", &t, content)
+            .record_evidence(
+                &scope,
+                &origin,
+                2,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
         }
     };
     let _job = store
-        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
@@ -569,7 +672,15 @@ fn adjudication_apply_pairwise_fixed_set() {
         "superseded target leaves lexical indexes"
     );
     let updated_id = result_memory_id(&ids[2]);
-    let (updated_hits, _) = store.search_memories(&scope, "上海", 20, false).unwrap();
+    let (updated_hits, _) = store
+        .search_memories(
+            &scope,
+            "上海",
+            20,
+            false,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(updated_hits.iter().any(|hit| hit.memory_id == updated_id));
     // d keep_separate：独立 L1 与 create 的 L1 并存（false merge 防护）。
     let (d_mem, a_mem) = (
@@ -651,13 +762,22 @@ fn runner_adjudication_commit_and_processed_receipt_are_atomic() {
             "user",
             &chrono::Utc::now(),
             content,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
     let dream = store
-        .dream_trigger(&scope, "manual", "atomic-complete", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "atomic-complete",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
@@ -866,14 +986,31 @@ fn adjudication_stale_on_target_drift() {
     let ev = {
         let t = chrono::Utc::now();
         match store
-            .record_evidence(&scope, &origin, 2, "user", "user", &t, content)
+            .record_evidence(
+                &scope,
+                &origin,
+                2,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
         }
     };
     let _job = store
-        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
@@ -1021,14 +1158,31 @@ fn adjudication_claim_lifecycle_and_provider_wait_resume() {
     let ev = {
         let t = chrono::Utc::now();
         match store
-            .record_evidence(&scope, &origin, 1, "user", "user", &t, content)
+            .record_evidence(
+                &scope,
+                &origin,
+                1,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
         }
     };
     let _job = store
-        .dream_trigger(&scope, "manual", "k1", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "k1",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     // claim 时钟须 >= run_after（trigger 内部落库时刻），故在 trigger 后取。
@@ -1153,13 +1307,22 @@ fn dream_adjudication_create_populates_lexical_memory_indexes() {
             "user",
             &chrono::Utc::now(),
             text,
+            &memory_domain::DomainScope::user_main(),
         )
         .unwrap()
     {
         crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
     };
     let dream = store
-        .dream_trigger(&scope, "manual", "lexical-index", None, None, None)
+        .dream_trigger(
+            &scope,
+            "manual",
+            "lexical-index",
+            None,
+            None,
+            None,
+            &memory_domain::DomainScope::user_main(),
+        )
         .unwrap()
         .unwrap();
     let now = crate::now_rfc3339_pub().unwrap();
@@ -1268,7 +1431,15 @@ fn dream_adjudication_create_populates_lexical_memory_indexes() {
             |row| row.get(0),
         )
         .unwrap();
-    let (hits, _) = store.search_memories(&scope, "Rust", 20, false).unwrap();
+    let (hits, _) = store
+        .search_memories(
+            &scope,
+            "Rust",
+            20,
+            false,
+            &memory_domain::DomainScope::user_main(),
+        )
+        .unwrap();
     assert!(fts_count > 0, "Dream-created active memory must enter FTS");
     assert!(
         gram_count > 0,

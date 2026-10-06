@@ -1,7 +1,7 @@
 //! Dream child read capabilities (D6-12): scope/job/generation/runner checked,
 //! snapshot the exact active targets observed, and never mutate memory truth.
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
@@ -196,6 +196,7 @@ impl Store {
         job_id: &str,
         generation: i64,
         document_key: &str,
+        dom: &DomainScope,
     ) -> Result<bool, StoreError> {
         let search_complete: bool = self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM dream_read_search_receipts
@@ -220,7 +221,7 @@ impl Store {
             .optional()?;
         if let Some((page_id, version)) = page {
             let now = now_rfc3339()?;
-            if self.get_page(scope, &page_id, &now)?.is_some() {
+            if self.get_page(scope, &page_id, &now, dom)?.is_some() {
                 return self
                     .conn()
                     .query_row(
@@ -749,7 +750,16 @@ mod tests {
         };
         let now = chrono::Utc::now();
         let remembered_evidence = match store
-            .record_evidence(&scope, &origin, 1, "user", "user", &now, "我偏好简洁回答")
+            .record_evidence(
+                &scope,
+                &origin,
+                1,
+                "user",
+                "user",
+                &now,
+                "我偏好简洁回答",
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
@@ -761,6 +771,7 @@ mod tests {
                 &remembered_evidence,
                 "我偏好简洁回答",
                 MemoryKind::Preference,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
         {
@@ -776,6 +787,7 @@ mod tests {
                 "user",
                 &now,
                 "我正在整理一套记忆系统",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
         {
@@ -789,6 +801,7 @@ mod tests {
                 Some("agent-a"),
                 None,
                 None,
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
             .unwrap();

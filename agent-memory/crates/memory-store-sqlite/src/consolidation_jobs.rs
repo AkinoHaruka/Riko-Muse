@@ -4,7 +4,7 @@
 //! 模型调用不在此发生（D6-7 Dream job 编排后才接 LLM）；本模块只管持久化与
 //! 状态机，固定响应验证在单元测试完成。
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
 
@@ -46,6 +46,7 @@ impl Store {
         input_fingerprint: &str,
         inputs: &[JobInput],
         run_after: &str,
+        dom: &DomainScope,
     ) -> Result<ConsolidationJobRow, StoreError> {
         let now = now_rfc3339()?;
         let tx = self
@@ -62,6 +63,7 @@ impl Store {
             inputs,
             run_after,
             &now,
+            dom,
         )?;
         tx.commit()?;
         self.consolidation_get(scope, &id)?
@@ -82,6 +84,7 @@ impl Store {
         input_fingerprint: &str,
         inputs: &[JobInput],
         run_after: &str,
+        dom: &DomainScope,
     ) -> Result<(ConsolidationJobRow, crate::dream_jobs::DreamJobRow), StoreError> {
         let now = now_rfc3339()?;
         let tx = self
@@ -98,6 +101,7 @@ impl Store {
             inputs,
             run_after,
             &now,
+            dom,
         )?;
         let trigger_key = format!("manual-consolidation-{job_id}");
         let dream_id = crate::dream_jobs::link_manual_consolidation_tx(
@@ -106,6 +110,7 @@ impl Store {
             &job_id,
             &trigger_key,
             &now,
+            dom,
         )?;
         tx.commit()?;
         let job = self
@@ -418,6 +423,7 @@ fn enqueue_job_tx(
     inputs: &[JobInput],
     run_after: &str,
     now: &str,
+    dom: &DomainScope,
 ) -> Result<String, StoreError> {
     if inputs.is_empty() {
         return Err(StoreError::InvalidPageField);
@@ -466,8 +472,8 @@ fn enqueue_job_tx(
     tx.execute(
         "INSERT INTO consolidation_jobs
            (id,tenant_id,user_id,document_kind,document_key,question_version,input_fingerprint,
-            generator_version,status,attempts,run_after,claim_generation,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',0,?9,0,?10,?10)",
+            generator_version,status,attempts,run_after,claim_generation,created_at,updated_at,domain_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',0,?9,0,?10,?10,?11)",
         params![
             id,
             scope.tenant_id,
@@ -478,7 +484,8 @@ fn enqueue_job_tx(
             input_fingerprint,
             generator_version,
             run_after,
-            now
+            now,
+            dom.write
         ],
     )?;
     for (order, (memory_id, version, claim_sha)) in inputs.iter().enumerate() {

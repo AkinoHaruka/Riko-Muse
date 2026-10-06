@@ -236,10 +236,12 @@ pub fn rewrite_input_json(
     let items: Vec<serde_json::Value> = held
         .iter()
         .map(|(idx, c)| {
-            let occurred = c
-                .occurred_at
-                .clone()
-                .or_else(|| events.iter().find(|e| e.id == c.source_event_id).map(|e| e.occurred_at.clone()));
+            let occurred = c.occurred_at.clone().or_else(|| {
+                events
+                    .iter()
+                    .find(|e| e.id == c.source_event_id)
+                    .map(|e| e.occurred_at.clone())
+            });
             serde_json::json!({
                 "candidate_index": idx,
                 "source_event_id": c.source_event_id,
@@ -309,7 +311,10 @@ pub fn parse_rewrite_output(
             return Err(format!("rewrite claims 超上限 index={}", r.candidate_index));
         }
         if r.claims.is_empty() && r.reason.is_none() {
-            return Err(format!("rewrite 空 claims 缺 reason index={}", r.candidate_index));
+            return Err(format!(
+                "rewrite 空 claims 缺 reason index={}",
+                r.candidate_index
+            ));
         }
     }
     for &idx in expected_indices {
@@ -502,7 +507,8 @@ pub fn admit_v4(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
         }
     }
     // 6. fact/preference 缺明确归属主体。
-    if matches!(c.kind.as_str(), "fact" | "preference") && rewritten_unclear_subject(text, claim_text.is_some())
+    if matches!(c.kind.as_str(), "fact" | "preference")
+        && rewritten_unclear_subject(text, claim_text.is_some())
     {
         return Held("UNCLEAR_SUBJECT");
     }
@@ -592,7 +598,6 @@ fn rewritten_unclear_subject(text: &str, is_claim: bool) -> bool {
     }
     unclear_subject(text)
 }
-
 
 /// 一次性/假设/转述词（doc/13 §5.5）。
 fn context_uncertain(quote: &str) -> bool {
@@ -1397,7 +1402,7 @@ mod tests {
             let c = ModelCandidate {
                 kind: kind.into(),
                 ..cand(quote)
-        };
+            };
             admit_v2(&c, &events)
         };
         use Admission::{Active, Held};
@@ -1633,16 +1638,25 @@ mod tests {
         multi2.kind = "preference".into();
         multi2.claim = Some("用户喜欢咖啡。用户喜欢茶".into());
         let events_pref = mk_events(&["我喜欢咖啡，也喜欢茶"]);
-        assert_eq!(admit_v4(&multi2, &events_pref), Admission::Held("MULTI_CLAIM"));
+        assert_eq!(
+            admit_v4(&multi2, &events_pref),
+            Admission::Held("MULTI_CLAIM")
+        );
         // 敏感/时效。
         let events_health = mk_events(&["我对花生过敏"]);
         let mut health = held_cand("我对花生过敏", 0);
         health.claim = Some("用户对花生过敏".into());
-        assert_eq!(admit_v4(&health, &events_health), Admission::Held("SENSITIVE"));
+        assert_eq!(
+            admit_v4(&health, &events_health),
+            Admission::Held("SENSITIVE")
+        );
         let events_temp = mk_events(&["我最近在肝星穹铁道"]);
         let mut temporal = held_cand("我最近在肝星穹铁道", 0);
         temporal.claim = Some("用户最近在玩星穹铁道".into());
-        assert_eq!(admit_v4(&temporal, &events_temp), Admission::Held("TEMPORAL"));
+        assert_eq!(
+            admit_v4(&temporal, &events_temp),
+            Admission::Held("TEMPORAL")
+        );
         // 按时间归位后 → Active。
         temporal.claim = Some("用户在 2026-10 玩星穹铁道".into());
         assert_eq!(admit_v4(&temporal, &events_temp), Admission::Active);

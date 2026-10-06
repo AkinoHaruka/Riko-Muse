@@ -7,7 +7,7 @@
 //! 回执（receipt）与业务修改同事务提交（doc6/02 §2）。D6-1/D6-2 提供存储与
 //! 可见性初核；resident 选择算法、预算与 suggestions 在 D6-3。
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 
 use crate::{now_rfc3339, Store, StoreError};
@@ -360,6 +360,7 @@ impl Store {
         &self,
         scope: &ScopeKey,
         now: &str,
+        dom: &DomainScope,
     ) -> Result<Vec<ResidentPinStatusRow>, StoreError> {
         let mut stmt = self.conn().prepare(
             "SELECT p.memory_id, p.position, p.version, m.status,
@@ -367,29 +368,33 @@ impl Store {
              FROM resident_pins p JOIN memories m
                ON m.tenant_id=p.tenant_id AND m.user_id=p.user_id AND m.id=p.memory_id
              WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.enabled=1
+               AND m.domain_id IN (SELECT value FROM json_each(?4))
              ORDER BY p.position, p.memory_id",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
-            let memory_status: String = r.get(3)?;
-            let visible: bool = r.get(4)?;
-            let reason = if visible {
-                ""
-            } else if memory_status == "forgotten" {
-                "STATUS_FORGOTTEN"
-            } else if memory_status == "superseded" {
-                "STATUS_SUPERSEDED"
-            } else {
-                "STATUS_EXPIRED"
-            };
-            Ok(ResidentPinStatusRow {
-                memory_id: r.get(0)?,
-                position: r.get(1)?,
-                version: r.get(2)?,
-                memory_status,
-                visible,
-                reason,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, now, dom.read_json()],
+            |r| {
+                let memory_status: String = r.get(3)?;
+                let visible: bool = r.get(4)?;
+                let reason = if visible {
+                    ""
+                } else if memory_status == "forgotten" {
+                    "STATUS_FORGOTTEN"
+                } else if memory_status == "superseded" {
+                    "STATUS_SUPERSEDED"
+                } else {
+                    "STATUS_EXPIRED"
+                };
+                Ok(ResidentPinStatusRow {
+                    memory_id: r.get(0)?,
+                    position: r.get(1)?,
+                    version: r.get(2)?,
+                    memory_status,
+                    visible,
+                    reason,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -399,6 +404,7 @@ impl Store {
         &self,
         scope: &ScopeKey,
         now: &str,
+        dom: &DomainScope,
     ) -> Result<Vec<VisiblePin>, StoreError> {
         let mut stmt = self.conn().prepare(
             "SELECT p.memory_id, p.position, p.version, m.kind, m.claim
@@ -406,21 +412,25 @@ impl Store {
                ON m.tenant_id=p.tenant_id AND m.user_id=p.user_id AND m.id=p.memory_id
              WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.enabled=1
                AND m.status='active'
+               AND m.domain_id IN (SELECT value FROM json_each(?4))
                AND (m.valid_until IS NULL OR m.valid_until > ?3)
                AND NOT EXISTS (SELECT 1 FROM memory_retirements r
                                WHERE r.tenant_id=p.tenant_id AND r.user_id=p.user_id
                                  AND r.memory_id=p.memory_id)
              ORDER BY p.position, p.memory_id",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
-            Ok(VisiblePin {
-                memory_id: r.get(0)?,
-                position: r.get(1)?,
-                version: r.get(2)?,
-                kind: r.get(3)?,
-                claim: r.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, now, dom.read_json()],
+            |r| {
+                Ok(VisiblePin {
+                    memory_id: r.get(0)?,
+                    position: r.get(1)?,
+                    version: r.get(2)?,
+                    kind: r.get(3)?,
+                    claim: r.get(4)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -552,8 +562,10 @@ impl Store {
         now: &str,
         max_items: usize,
         max_chars: usize,
+        dom: &DomainScope,
     ) -> Result<ResidentSelection, StoreError> {
         // 1. enabled pin JOIN active 未过期记忆（position 升序）。
+        // V2-S1：仅读域集内记忆/页面进入常驻装配（doc7/04 §3）。
         let mut items: Vec<ResidentItem> = Vec::new();
         let mut candidate_ids: Vec<String> = Vec::new();
         let mut needs_review: Vec<String> = Vec::new();
@@ -563,17 +575,21 @@ impl Store {
                  FROM resident_pins p JOIN memories m
                    ON m.tenant_id=p.tenant_id AND m.user_id=p.user_id AND m.id=p.memory_id
                  WHERE p.tenant_id=?1 AND p.user_id=?2 AND p.enabled=1
+                   AND m.domain_id IN (SELECT value FROM json_each(?3))
                  ORDER BY p.position, p.memory_id",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })?;
+            let rows = stmt.query_map(
+                params![scope.tenant_id, scope.user_id, dom.read_json()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
             for row in rows {
                 let (memory_id, kind, claim, version, status) = row?;
                 if status != "active" {
@@ -583,7 +599,7 @@ impl Store {
                     continue;
                 }
                 // D6-9：retired 覆盖在排序前排除（读路径统一门）。
-                if self.retirement_get(scope, &memory_id)?.is_some() {
+                if self.retirement_get(scope, &memory_id, dom)?.is_some() {
                     needs_review.push(memory_id);
                     continue;
                 }
@@ -615,7 +631,7 @@ impl Store {
             })?;
             let pinned_page_ids: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
             for page_id in pinned_page_ids {
-                match self.get_page(scope, &page_id, now)? {
+                match self.get_page(scope, &page_id, now, dom)? {
                     Some(p) => {
                         candidate_ids.push(page_id.clone());
                         items.push(ResidentItem {
@@ -640,6 +656,7 @@ impl Store {
                  WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.status='active'
                    AND m.kind='instruction'
                    AND (m.valid_until IS NULL OR m.valid_until > ?3)
+                   AND m.domain_id IN (SELECT value FROM json_each(?4))
                    AND NOT EXISTS (
                      SELECT 1 FROM resident_pins p
                      WHERE p.tenant_id=m.tenant_id AND p.user_id=m.user_id
@@ -647,14 +664,17 @@ impl Store {
                    )
                  ORDER BY m.updated_at DESC, m.id ASC LIMIT 200",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, now], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?;
+            let rows = stmt.query_map(
+                params![scope.tenant_id, scope.user_id, now, dom.read_json()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
             for row in rows {
                 let (memory_id, kind, claim, version) = row?;
                 candidate_ids.push(memory_id.clone());
@@ -789,7 +809,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::IngestOutcome;
-    use memory_domain::{MemoryKind, Origin};
+    use memory_domain::{DomainScope, MemoryKind, Origin};
 
     fn migrations_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -822,14 +842,30 @@ mod tests {
     ) -> String {
         let t = chrono::Utc::now();
         let ev = match store
-            .record_evidence(scope, origin, seq, "user", "user", &t, claim)
+            .record_evidence(
+                scope,
+                origin,
+                seq,
+                "user",
+                "user",
+                &t,
+                claim,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             IngestOutcome::Recorded(id) => id,
             IngestOutcome::AlreadyRecorded(id) => id,
         };
         match store
-            .remember(scope, origin, &ev, claim, MemoryKind::Fact)
+            .remember(
+                scope,
+                origin,
+                &ev,
+                claim,
+                MemoryKind::Fact,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::RememberOutcome::Created { memory_id, .. } => memory_id,
@@ -960,11 +996,13 @@ mod tests {
             .unwrap();
         let now = now_rfc3339().unwrap();
         assert!(store
-            .resident_visible_pins(&scope, &now)
+            .resident_visible_pins(&scope, &now, &memory_domain::DomainScope::user_main())
             .unwrap()
             .is_empty());
         // CLI list 给出不可见原因；pin 行保留作历史。
-        let rows = store.resident_pins_with_status(&scope, &now).unwrap();
+        let rows = store
+            .resident_pins_with_status(&scope, &now, &memory_domain::DomainScope::user_main())
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| !r.visible));
         assert!(rows.iter().any(|r| r.reason == "STATUS_FORGOTTEN"));
@@ -977,7 +1015,9 @@ mod tests {
                 params![scope.tenant_id, scope.user_id, m_keep],
             )
             .unwrap();
-        let visible2 = store.resident_visible_pins(&scope, &now).unwrap();
+        let visible2 = store
+            .resident_visible_pins(&scope, &now, &memory_domain::DomainScope::user_main())
+            .unwrap();
         assert_eq!(visible2.len(), 1);
         assert_eq!(visible2[0].memory_id, m_keep);
     }
@@ -1062,13 +1102,32 @@ mod tests {
     ) -> String {
         let t = chrono::Utc::now();
         let ev = match store
-            .record_evidence(scope, origin, seq, "user", "user", &t, claim)
+            .record_evidence(
+                scope,
+                origin,
+                seq,
+                "user",
+                "user",
+                &t,
+                claim,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             IngestOutcome::Recorded(id) => id,
             IngestOutcome::AlreadyRecorded(id) => id,
         };
-        match store.remember(scope, origin, &ev, claim, kind).unwrap() {
+        match store
+            .remember(
+                scope,
+                origin,
+                &ev,
+                claim,
+                kind,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap()
+        {
             crate::RememberOutcome::Created { memory_id, .. } => memory_id,
             crate::RememberOutcome::Dedup { memory_id, .. } => memory_id,
         }
@@ -1112,7 +1171,15 @@ mod tests {
         );
         store.resident_pin(&scope, &f1, None, None, None).unwrap();
         let now = now_rfc3339().unwrap();
-        let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+        let sel = store
+            .select_resident(
+                &scope,
+                &now,
+                24,
+                3000,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         let ids: Vec<&str> = sel.items.iter().map(|i| i.memory_id.as_str()).collect();
         // pinned fact 在前；instruction 按 updated_at DESC（最新的 i2 在前）。
         assert_eq!(ids, vec![f1.as_str(), i2.as_str(), i1.as_str()]);
@@ -1162,7 +1229,15 @@ mod tests {
         store.resident_pin(&scope, &f2, None, None, None).unwrap();
         let now = now_rfc3339().unwrap();
         // 条数限制：2 条 pin 后 instruction 被 ITEM_LIMIT。
-        let sel = store.select_resident(&scope, &now, 2, 10000).unwrap();
+        let sel = store
+            .select_resident(
+                &scope,
+                &now,
+                2,
+                10000,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert_eq!(sel.items.len(), 2);
         assert!(sel
             .omitted
@@ -1170,7 +1245,15 @@ mod tests {
             .any(|(id, r)| id == &i1 && *r == "ITEM_LIMIT"));
         assert!(sel.truncated);
         // 字符限制：预算极小 → 长条 CHAR_LIMIT；正文仍为完整条目（非半句）。
-        let sel2 = store.select_resident(&scope, &now, 24, 40).unwrap();
+        let sel2 = store
+            .select_resident(
+                &scope,
+                &now,
+                24,
+                40,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(sel2
             .items
             .iter()
@@ -1209,7 +1292,15 @@ mod tests {
             )
             .unwrap();
         let now = now_rfc3339().unwrap();
-        let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+        let sel = store
+            .select_resident(
+                &scope,
+                &now,
+                24,
+                3000,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert_eq!(sel.conflict_ids.len(), 2, "两端都进 conflict_ids");
         assert!(sel.items.is_empty(), "冲突对默认都不进正文");
         assert!(sel.omitted.is_empty(), "冲突退出不算预算省略");
@@ -1237,7 +1328,15 @@ mod tests {
             )
             .unwrap();
         let now = now_rfc3339().unwrap();
-        let sel = store.select_resident(&scope, &now, 24, 3000).unwrap();
+        let sel = store
+            .select_resident(
+                &scope,
+                &now,
+                24,
+                3000,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         assert!(sel.needs_review.contains(&f1), "旧 pin 报 needs_review");
         assert!(sel.items.is_empty());
     }

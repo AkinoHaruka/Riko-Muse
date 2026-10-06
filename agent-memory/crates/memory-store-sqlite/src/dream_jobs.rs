@@ -4,7 +4,7 @@
 //! runner 与 DSH 的持久 dispatch 通过 dream_runners / claim_generation 管理；
 //! 触发器与输入始终先由 memoryd 持久化。
 
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -509,11 +509,12 @@ impl Store {
         scope: &ScopeKey,
         consolidation_job_id: &str,
         trigger_key: &str,
+        dom: &DomainScope,
     ) -> Result<DreamJobRow, StoreError> {
         let now = now_rfc3339()?;
         let tx = self.conn_mut().transaction()?;
         let dream_id =
-            link_manual_consolidation_tx(&tx, scope, consolidation_job_id, trigger_key, &now)?;
+            link_manual_consolidation_tx(&tx, scope, consolidation_job_id, trigger_key, &now, dom)?;
         tx.commit()?;
         self.dream_get(scope, &dream_id)?
             .ok_or(StoreError::JobNotFound)
@@ -533,6 +534,7 @@ impl Store {
         agent_id: Option<&str>,
         host_id: Option<&str>,
         session_id: Option<&str>,
+        dom: &DomainScope,
     ) -> Result<Option<DreamJobRow>, StoreError> {
         if !matches!(trigger_kind, "compact" | "scheduled" | "custom" | "manual") {
             return Err(StoreError::StateConflict);
@@ -561,8 +563,13 @@ impl Store {
                 "SELECT e.id, e.host_id, e.session_id, e.event_seq, e.content_sha256, e.content
                  FROM evidence_events e
                  WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+                   AND COALESCE((SELECT d.domain_id FROM evidence_domain_map d
+                                 WHERE d.tenant_id=e.tenant_id AND d.user_id=e.user_id
+                                   AND d.evidence_id=e.id), 'user_main')
+                       IN (SELECT value FROM json_each(?5))
                    AND NOT EXISTS (SELECT 1 FROM suppressed_sources ss
-                     WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id)
+                     WHERE ss.tenant_id=e.tenant_id AND ss.user_id=e.user_id AND ss.evidence_id=e.id
+                       AND ss.domain_id IN (SELECT value FROM json_each(?5)))
                    AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt
                      WHERE pt.tenant_id=e.tenant_id AND pt.user_id=e.user_id
                        AND pt.source_kind='evidence' AND pt.source_id=e.content_sha256)
@@ -584,7 +591,13 @@ impl Store {
                  ORDER BY e.host_id, e.session_id, e.event_seq",
             )?;
             let rows = stmt.query_map(
-                params![scope.tenant_id, scope.user_id, DREAM_PIPELINE_V1, now],
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    DREAM_PIPELINE_V1,
+                    now,
+                    dom.read_json()
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -620,8 +633,8 @@ impl Store {
             "INSERT INTO dream_jobs
                (id, tenant_id, user_id, trigger_kind, trigger_key, agent_id, host_id, session_id,
                 pipeline_version, extract_version, status, attempts, run_after,
-                claim_generation, input_fingerprint, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', 0, ?11, 0, ?12, ?13, ?13)",
+                claim_generation, input_fingerprint, created_at, updated_at, domain_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', 0, ?11, 0, ?12, ?13, ?13, ?14)",
             params![
                 id,
                 scope.tenant_id,
@@ -635,7 +648,8 @@ impl Store {
                 DREAM_EXTRACT_V2,
                 now,
                 fingerprint,
-                now
+                now,
+                dom.write
             ],
         )?;
         for (order, (eid, host, session, seq, sha)) in candidates.iter().enumerate() {
@@ -1663,6 +1677,7 @@ pub(crate) fn link_manual_consolidation_tx(
     consolidation_job_id: &str,
     trigger_key: &str,
     now: &str,
+    dom: &DomainScope,
 ) -> Result<String, StoreError> {
     if trigger_key.is_empty() || trigger_key.len() > 128 {
         return Err(StoreError::InvalidPageField);
@@ -1693,9 +1708,9 @@ pub(crate) fn link_manual_consolidation_tx(
             tx.execute(
                 "INSERT INTO dream_jobs
                    (id,tenant_id,user_id,trigger_kind,trigger_key,pipeline_version,extract_version,
-                    status,attempts,run_after,claim_generation,input_fingerprint,created_at,updated_at,purpose)
-                 VALUES (?1,?2,?3,'manual',?4,?5,?6,'queued',0,?7,0,?8,?7,?7,'consolidation')",
-                params![id,scope.tenant_id,scope.user_id,trigger_key,DREAM_PIPELINE_V1,generator,now,fingerprint],
+                    status,attempts,run_after,claim_generation,input_fingerprint,created_at,updated_at,purpose,domain_id)
+                 VALUES (?1,?2,?3,'manual',?4,?5,?6,'queued',0,?7,0,?8,?7,?7,'consolidation',?9)",
+                params![id,scope.tenant_id,scope.user_id,trigger_key,DREAM_PIPELINE_V1,generator,now,fingerprint,dom.write],
             )?;
             id
         }

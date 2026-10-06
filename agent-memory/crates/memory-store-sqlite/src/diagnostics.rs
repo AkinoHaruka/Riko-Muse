@@ -423,7 +423,16 @@ mod tests {
             session_id: session.into(),
         };
         match store
-            .record_evidence(&scope(user), &o, seq, "user", "user", &t, content)
+            .record_evidence(
+                &scope(user),
+                &o,
+                seq,
+                "user",
+                "user",
+                &t,
+                content,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
@@ -432,7 +441,13 @@ mod tests {
 
     fn flush(store: &mut Store, user: &str, session: &str, through: i64) -> String {
         match store
-            .flush_window(&scope(user), "dsh", session, through)
+            .flush_window(
+                &scope(user),
+                "dsh",
+                session,
+                through,
+                &memory_domain::DomainScope::user_main(),
+            )
             .unwrap()
         {
             FlushOutcome::Created { job_id, .. } => job_id,
@@ -630,7 +645,8 @@ mod tests {
             occurred_at: None,
             valid_until: None,
             confidence: None,
-        claim: None,};
+            claim: None,
+        };
         let outcome = store
             .save_candidate(
                 &scope("u1"),

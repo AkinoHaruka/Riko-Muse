@@ -1,7 +1,10 @@
 //! 作用域、来源、状态机与字符串规范化规则（doc/04、doc/13）。
 //! 纯 Rust，不依赖存储或网络。
 
+pub mod domains;
 pub mod rupture;
+
+pub use domains::{DomainScope, USER_MAIN_DOMAIN};
 
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;

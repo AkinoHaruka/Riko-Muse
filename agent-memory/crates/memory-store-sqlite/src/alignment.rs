@@ -9,7 +9,7 @@
 //! RFC3339 固定微秒格式下字典序即时间序。
 
 use memory_domain::rupture::rupture_matches;
-use memory_domain::ScopeKey;
+use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension};
 
 use crate::{now_rfc3339, Store, StoreError};
@@ -163,7 +163,11 @@ impl Store {
     /// rupture 扫描（doc7/01 §1.1–1.3）：按游标增量扫 user 事件，规则命中即落
     /// rupture_events（幂等键去重），并按 7 天窗口归组到 open 线程。
     /// detected_at = 事件 received_at；游标推进与业务写入同事务。
-    pub fn rupture_scan(&mut self, scope: &ScopeKey) -> Result<RuptureScanOutcome, StoreError> {
+    pub fn rupture_scan(
+        &mut self,
+        scope: &ScopeKey,
+        dom: &DomainScope,
+    ) -> Result<RuptureScanOutcome, StoreError> {
         let mut outcome = RuptureScanOutcome::default();
         let now = now_rfc3339()?;
         let tx = self.conn_mut().transaction()?;
@@ -176,12 +180,18 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0);
-        let events: Vec<(i64, String, String, String, i64, String)> = {
+        // V2-S1：事件域取 evidence_domain_map（无映射按 user_main）；本扫描只处理
+        // 读域集内事件，跨域事件留给对应域的扫描轮次（游标全局单调，见 doc7/04 §1.3）。
+        let events: Vec<(i64, String, String, String, i64, String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT rowid, id, host_id, session_id, event_seq, content FROM evidence_events
-                 WHERE tenant_id=?1 AND user_id=?2 AND rowid > ?3
-                   AND role='user' AND source_kind='user'
-                 ORDER BY rowid ASC LIMIT ?4",
+                "SELECT e.rowid, e.id, e.host_id, e.session_id, e.event_seq, e.content,
+                        COALESCE(d.domain_id, 'user_main') AS domain_id
+                 FROM evidence_events e
+                 LEFT JOIN evidence_domain_map d
+                   ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
+                 WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.rowid > ?3
+                   AND e.role='user' AND e.source_kind='user'
+                 ORDER BY e.rowid ASC LIMIT ?4",
             )?;
             let rows = stmt.query_map(
                 params![
@@ -198,6 +208,7 @@ impl Store {
                         r.get::<_, String>(3)?,
                         r.get::<_, i64>(4)?,
                         r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
                     ))
                 },
             )?;
@@ -208,8 +219,11 @@ impl Store {
         // 本批触碰过的线程（新建或追加），事件循环后按 rupture_events 事实重算计数。
         let mut touched_threads: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        for (rowid, evidence_id, host_id, session_id, event_seq, content) in events {
+        for (rowid, evidence_id, host_id, session_id, event_seq, content, event_domain) in events {
             last_scanned_rowid = rowid;
+            if !dom.allows_read(&event_domain) {
+                continue;
+            }
             let matches = rupture_matches(&content);
             if matches.is_empty() {
                 continue;
@@ -221,7 +235,7 @@ impl Store {
                 |r| r.get(0),
             )?;
             let (thread_id, opened) =
-                assign_thread_tx(&tx, scope, &content, &detected_at, &now)?;
+                assign_thread_tx(&tx, scope, &content, &detected_at, &now, &event_domain)?;
             if opened {
                 outcome.opened_threads += 1;
             }
@@ -230,8 +244,8 @@ impl Store {
                 let n = tx.execute(
                     "INSERT OR IGNORE INTO rupture_events
                      (id, tenant_id, user_id, evidence_id, host_id, session_id, event_seq,
-                      signal, cue, start_byte, end_byte, thread_id, detected_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                      signal, cue, start_byte, end_byte, thread_id, detected_at, domain_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                     params![
                         uuid::Uuid::now_v7().to_string(),
                         scope.tenant_id,
@@ -245,7 +259,8 @@ impl Store {
                         m.start_byte as i64,
                         m.end_byte as i64,
                         thread_id,
-                        detected_at
+                        detected_at,
+                        event_domain
                     ],
                 )?;
                 if n > 0 {
@@ -271,14 +286,7 @@ impl Store {
                     "UPDATE repair_threads
                      SET rupture_count=?1, last_rupture_at=?2, updated_at=?3
                      WHERE tenant_id=?4 AND user_id=?5 AND id=?6",
-                    params![
-                        cnt,
-                        last_at,
-                        now,
-                        scope.tenant_id,
-                        scope.user_id,
-                        thread_id
-                    ],
+                    params![cnt, last_at, now, scope.tenant_id, scope.user_id, thread_id],
                 )?;
             }
         }
@@ -287,12 +295,7 @@ impl Store {
              VALUES (?1,?2,?3,?4)
              ON CONFLICT (tenant_id, user_id)
              DO UPDATE SET last_rowid=?3, updated_at=?4",
-            params![
-                scope.tenant_id,
-                scope.user_id,
-                last_scanned_rowid,
-                now
-            ],
+            params![scope.tenant_id, scope.user_id, last_scanned_rowid, now],
         )?;
         tx.commit()?;
         Ok(outcome)
@@ -304,6 +307,7 @@ impl Store {
         scope: &ScopeKey,
         status: Option<&str>,
         limit: usize,
+        dom: &DomainScope,
     ) -> Result<Vec<RepairThreadRow>, StoreError> {
         let limit = limit.clamp(1, RUPTURE_LIST_LIMIT_MAX) as i64;
         let mut stmt = self.conn().prepare(
@@ -311,10 +315,17 @@ impl Store {
                     closed_at, close_reason
              FROM repair_threads
              WHERE tenant_id=?1 AND user_id=?2 AND (?3 IS NULL OR status=?3)
-             ORDER BY last_rupture_at DESC LIMIT ?4",
+               AND domain_id IN (SELECT value FROM json_each(?4))
+             ORDER BY last_rupture_at DESC LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, status, limit],
+            params![
+                scope.tenant_id,
+                scope.user_id,
+                status,
+                dom.read_json(),
+                limit
+            ],
             |r| {
                 Ok(RepairThreadRow {
                     id: r.get(0)?,
@@ -338,17 +349,24 @@ impl Store {
         thread_id: &str,
         reason: &str,
         actor_id: &str,
+        dom: &DomainScope,
     ) -> Result<bool, StoreError> {
         let now = now_rfc3339()?;
         let tx = self.conn_mut().transaction()?;
-        let status: Option<String> = tx
+        // V2-S1：仅写域内线程可关（doc7/04 §3）。
+        let (status, thread_domain): (Option<String>, Option<String>) = tx
             .query_row(
-                "SELECT status FROM repair_threads
+                "SELECT status, domain_id FROM repair_threads
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, thread_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?;
+            .optional()?
+            .map(|(a, b)| (Some(a), Some(b)))
+            .unwrap_or((None, None));
+        if thread_domain.as_deref() != Some(dom.write.as_str()) {
+            return Err(StoreError::ThreadNotFound);
+        }
         match status.as_deref() {
             None => return Err(StoreError::ThreadNotFound),
             Some("closed") => {
@@ -386,6 +404,7 @@ impl Store {
         &self,
         scope: &ScopeKey,
         limit: usize,
+        dom: &DomainScope,
     ) -> Result<Vec<RuptureEventRow>, StoreError> {
         let limit = limit.clamp(1, RUPTURE_LIST_LIMIT_MAX) as i64;
         let mut stmt = self.conn().prepare(
@@ -393,23 +412,27 @@ impl Store {
                     start_byte, end_byte, thread_id, detected_at
              FROM rupture_events
              WHERE tenant_id=?1 AND user_id=?2
-             ORDER BY detected_at DESC, id DESC LIMIT ?3",
+               AND domain_id IN (SELECT value FROM json_each(?3))
+             ORDER BY detected_at DESC, id DESC LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, limit], |r| {
-            Ok(RuptureEventRow {
-                id: r.get(0)?,
-                evidence_id: r.get(1)?,
-                host_id: r.get(2)?,
-                session_id: r.get(3)?,
-                event_seq: r.get(4)?,
-                signal: r.get(5)?,
-                cue: r.get(6)?,
-                start_byte: r.get(7)?,
-                end_byte: r.get(8)?,
-                thread_id: r.get(9)?,
-                detected_at: r.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, dom.read_json(), limit],
+            |r| {
+                Ok(RuptureEventRow {
+                    id: r.get(0)?,
+                    evidence_id: r.get(1)?,
+                    host_id: r.get(2)?,
+                    session_id: r.get(3)?,
+                    event_seq: r.get(4)?,
+                    signal: r.get(5)?,
+                    cue: r.get(6)?,
+                    start_byte: r.get(7)?,
+                    end_byte: r.get(8)?,
+                    thread_id: r.get(9)?,
+                    detected_at: r.get(10)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -419,6 +442,7 @@ impl Store {
     pub fn alignment_synthesis_latest(
         &self,
         scope: &ScopeKey,
+        dom: &DomainScope,
     ) -> Result<Option<AlignmentSynthesisRow>, StoreError> {
         let row = self
             .conn()
@@ -428,8 +452,9 @@ impl Store {
                         generated_at
                  FROM alignment_synthesis
                  WHERE tenant_id=?1 AND user_id=?2
+                   AND domain_id IN (SELECT value FROM json_each(?3))
                  ORDER BY version DESC LIMIT 1",
-                params![scope.tenant_id, scope.user_id],
+                params![scope.tenant_id, scope.user_id, dom.read_json()],
                 |r| {
                     Ok(AlignmentSynthesisRow {
                         version: r.get(0)?,
@@ -455,7 +480,10 @@ impl Store {
     pub fn alignment_synthesis_refresh(
         &mut self,
         scope: &ScopeKey,
+        dom: &DomainScope,
     ) -> Result<AlignmentSynthesisRow, StoreError> {
+        // V2-S1：synthesis 按域独立版本链；指标/线程/事件全部按写域过滤（doc7/04 §1.3）。
+        let domain = &dom.write;
         let now = now_rfc3339()?;
         let tx = self.conn_mut().transaction()?;
         let latest: Option<(i64, String, i64, i64, i64, i64)> = tx
@@ -463,11 +491,12 @@ impl Store {
                 "SELECT version, window_until, rupture_turns, open_repair_threads, user_turns,
                         (SELECT COALESCE(SUM(rupture_turns),0) FROM alignment_synthesis
                           WHERE tenant_id=alignment_synthesis.tenant_id
-                            AND user_id=alignment_synthesis.user_id)
+                            AND user_id=alignment_synthesis.user_id
+                            AND domain_id=alignment_synthesis.domain_id)
                  FROM alignment_synthesis
-                 WHERE tenant_id=?1 AND user_id=?2
+                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3
                  ORDER BY version DESC LIMIT 1",
-                params![scope.tenant_id, scope.user_id],
+                params![scope.tenant_id, scope.user_id, domain],
                 |r| {
                     Ok((
                         r.get(0)?,
@@ -481,14 +510,14 @@ impl Store {
             )
             .optional()?;
         let total_ruptures: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM rupture_events WHERE tenant_id=?1 AND user_id=?2",
-            params![scope.tenant_id, scope.user_id],
+            "SELECT COUNT(*) FROM rupture_events WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3",
+            params![scope.tenant_id, scope.user_id, domain],
             |r| r.get(0),
         )?;
         let open_threads: i64 = tx.query_row(
             "SELECT COUNT(*) FROM repair_threads
-             WHERE tenant_id=?1 AND user_id=?2 AND status='open'",
-            params![scope.tenant_id, scope.user_id],
+             WHERE tenant_id=?1 AND user_id=?2 AND status='open' AND domain_id=?3",
+            params![scope.tenant_id, scope.user_id, domain],
             |r| r.get(0),
         )?;
         let due = match &latest {
@@ -507,8 +536,8 @@ impl Store {
                             correction_free_rate, open_repair_threads, body, source_refs_json,
                             generated_at
                      FROM alignment_synthesis
-                     WHERE tenant_id=?1 AND user_id=?2 AND version=?3",
-                    params![scope.tenant_id, scope.user_id, latest_version],
+                     WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND version=?4",
+                    params![scope.tenant_id, scope.user_id, domain, latest_version],
                     map_synthesis_row,
                 )
                 .optional()?
@@ -521,9 +550,12 @@ impl Store {
             None => {
                 // 首版：从最早 user 事件起算；无任何事件则空窗口 [now, now)。
                 tx.query_row(
-                    "SELECT MIN(received_at) FROM evidence_events
-                     WHERE tenant_id=?1 AND user_id=?2 AND role='user' AND source_kind='user'",
-                    params![scope.tenant_id, scope.user_id],
+                    "SELECT MIN(e.received_at) FROM evidence_events e
+                     LEFT JOIN evidence_domain_map d
+                       ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
+                     WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+                       AND COALESCE(d.domain_id, 'user_main')=?3",
+                    params![scope.tenant_id, scope.user_id, domain],
                     |r| r.get::<_, Option<String>>(0),
                 )?
                 .unwrap_or_else(|| now.clone())
@@ -532,30 +564,34 @@ impl Store {
         let rupture_ids: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM rupture_events
-                 WHERE tenant_id=?1 AND user_id=?2 AND detected_at >= ?3 AND detected_at < ?4
+                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?5
+                   AND detected_at >= ?3 AND detected_at < ?4
                  ORDER BY detected_at ASC, id ASC",
             )?;
             let rows = stmt.query_map(
-                params![scope.tenant_id, scope.user_id, window_since, now],
+                params![scope.tenant_id, scope.user_id, window_since, now, domain],
                 |r| r.get::<_, String>(0),
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let rupture_turns = rupture_ids.len() as i64;
         let user_turns: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM evidence_events
-             WHERE tenant_id=?1 AND user_id=?2 AND role='user' AND source_kind='user'
-               AND received_at >= ?3 AND received_at < ?4",
-            params![scope.tenant_id, scope.user_id, window_since, now],
+            "SELECT COUNT(*) FROM evidence_events e
+             LEFT JOIN evidence_domain_map d
+               ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
+             WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+               AND COALESCE(d.domain_id, 'user_main')=?5
+               AND e.received_at >= ?3 AND e.received_at < ?4",
+            params![scope.tenant_id, scope.user_id, window_since, now, domain],
             |r| r.get(0),
         )?;
         let open_thread_rows: Vec<(String, String, i64, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, title, rupture_count, last_rupture_at FROM repair_threads
-                 WHERE tenant_id=?1 AND user_id=?2 AND status='open'
+                 WHERE tenant_id=?1 AND user_id=?2 AND status='open' AND domain_id=?3
                  ORDER BY last_rupture_at DESC",
             )?;
-            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id], |r| {
+            let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, domain], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -583,13 +619,14 @@ impl Store {
         };
         tx.execute(
             "INSERT INTO alignment_synthesis
-             (tenant_id, user_id, version, window_since, window_until, rupture_turns,
+             (tenant_id, user_id, domain_id, version, window_since, window_until, rupture_turns,
               user_turns, correction_free_rate, open_repair_threads, body, source_refs_json,
               generated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 scope.tenant_id,
                 scope.user_id,
+                domain,
                 version,
                 window_since,
                 now,
@@ -608,8 +645,8 @@ impl Store {
                         correction_free_rate, open_repair_threads, body, source_refs_json,
                         generated_at
                  FROM alignment_synthesis
-                 WHERE tenant_id=?1 AND user_id=?2 AND version=?3",
-                params![scope.tenant_id, scope.user_id, version],
+                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND version=?4",
+                params![scope.tenant_id, scope.user_id, domain, version],
                 map_synthesis_row,
             )
             .expect("just inserted");
@@ -642,15 +679,18 @@ fn assign_thread_tx(
     content: &str,
     detected_at: &str,
     now: &str,
+    domain: &str,
 ) -> Result<(String, bool), StoreError> {
+    // V2-S1：线程按域归组，跨域事件不合线（doc7/04 §1.3）。
     let regroup_since = regroup_since_str(detected_at, REPAIR_THREAD_REGROUP_DAYS)?;
     let existing: Option<String> = tx
         .query_row(
             "SELECT id FROM repair_threads
              WHERE tenant_id=?1 AND user_id=?2 AND status='open'
-               AND last_rupture_at >= ?3
+               AND domain_id=?3
+               AND last_rupture_at >= ?4
              ORDER BY last_rupture_at DESC LIMIT 1",
-            params![scope.tenant_id, scope.user_id, regroup_since],
+            params![scope.tenant_id, scope.user_id, domain, regroup_since],
             |r| r.get(0),
         )
         .optional()?;
@@ -662,9 +702,17 @@ fn assign_thread_tx(
     tx.execute(
         "INSERT INTO repair_threads
          (id, tenant_id, user_id, title, status, rupture_count,
-          first_rupture_at, last_rupture_at, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,'open',1,?5,?5,?6,?6)",
-        params![id, scope.tenant_id, scope.user_id, title, detected_at, now],
+          first_rupture_at, last_rupture_at, created_at, updated_at, domain_id)
+         VALUES (?1,?2,?3,?4,'open',1,?5,?5,?6,?6,?7)",
+        params![
+            id,
+            scope.tenant_id,
+            scope.user_id,
+            title,
+            detected_at,
+            now,
+            domain
+        ],
     )?;
     Ok((id, true))
 }
@@ -697,9 +745,7 @@ fn render_synthesis_body(
 ) -> String {
     let mut s = String::new();
     s.push_str("# 相处指南（alignment synthesis，确定性派生）\n");
-    s.push_str(&format!(
-        "窗口：{window_since} → {window_until}\n"
-    ));
+    s.push_str(&format!("窗口：{window_since} → {window_until}\n"));
     s.push_str(&format!(
         "指标：纠正轮次 {rupture_turns} / 用户轮次 {user_turns}（无纠正率 {correction_free_rate:.2}）；待修复线程 {}。\n",
         open_threads.len()

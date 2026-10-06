@@ -89,6 +89,16 @@ pub enum StoreError {
     InvalidAdjudicationCoverage,
     #[error("修复线程不存在或不属于当前 scope")]
     ThreadNotFound,
+    #[error("记忆域不存在或不属于当前 scope")]
+    DomainNotFound,
+    #[error("记忆域已关闭，不能再作为读/写/绑定目标")]
+    DomainClosed,
+    #[error("user_main 是保留域名，不能创建或关闭")]
+    DomainReserved,
+    #[error("域名不合法（1—64 个 ASCII [A-Za-z0-9_-]，且不能是 user_main）")]
+    InvalidDomainId,
+    #[error("会话已绑定到其他域，拒绝静默改绑")]
+    DomainBindingConflict,
     #[error("时间溢出: {0}")]
     Time(String),
 }
@@ -104,15 +114,16 @@ mod d67_tests;
 mod d68_tests;
 #[cfg(test)]
 mod d69_tests;
-#[cfg(test)]
-mod muse_tests;
 pub mod diagnostics;
+pub mod domains;
 pub mod dream_jobs;
 pub mod dream_read;
 pub mod evidence;
 pub mod jobs;
 pub mod lifecycle;
 pub mod memories;
+#[cfg(test)]
+mod muse_tests;
 pub mod pages;
 #[cfg(test)]
 mod probes;
@@ -120,6 +131,8 @@ pub mod purge;
 pub mod resident;
 pub mod semantic_index;
 pub mod soul;
+#[cfg(test)]
+mod v2_domain_tests;
 
 pub use diagnostics::{CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem};
 pub use evidence::IngestOutcome;
@@ -398,10 +411,32 @@ impl Store {
             });
         }
         let hash = hex::encode(Sha256::digest(token.as_bytes()));
-        self.conn.execute(
+        let now = now_rfc3339()?;
+        // V2-S1（doc7/04 §1.1）：principal 与其 user_main 域注册行必须同事务出现，
+        // 否则新用户的域表里没有主域行。
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO principals (tenant_id, user_id, token_sha256, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",
-            rusqlite::params![tenant_id, user_id, hash, now_rfc3339()?],
+            rusqlite::params![tenant_id, user_id, hash, now],
         )?;
+        // 0001—0014 的历史 schema 快照（迁移演练测试）没有 memory_domains；
+        // 只有 0015 之后才写主域注册行，迁移测试因此仍可在旧版本库上建 principal。
+        let has_domain_table: bool = tx.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='memory_domains'",
+            [],
+            |r| Ok(r.get::<_, i64>(0)? > 0),
+        )?;
+        if has_domain_table {
+            tx.execute(
+                "INSERT INTO memory_domains
+                   (tenant_id, user_id, domain_id, kind, status, policy_version,
+                    created_reason, created_at, updated_at)
+                 VALUES (?1, ?2, 'user_main', 'user_main', 'active', 1, 'principal_create', ?3, ?3)
+                 ON CONFLICT(tenant_id, user_id, domain_id) DO NOTHING",
+                rusqlite::params![tenant_id, user_id, now],
+            )?;
+        }
+        tx.commit()?;
         write_token_file(token_out, token)
     }
 
@@ -853,9 +888,18 @@ mod tests {
                 "user",
                 &t,
                 "以后回答我用中文",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
-        let _ = store3.flush_window(&scope, "dsh", "s1", 1).unwrap();
+        let _ = store3
+            .flush_window(
+                &scope,
+                "dsh",
+                "s1",
+                1,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
         let (pv, av): (String, String) = store3
             .conn()
             .query_row(

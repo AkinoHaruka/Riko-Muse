@@ -616,6 +616,23 @@ struct Config {
     rerank_key_file: Option<PathBuf>,
     /// episode Retrieved 排序的 recency 模式：linear|exponential|none（默认 linear）。
     recency_mode: Option<String>,
+
+    /// V2-S1 记忆域（doc7/04 §2.1）：缺省 false，全部请求解析为 user_main，
+    /// 行为与 schema 14 一致；启用后管理端点才可用、域头才生效。
+    #[serde(default)]
+    domains: DomainsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct DomainsConfig {
+    enabled: bool,
+}
+
+impl Default for DomainsConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -671,6 +688,8 @@ struct AppState {
     semantic_min_similarity: f32,
     /// recency 模式（doc6/04 §3.1：linear|exponential|none，默认 linear）。
     recency_mode: &'static str,
+    /// V2-S1：记忆域总开关（doc7/04 §2.1）。false 时域头与管理端点全部不生效。
+    domains_enabled: bool,
 }
 
 #[tokio::main]
@@ -762,6 +781,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some("exponential") => "exponential",
                     _ => memory_contract::RECENCY_MODE_DEFAULT,
                 },
+                domains_enabled: cfg.domains.enabled,
             };
             // 提取 worker：模型配置齐全才启动；端点不可达时作业可见失败，不影响手工记忆（doc/09）。
             let model_cfg = match (&cfg.model_endpoint, &cfg.model_name, &cfg.model_key_file) {
@@ -821,8 +841,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 user_id: user,
                             };
                             let key = format!("auto-{}", &now[..10.min(now.len())]);
-                            let _ =
-                                store.dream_trigger(&scope, "scheduled", &key, None, None, None);
+                            let _ = store.dream_trigger(
+                                &scope,
+                                "scheduled",
+                                &key,
+                                None,
+                                None,
+                                None,
+                                &memory_domain::DomainScope::user_main(),
+                            );
                         }
                     }
                 });
@@ -905,7 +932,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     for scope in scopes {
                         let scan = match muse_state.store.lock() {
-                            Ok(mut s) => s.rupture_scan(&scope),
+                            Ok(mut s) => {
+                                s.rupture_scan(&scope, &memory_domain::DomainScope::user_main())
+                            }
                             Err(_) => {
                                 eprintln!("[memoryd] Muse 调度器无法取得 Store 锁");
                                 continue;
@@ -928,7 +957,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         let refreshed = match muse_state.store.lock() {
-                            Ok(mut s) => s.alignment_synthesis_refresh(&scope),
+                            Ok(mut s) => s.alignment_synthesis_refresh(
+                                &scope,
+                                &memory_domain::DomainScope::user_main(),
+                            ),
                             Err(_) => {
                                 eprintln!("[memoryd] Muse 调度器无法取得 Store 锁");
                                 continue;
@@ -1004,6 +1036,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     post(close_repair_thread),
                 )
                 .route("/v1/ruptures", get(list_ruptures))
+                // V2-S1（doc7/04 §4）：记忆域自助配置。enabled=false 时全部 403。
+                .route("/v1/domains", get(list_domains).post(create_domain))
+                .route("/v1/domains/close", post(close_domain_endpoint))
+                .route(
+                    "/v1/domains/bindings",
+                    get(list_domain_bindings).post(put_domain_binding),
+                )
+                .route(
+                    "/v1/domains/bindings/{host_id}/{session_id}",
+                    delete(delete_domain_binding),
+                )
+                .route(
+                    "/v1/domains/grants",
+                    get(list_domain_grants).post(create_domain_grant),
+                )
+                .route("/v1/domains/grants/{grant_id}", delete(delete_domain_grant))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     request_pipeline,
@@ -1315,7 +1363,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .verify_user_quote_span(&scope, &origin, &evidence_id, &quote)
                 .map_err(|e| format!("quote 核验失败: {e}"))?;
             let claim_ok = store
-                .get_memory(&scope, &memory_id)
+                .get_memory(
+                    &scope,
+                    &memory_id,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?
                 .map(|m| find_quote_span(&m.claim, &quote).is_some())
                 .unwrap_or(false);
@@ -1334,7 +1386,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 end_byte: end_byte as i64,
             };
             let retired = store
-                .retire_memory(&scope, &memory_id, &req)
+                .retire_memory(
+                    &scope,
+                    &memory_id,
+                    &req,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             println!("retire 完成：memory_id={memory_id} retired={retired}");
             Ok(())
@@ -1374,7 +1431,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 end_byte: end_byte as i64,
             };
             let restored = store
-                .restore_memory(&scope, &memory_id, &req)
+                .restore_memory(
+                    &scope,
+                    &memory_id,
+                    &req,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             println!("restore 完成：memory_id={memory_id} restored={restored}");
             Ok(())
@@ -1393,7 +1455,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 user_id: user,
             };
             let (token, preview) = store
-                .purge_preview(&scope, &memory_id, &idempotency_key)
+                .purge_preview(
+                    &scope,
+                    &memory_id,
+                    &idempotency_key,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             // 明文 token 只输出一次（确认后即弃；库中仅存哈希）。
             println!("preview token（一次性，15 分钟内有效）：{token}");
@@ -1417,7 +1484,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 user_id: user,
             };
             let out = store
-                .purge_confirm(&scope, &token, &idempotency_key)
+                .purge_confirm(
+                    &scope,
+                    &token,
+                    &idempotency_key,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             println!(
                 "purge confirm 完成：job_id={} deleted={}",
@@ -1483,13 +1555,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_id: tenant,
                 user_id: user,
             };
-            let scan = store.rupture_scan(&scope).map_err(|e| e.to_string())?;
+            let scan = store
+                .rupture_scan(&scope, &memory_domain::DomainScope::user_main())
+                .map_err(|e| e.to_string())?;
             println!(
                 "rupture 扫描完成：扫描事件 {} 条、新 rupture {} 条、新线程 {}",
                 scan.scanned_events, scan.inserted_ruptures, scan.opened_threads
             );
             let synthesis = store
-                .alignment_synthesis_refresh(&scope)
+                .alignment_synthesis_refresh(
+                    &scope,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             println!(
                 "synthesis 版本 {}：窗口 {} → {}，纠正 {}/{}，无纠正率 {:.2}，待修复线程 {}",
@@ -1808,7 +1885,11 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             };
             let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             let rows = store
-                .resident_pins_with_status(&scope, &now)
+                .resident_pins_with_status(
+                    &scope,
+                    &now,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             if rows.is_empty() {
                 println!("（无 enabled pin）");
@@ -1840,7 +1921,11 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             };
             let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             let rows = store
-                .resident_pins_with_status(&scope, &now)
+                .resident_pins_with_status(
+                    &scope,
+                    &now,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             let mut md = String::from("# 长期记忆（resident pinned 视图）\n\n");
             md.push_str(&format!(
@@ -1852,7 +1937,11 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             let rows_len = rows.len();
             for r in rows {
                 let claim = store
-                    .get_memory_claim(&scope, &r.memory_id)
+                    .get_memory_claim(
+                        &scope,
+                        &r.memory_id,
+                        /*DOM*/ &memory_domain::DomainScope::user_main(),
+                    )
                     .map_err(|e| e.to_string())?
                     .unwrap_or_else(|| "（正文不可读）".into());
                 let visibility = if r.visible {
@@ -1886,12 +1975,22 @@ fn select_consolidation_inputs(
     query: &str,
 ) -> Result<Vec<(String, i64, String)>, String> {
     let (hits, _) = store
-        .search_memories(scope, query, 20, false)
+        .search_memories(
+            scope,
+            query,
+            20,
+            false,
+            /*DOM*/ &memory_domain::DomainScope::user_main(),
+        )
         .map_err(|e| e.to_string())?;
     let mut inputs: Vec<(String, i64, String)> = Vec::new();
     for hit in hits {
         let (v, s) = store
-            .memory_version_sha(scope, &hit.memory_id)
+            .memory_version_sha(
+                scope,
+                &hit.memory_id,
+                /*DOM*/ &memory_domain::DomainScope::user_main(),
+            )
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("记忆 {} 读取失败", hit.memory_id))?;
         inputs.push((hit.memory_id, v, s));
@@ -2045,7 +2144,12 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
                 Some(s) => s.split(',').map(str::trim).collect(),
             };
             let rows = store
-                .page_list(&scope, &statuses, limit)
+                .page_list(
+                    &scope,
+                    &statuses,
+                    limit,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?;
             if rows.is_empty() {
                 println!("（无页面）");
@@ -2083,7 +2187,12 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
             };
             let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             match store
-                .get_page(&scope, &page_id, &now)
+                .get_page(
+                    &scope,
+                    &page_id,
+                    &now,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                )
                 .map_err(|e| e.to_string())?
             {
                 None => Err(format!(
@@ -2203,6 +2312,7 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
                     &fingerprint,
                     &inputs,
                     &now,
+                    /*DOM*/ &memory_domain::DomainScope::user_main(),
                 )
                 .map_err(|e| e.to_string())?;
             println!(
@@ -2291,8 +2401,739 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
     }
 }
 
+// ---- V2-S1 记忆域管理端点（doc7/04 §4；enabled=false 时全部 403 DOMAIN_DISABLED）----
+
+fn domains_guard(state: &AppState, req_id: &str) -> Option<Response> {
+    if state.domains_enabled {
+        None
+    } else {
+        Some(err(
+            req_id,
+            StatusCode::FORBIDDEN,
+            ErrorCode::DomainDisabled,
+            "记忆域功能未启用（[domains] enabled=false）",
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainCreateRequest {
+    domain_id: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainCloseRequest {
+    domain_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainDto {
+    domain_id: String,
+    kind: String,
+    status: String,
+    policy_version: i64,
+    created_reason: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<memory_store_sqlite::domains::DomainRow> for DomainDto {
+    fn from(r: memory_store_sqlite::domains::DomainRow) -> Self {
+        DomainDto {
+            domain_id: r.domain_id,
+            kind: r.kind,
+            status: r.status,
+            policy_version: r.policy_version,
+            created_reason: r.created_reason,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainsResponse {
+    request_id: String,
+    domains: Vec<DomainDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainWriteResponse {
+    request_id: String,
+    domain: DomainDto,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    created: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    changed: bool,
+}
+
+/// 可信配置者身份（doc7/04 §4：本 scope 自助配置，不由模型提供 tenant/user）。
+fn domain_actor(state: &AppState) -> (&'static str, &'static str) {
+    let _ = state;
+    ("user", "trusted_user")
+}
+
+async fn list_domains(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.domain_list(&scope) {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(DomainsResponse {
+                request_id: req_id.0,
+                domains: rows.into_iter().map(DomainDto::from).collect(),
+            }),
+        )
+            .into_response(),
+        Err(e) => domain_err(&req_id.0, &e),
+    }
+}
+
+async fn create_domain(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<DomainCreateRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let (row, created) = match guard.domain_create_side(&scope, &body.domain_id, &body.reason) {
+        Ok(v) => v,
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    let (actor_kind, actor_id) = domain_actor(&state);
+    let _ = guard.domain_audit(
+        &scope,
+        actor_kind,
+        actor_id,
+        &row.domain_id.clone(),
+        serde_json::json!({"op": "create", "domain_id": row.domain_id, "created": created, "actor": actor_id}),
+    );
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(DomainWriteResponse {
+            request_id: req_id.0,
+            domain: DomainDto::from(row),
+            created,
+            changed: created,
+        }),
+    )
+        .into_response()
+}
+
+async fn close_domain_endpoint(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<DomainCloseRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let changed = match guard.domain_close(&scope, &body.domain_id) {
+        Ok(v) => v,
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    let row = match guard.domain_get(&scope, &body.domain_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err(
+                &req_id.0,
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "记忆域不存在",
+            )
+        }
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    let (actor_kind, actor_id) = domain_actor(&state);
+    let _ = guard.domain_audit(
+        &scope,
+        actor_kind,
+        actor_id,
+        &body.domain_id,
+        serde_json::json!({"op": "close", "domain_id": body.domain_id, "changed": changed, "actor": actor_id}),
+    );
+    (
+        StatusCode::OK,
+        Json(DomainWriteResponse {
+            request_id: req_id.0,
+            domain: DomainDto::from(row),
+            created: false,
+            changed,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainBindingRequest {
+    host_id: String,
+    session_id: String,
+    domain_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainBindingDto {
+    host_id: String,
+    session_id: String,
+    domain_id: String,
+    registered_by: String,
+    created_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainBindingsResponse {
+    request_id: String,
+    bindings: Vec<DomainBindingDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainMutationResponse {
+    request_id: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    created: bool,
+}
+
+async fn list_domain_bindings(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.domain_binding_list(&scope) {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(DomainBindingsResponse {
+                request_id: req_id.0,
+                bindings: rows
+                    .into_iter()
+                    .map(|r| DomainBindingDto {
+                        host_id: r.host_id,
+                        session_id: r.session_id,
+                        domain_id: r.domain_id,
+                        registered_by: r.registered_by,
+                        created_at: r.created_at,
+                    })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(e) => domain_err(&req_id.0, &e),
+    }
+}
+
+async fn put_domain_binding(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<DomainBindingRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let (actor_kind, actor_id) = domain_actor(&state);
+    let created = match guard.domain_binding_put(
+        &scope,
+        &body.host_id,
+        &body.session_id,
+        &body.domain_id,
+        actor_id,
+    ) {
+        Ok(v) => v,
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    let _ = guard.domain_audit(
+        &scope,
+        actor_kind,
+        actor_id,
+        &body.session_id,
+        serde_json::json!({
+            "op": "bind", "host_id": body.host_id, "session_id": body.session_id,
+            "domain_id": body.domain_id, "created": created, "actor": actor_id
+        }),
+    );
+    (
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(DomainMutationResponse {
+            request_id: req_id.0,
+            status: "ok",
+            created,
+        }),
+    )
+        .into_response()
+}
+
+async fn delete_domain_binding(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath((host_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let deleted = match guard.domain_binding_delete(&scope, &host_id, &session_id) {
+        Ok(v) => v,
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    if !deleted {
+        return err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "会话绑定不存在",
+        );
+    }
+    let (actor_kind, actor_id) = domain_actor(&state);
+    let _ = guard.domain_audit(
+        &scope,
+        actor_kind,
+        actor_id,
+        &session_id,
+        serde_json::json!({"op": "unbind", "host_id": host_id, "session_id": session_id, "actor": actor_id}),
+    );
+    (
+        StatusCode::OK,
+        Json(DomainMutationResponse {
+            request_id: req_id.0,
+            status: "ok",
+            created: false,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainGrantRequest {
+    reader_domain: String,
+    granted_domain: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainGrantDto {
+    id: String,
+    reader_domain: String,
+    granted_domain: String,
+    granted_by: String,
+    reason: String,
+    created_at: String,
+    revoked_at: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DomainGrantsResponse {
+    request_id: String,
+    grants: Vec<DomainGrantDto>,
+}
+
+async fn list_domain_grants(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.domain_grant_list(&scope) {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(DomainGrantsResponse {
+                request_id: req_id.0,
+                grants: rows
+                    .into_iter()
+                    .map(|g| DomainGrantDto {
+                        id: g.id,
+                        reader_domain: g.reader_domain,
+                        granted_domain: g.granted_domain,
+                        granted_by: g.granted_by,
+                        reason: g.reason,
+                        created_at: g.created_at,
+                        revoked_at: g.revoked_at,
+                    })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(e) => domain_err(&req_id.0, &e),
+    }
+}
+
+async fn create_domain_grant(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<DomainGrantRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let (actor_kind, actor_id) = domain_actor(&state);
+    let (row, created) = match guard.domain_grant_add(
+        &scope,
+        &body.reader_domain,
+        &body.granted_domain,
+        actor_id,
+        &body.reason,
+    ) {
+        Ok(v) => v,
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    let _ = guard.domain_audit(
+        &scope,
+        actor_kind,
+        actor_id,
+        &row.id.clone(),
+        serde_json::json!({
+            "op": "grant", "id": row.id, "reader_domain": row.reader_domain,
+            "granted_domain": row.granted_domain, "created": created, "actor": actor_id
+        }),
+    );
+    (
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(serde_json::json!({
+            "request_id": req_id.0,
+            "created": created,
+            "grant": {
+                "id": row.id, "reader_domain": row.reader_domain,
+                "granted_domain": row.granted_domain, "granted_by": row.granted_by,
+                "reason": row.reason, "created_at": row.created_at
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn delete_domain_grant(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(grant_id): AxumPath<String>,
+) -> Response {
+    if let Some(resp) = domains_guard(&state, &req_id.0) {
+        return resp;
+    }
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let revoked = match guard.domain_grant_revoke(&scope, &grant_id) {
+        Ok(v) => v,
+        Err(e) => return domain_err(&req_id.0, &e),
+    };
+    if !revoked {
+        return err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "生效中的授权不存在",
+        );
+    }
+    let (actor_kind, actor_id) = domain_actor(&state);
+    let _ = guard.domain_audit(
+        &scope,
+        actor_kind,
+        actor_id,
+        &grant_id,
+        serde_json::json!({"op": "revoke", "id": grant_id, "actor": actor_id}),
+    );
+    (
+        StatusCode::OK,
+        Json(DomainMutationResponse {
+            request_id: req_id.0,
+            status: "ok",
+            created: false,
+        }),
+    )
+        .into_response()
+}
+
 fn err(req_id: &str, status: StatusCode, code: ErrorCode, msg: &str) -> Response {
     (status, Json(ErrorResponse::new(req_id, code, msg))).into_response()
+}
+
+// ---- V2-S1 记忆域请求上下文（doc7/04 §2）----
+
+/// 请求级域上下文：域功能关闭时恒为 user_main，行为与 schema 14 一致。
+/// 读域选择器来自请求头 `X-Riko-Memory-Domain`（缺省 user_main）；
+/// 写域**不**取自请求头或正文，而是由服务端从可信会话绑定解析（§2.2）。
+#[derive(Clone, Debug)]
+struct DomainCtx {
+    enabled: bool,
+    selected: String,
+}
+
+impl DomainCtx {
+    fn main_only() -> Self {
+        DomainCtx {
+            enabled: false,
+            selected: memory_domain::USER_MAIN_DOMAIN.to_string(),
+        }
+    }
+}
+
+/// 域相关 StoreError → HTTP 语义（doc7/04 §2.3：非法/未知 404、closed 409）。
+fn domain_err(req_id: &str, e: &memory_store_sqlite::StoreError) -> Response {
+    use memory_store_sqlite::StoreError as E;
+    match e {
+        E::DomainNotFound => err(
+            req_id,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "记忆域不存在",
+        ),
+        E::DomainClosed => err(
+            req_id,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "记忆域已关闭",
+        ),
+        E::DomainBindingConflict => err(
+            req_id,
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "会话已绑定到其他域",
+        ),
+        E::InvalidDomainId | E::DomainReserved => err(
+            req_id,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "域名不合法",
+        ),
+        _ => err(
+            req_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "域操作失败",
+        ),
+    }
+}
+
+/// 解析本次请求的 DomainScope。
+///
+/// - `enabled=false`：恒 `user_main`（与 14 版本一致，不写 evidence_domain_map）。
+/// - `origin` 给出时写域来自可信会话绑定；否则写域 = 读域选择器。
+/// - 读域集 = {D} ∪（D 为 side 时 user_main）∪ 已授权域 ∪ {写域}（§2.3、§3）。
+fn domain_scope_for(
+    state: &AppState,
+    scope: &ScopeKey,
+    ctx: &DomainCtx,
+    req_id: &str,
+    origin: Option<&Origin>,
+) -> Result<memory_domain::DomainScope, Response> {
+    if !ctx.enabled {
+        return Ok(memory_domain::DomainScope::user_main());
+    }
+    if !ctx.selected.is_empty() && !ctx.selected.eq(memory_domain::USER_MAIN_DOMAIN) {
+        // 选择器只表达「想读哪个域」，权限由 Rust 计算（§2.3）。
+        memory_store_sqlite::domains::validate_domain_id(&ctx.selected)
+            .map_err(|e| domain_err(req_id, &e))?;
+    }
+    let store = state.store.lock().map_err(|_| {
+        err(
+            req_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "存储不可用",
+        )
+    })?;
+    let write = match origin {
+        Some(o) => store
+            .resolve_write_domain(scope, &o.host_id, &o.session_id)
+            .map_err(|e| domain_err(req_id, &e))?,
+        None => ctx.selected.clone(),
+    };
+    let selected_row = store
+        .domain_require_active(scope, &ctx.selected)
+        .map_err(|e| domain_err(req_id, &e))?;
+    let grants = store
+        .domain_grants_for(scope, &ctx.selected)
+        .map_err(|e| domain_err(req_id, &e))?;
+    Ok(memory_domain::DomainScope::resolve(
+        &ctx.selected,
+        selected_row.kind == "side",
+        &grants,
+        &write,
+    ))
+}
+
+/// 取请求的域上下文；解析失败直接返回响应。
+macro_rules! dom_or_return {
+    ($state:expr, $scope:expr, $ctx:expr, $req_id:expr, $origin:expr) => {
+        match domain_scope_for($state, $scope, $ctx, $req_id, $origin) {
+            Ok(d) => d,
+            Err(resp) => return resp,
+        }
+    };
 }
 
 /// 请求管线：生成/校验 request ID；除 health/version 外执行 Bearer 认证（doc/12 §1）。
@@ -2357,7 +3198,48 @@ async fn request_pipeline(State(state): State<AppState>, mut req: Request, next:
             );
         }
     };
-    req.extensions_mut().insert(scope);
+    req.extensions_mut().insert(scope.clone());
+
+    // V2-S1（doc7/04 §2.3）：读域选择器只表达「想读哪个域」，权限由 Rust 计算。
+    // 域功能关闭时不读请求头，行为与 schema 14 一致。
+    let dom_ctx = if state.domains_enabled {
+        let rid = req
+            .extensions()
+            .get::<RequestId>()
+            .map(|r| r.0.clone())
+            .unwrap_or_default();
+        let selected = req
+            .headers()
+            .get("x-riko-memory-domain")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(memory_domain::USER_MAIN_DOMAIN)
+            .to_string();
+        if selected != memory_domain::USER_MAIN_DOMAIN {
+            if let Err(e) = memory_store_sqlite::domains::validate_domain_id(&selected) {
+                return domain_err(&rid, &e);
+            }
+        }
+        // 非法/未知 → 404，已关闭 → 409；拒绝在进入业务前就发生。
+        match state
+            .store
+            .lock()
+            .map_err(|_| memory_store_sqlite::StoreError::StateConflict)
+            .and_then(|store| store.domain_require_active(&scope, &selected))
+        {
+            Ok(_) => {}
+            Err(e) => return domain_err(&rid, &e),
+        }
+        DomainCtx {
+            enabled: true,
+            selected,
+        }
+    } else {
+        DomainCtx::main_only()
+    };
+    req.extensions_mut().insert(dom_ctx);
+
     next.run(req).await
 }
 
@@ -2413,6 +3295,7 @@ async fn ingest_events(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<IngestRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
@@ -2494,6 +3377,7 @@ async fn ingest_events(
     }
 
     let outcome = {
+        let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, Some(&origin));
         let mut guard = state.store.lock().unwrap();
         guard.record_evidence(
             &scope,
@@ -2503,6 +3387,7 @@ async fn ingest_events(
             &body.source_kind,
             &occurred_at,
             &body.content,
+            &dom,
         )
     };
     match outcome {
@@ -2554,6 +3439,7 @@ async fn remember_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<RememberRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
@@ -2610,8 +3496,16 @@ async fn remember_memory(
         );
     }
     let outcome = {
+        let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, Some(&origin));
         let mut guard = state.store.lock().unwrap();
-        guard.remember(&scope, &origin, &body.user_evidence_id, &body.quote, kind)
+        guard.remember(
+            &scope,
+            &origin,
+            &body.user_evidence_id,
+            &body.quote,
+            kind,
+            &dom,
+        )
     };
     match outcome {
         Ok(RememberOutcome::Created { memory_id, version }) => {
@@ -2685,9 +3579,15 @@ async fn get_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(memory_id): AxumPath<String>,
 ) -> Response {
-    let row = state.store.lock().unwrap().get_memory(&scope, &memory_id);
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let row = state
+        .store
+        .lock()
+        .unwrap()
+        .get_memory(&scope, &memory_id, /*DOM*/ &dom);
     match row {
         Ok(Some(m)) => {
             let refs: Vec<serde_json::Value> = m
@@ -2740,8 +3640,10 @@ async fn search_memories(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<SearchRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(body) = match body {
         Ok(b) => b,
         Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
@@ -2788,12 +3690,13 @@ async fn search_memories(
             "include_history=true 要求 query 含明确历史词（以前/过去/曾经/当时 等）",
         );
     }
-    let result =
-        state
-            .store
-            .lock()
-            .unwrap()
-            .search_memories(&scope, &body.query, limit, include_history);
+    let result = state.store.lock().unwrap().search_memories(
+        &scope,
+        &body.query,
+        limit,
+        include_history,
+        /*DOM*/ &dom,
+    );
     match result {
         Ok((hits, degraded)) => {
             let items: Vec<serde_json::Value> = hits
@@ -2845,8 +3748,10 @@ async fn compose_context(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<ComposeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(body) = match body {
         Ok(b) => b,
         Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
@@ -2890,6 +3795,7 @@ async fn compose_context(
         &body.query,
         max_items,
         max_chars,
+        /*DOM*/ &dom,
     );
     match result {
         Ok(ComposeResult {
@@ -2910,7 +3816,7 @@ async fn compose_context(
             if body.include_alignment {
                 let synthesis = {
                     let guard = state.store.lock().unwrap();
-                    guard.alignment_synthesis_latest(&scope)
+                    guard.alignment_synthesis_latest(&scope, &dom)
                 };
                 match synthesis {
                     Ok(Some(row)) => {
@@ -2968,9 +3874,11 @@ async fn get_alignment_synthesis(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let guard = state.store.lock().unwrap();
-    match guard.alignment_synthesis_latest(&scope) {
+    match guard.alignment_synthesis_latest(&scope, &dom) {
         Ok(Some(row)) => Json(serde_json::json!({
             "request_id": req_id.0,
             "synthesis": alignment_json(&row),
@@ -2994,9 +3902,11 @@ async fn refresh_alignment_synthesis(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let mut guard = state.store.lock().unwrap();
-    match guard.alignment_synthesis_refresh(&scope) {
+    match guard.alignment_synthesis_refresh(&scope, &dom) {
         Ok(row) => Json(serde_json::json!({
             "request_id": req_id.0,
             "synthesis": alignment_json(&row),
@@ -3011,7 +3921,9 @@ async fn refresh_alignment_synthesis(
     }
 }
 
-fn alignment_json(row: &memory_store_sqlite::alignment::AlignmentSynthesisRow) -> serde_json::Value {
+fn alignment_json(
+    row: &memory_store_sqlite::alignment::AlignmentSynthesisRow,
+) -> serde_json::Value {
     serde_json::json!({
         "version": row.version,
         "window_since": row.window_since,
@@ -3037,8 +3949,10 @@ async fn list_repair_threads(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     axum::extract::Query(query): axum::extract::Query<RepairThreadsListQuery>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     if let Some(s) = query.status.as_deref() {
         if !matches!(s, "open" | "closed") {
             return err(
@@ -3051,7 +3965,7 @@ async fn list_repair_threads(
     }
     let limit = query.limit.unwrap_or(50);
     let guard = state.store.lock().unwrap();
-    match guard.repair_threads_list(&scope, query.status.as_deref(), limit) {
+    match guard.repair_threads_list(&scope, query.status.as_deref(), limit, &dom) {
         Ok(rows) => Json(serde_json::json!({
             "request_id": req_id.0,
             "threads": rows.iter().map(|r| serde_json::json!({
@@ -3085,9 +3999,11 @@ async fn close_repair_thread(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     axum::extract::Path(thread_id): axum::extract::Path<String>,
     body: Result<Json<RepairThreadCloseRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(body) = match body {
         Ok(b) => b,
         Err(_) => {
@@ -3108,7 +4024,7 @@ async fn close_repair_thread(
         );
     }
     let mut guard = state.store.lock().unwrap();
-    match guard.repair_thread_close(&scope, &thread_id, &body.reason, "api") {
+    match guard.repair_thread_close(&scope, &thread_id, &body.reason, "api", &dom) {
         Ok(changed) => Json(serde_json::json!({
             "request_id": req_id.0,
             "changed": changed,
@@ -3138,11 +4054,13 @@ async fn list_ruptures(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     axum::extract::Query(query): axum::extract::Query<RupturesListQuery>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let limit = query.limit.unwrap_or(50);
     let guard = state.store.lock().unwrap();
-    match guard.ruptures_list(&scope, limit) {
+    match guard.ruptures_list(&scope, limit, &dom) {
         Ok(rows) => Json(serde_json::json!({
             "request_id": req_id.0,
             "ruptures": rows.iter().map(|r| serde_json::json!({
@@ -3183,6 +4101,7 @@ async fn flush_window(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<FlushRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
@@ -3213,12 +4132,24 @@ async fn flush_window(
         );
     }
     let outcome = {
+        let dom = dom_or_return!(
+            &state,
+            &scope,
+            &dom_ctx,
+            &req_id.0,
+            Some(&Origin {
+                host_id: body.host_id.clone(),
+                agent_id: String::new(),
+                session_id: body.session_id.clone()
+            })
+        );
         let mut guard = state.store.lock().unwrap();
         guard.flush_window(
             &scope,
             &body.host_id,
             &body.session_id,
             body.through_event_seq,
+            &dom,
         )
     };
     match outcome {
@@ -4038,8 +4969,10 @@ async fn get_resident(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     axum::extract::Query(query): axum::extract::Query<ResidentQuery>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let limit = match budget_check(
         &req_id.0,
         "limit",
@@ -4062,7 +4995,7 @@ async fn get_resident(
         }
     };
     let guard = state.store.lock().unwrap();
-    match guard.select_resident(&scope, &now, limit, RESIDENT_MAX_CHARS_MAX) {
+    match guard.select_resident(&scope, &now, limit, RESIDENT_MAX_CHARS_MAX, &dom) {
         Ok(sel) => {
             let needs_review: Vec<&String> = sel.needs_review.iter().collect();
             Json(serde_json::json!({
@@ -4143,8 +5076,10 @@ async fn post_context_bundle(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<BundleRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(req) = match body {
         Ok(b) => b,
         Err(axum::extract::rejection::JsonRejection::JsonSyntaxError(_)) => {
@@ -4227,7 +5162,7 @@ async fn post_context_bundle(
     // resident 段（查询无关，每轮重算；doc6/03 §3）。
     let selection = {
         let guard = state.store.lock().unwrap();
-        guard.select_resident(&scope, &now, r_items, r_chars)
+        guard.select_resident(&scope, &now, r_items, r_chars, &dom)
     };
     let selection = match selection {
         Ok(s) => s,
@@ -4274,7 +5209,7 @@ async fn post_context_bundle(
         // ---- 通道 1：词法记忆（FTS+grams 内部融合，单一词法通道排名）。----
         let search_res = {
             let guard = state.store.lock().unwrap();
-            guard.search_memories(&scope, query_trim, lane_k, false)
+            guard.search_memories(&scope, query_trim, lane_k, false, &dom)
         };
         let (mem_lex, index_degraded) = match search_res {
             Ok(v) => v,
@@ -4296,7 +5231,7 @@ async fn post_context_bundle(
         let page_lex: Vec<String> = {
             let guard = state.store.lock().unwrap();
             guard
-                .page_fts_search(&scope, query_trim, lane_k)
+                .page_fts_search(&scope, query_trim, lane_k, &dom)
                 .unwrap_or_default()
         };
         page_index_status = "ok";
@@ -4317,6 +5252,7 @@ async fn post_context_bundle(
                         qv,
                         lane_k,
                         state.semantic_min_similarity,
+                        &dom,
                     );
                     let scan_p = guard.semantic_scan_with_floor(
                         &scope,
@@ -4325,6 +5261,7 @@ async fn post_context_bundle(
                         qv,
                         lane_k,
                         state.semantic_min_similarity,
+                        &dom,
                     );
                     match (scan_m, scan_p) {
                         (Ok((mh, mc)), Ok((ph, pc))) => {
@@ -4366,7 +5303,7 @@ async fn post_context_bundle(
         {
             let guard = state.store.lock().unwrap();
             for mid in &mem_ids {
-                if let Ok(Some(m)) = guard.get_memory(&scope, mid) {
+                if let Ok(Some(m)) = guard.get_memory(&scope, mid, &dom) {
                     mem_info.insert(mid.clone(), m);
                 }
             }
@@ -4376,7 +5313,7 @@ async fn post_context_bundle(
         {
             let guard = state.store.lock().unwrap();
             for pid in &page_ids {
-                if let Ok(Some(p)) = guard.get_page(&scope, pid, &now) {
+                if let Ok(Some(p)) = guard.get_page(&scope, pid, &now, &dom) {
                     page_info.insert(pid.clone(), p);
                 }
             }
@@ -4677,8 +5614,10 @@ async fn list_pages(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     axum::extract::Query(query): axum::extract::Query<PagesListQuery>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let limit = query.limit.unwrap_or(20);
     if !(1..=100).contains(&limit) {
         return err(
@@ -4703,7 +5642,7 @@ async fn list_pages(
         }
     }
     let guard = state.store.lock().unwrap();
-    match guard.page_list(&scope, &statuses, limit) {
+    match guard.page_list(&scope, &statuses, limit, &dom) {
         Ok(rows) => Json(serde_json::json!({
             "request_id": req_id.0,
             "pages": rows.iter().map(page_json).collect::<Vec<_>>(),
@@ -4722,8 +5661,10 @@ async fn get_page(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(page_id): AxumPath<String>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let now = match memory_store_sqlite::now_rfc3339_pub() {
         Ok(t) => t,
         Err(e) => {
@@ -4736,7 +5677,7 @@ async fn get_page(
         }
     };
     let guard = state.store.lock().unwrap();
-    match guard.get_page(&scope, &page_id, &now) {
+    match guard.get_page(&scope, &page_id, &now, &dom) {
         Ok(Some(p)) => Json(serde_json::json!({
             "request_id": req_id.0,
             "page": page_json(&p),
@@ -4914,6 +5855,7 @@ async fn post_dream_trigger(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<DreamTriggerRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
@@ -4945,6 +5887,17 @@ async fn post_dream_trigger(
     }
     // 只入队不等待完成（doc6/10 §4：触发器只负责入队）。
     let result = {
+        let dom = dom_or_return!(
+            &state,
+            &scope,
+            &dom_ctx,
+            &req_id.0,
+            Some(&Origin {
+                host_id: req.host_id.clone().unwrap_or_default(),
+                agent_id: req.agent_id.clone().unwrap_or_default(),
+                session_id: req.session_id.clone().unwrap_or_default()
+            })
+        );
         let mut guard = state.store.lock().unwrap();
         guard.dream_trigger(
             &scope,
@@ -4953,6 +5906,7 @@ async fn post_dream_trigger(
             req.agent_id.as_deref(),
             req.host_id.as_deref(),
             req.session_id.as_deref(),
+            &dom,
         )
     };
     match result {
@@ -5078,8 +6032,10 @@ async fn dream_runner_claim(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     body: Result<Json<DreamRunnerClaimRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(req) = match body {
         Ok(b) => b,
         Err(_) => {
@@ -5281,7 +6237,7 @@ async fn dream_runner_claim(
         };
         let targets = {
             let guard = state.store.lock().unwrap();
-            recalls.iter().filter_map(|r| guard.get_memory(&scope, &r.target_memory_id).ok().flatten().map(|m| serde_json::json!({
+            recalls.iter().filter_map(|r| guard.get_memory(&scope, &r.target_memory_id, &dom).ok().flatten().map(|m| serde_json::json!({
                 "candidate_id": r.candidate_id, "target_memory_id": r.target_memory_id,
                 "kind": m.kind, "claim": m.claim, "version": m.version,
             }))).collect::<Vec<_>>()
@@ -5324,7 +6280,7 @@ async fn dream_runner_claim(
             };
             let mut sources = Vec::with_capacity(inputs.len());
             for (id, version, sha) in inputs {
-                match guard.get_memory(&scope, &id) {
+                match guard.get_memory(&scope, &id, &dom) {
                     Ok(Some(m))
                         if m.status == "active"
                             && m.version == version
@@ -6015,9 +6971,11 @@ async fn dream_runner_publish_page(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(job_id): AxumPath<String>,
     body: Result<Json<DreamPagePublishRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(req) = match body {
         Ok(b) => b,
         Err(_) => {
@@ -6117,7 +7075,7 @@ async fn dream_runner_publish_page(
     };
     let mut sources = Vec::with_capacity(inputs.len());
     for (id, version, sha) in inputs {
-        match guard.get_memory(&scope, &id) {
+        match guard.get_memory(&scope, &id, &dom) {
             Ok(Some(memory))
                 if memory.status == "active"
                     && memory.version == version
@@ -6190,6 +7148,7 @@ async fn dream_runner_publish_page(
                 &req.dream_job_id,
                 req.dream_generation,
                 &job.document_key,
+                &dom,
             )
             .unwrap_or(false);
         if !compared {
@@ -6208,9 +7167,9 @@ async fn dream_runner_publish_page(
                 "consolidate_v2 必须先完成语义搜索；若已有有效同 key 页面，还必须读取其冻结版本",
             );
         }
-        guard.publish_page_with_description_idempotent(&request, description)
+        guard.publish_page_with_description_idempotent(&request, description, &dom)
     } else {
-        guard.publish_page_idempotent(&request)
+        guard.publish_page_idempotent(&request, &dom)
     };
     let (page_id, page_version) = match publish_result {
         Ok(v) => v,
@@ -6518,9 +7477,11 @@ async fn dream_scoped_read(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(job_id): AxumPath<String>,
     body: Result<Json<DreamScopedReadRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
     let Json(req) = match body {
         Ok(body) => body,
         Err(_) => {
@@ -6659,7 +7620,7 @@ async fn dream_scoped_read(
                 .store
                 .lock()
                 .unwrap()
-                .search_memories(&scope, &query, 20, false)
+                .search_memories(&scope, &query, 20, false, &dom)
             {
                 Ok(result) => result,
                 Err(e) => return dream_read_error(&req_id.0, e),
@@ -6677,6 +7638,7 @@ async fn dream_scoped_read(
                             vector,
                             20,
                             state.semantic_min_similarity,
+                            &dom,
                         );
                         match scan {
                             Ok((hits, ready)) if ready < memory_contract::SEMANTIC_SCAN_LIMIT => {
@@ -6694,13 +7656,13 @@ async fn dream_scoped_read(
             {
                 let guard = state.store.lock().unwrap();
                 for hit in &lexical {
-                    if let Ok(Some(memory)) = guard.get_memory(&scope, &hit.memory_id) {
+                    if let Ok(Some(memory)) = guard.get_memory(&scope, &hit.memory_id, &dom) {
                         info.insert(hit.memory_id.clone(), memory);
                     }
                 }
                 for id in &semantic_ids {
                     if !info.contains_key(id) {
-                        if let Ok(Some(memory)) = guard.get_memory(&scope, id) {
+                        if let Ok(Some(memory)) = guard.get_memory(&scope, id, &dom) {
                             info.insert(id.clone(), memory);
                         }
                     }
@@ -6790,7 +7752,7 @@ async fn dream_scoped_read(
                 .store
                 .lock()
                 .unwrap()
-                .page_fts_search(&scope, &query, 20)
+                .page_fts_search(&scope, &query, 20, &dom)
             {
                 Ok(v) => v,
                 Err(e) => return dream_read_error(&req_id.0, e),
@@ -6807,6 +7769,7 @@ async fn dream_scoped_read(
                             &vectors[0],
                             20,
                             state.semantic_min_similarity,
+                            &dom,
                         ) {
                             Ok((hits, ready)) if ready < memory_contract::SEMANTIC_SCAN_LIMIT => {
                                 semantic_ids = hits.into_iter().map(|(id, _)| id).collect();
@@ -6825,7 +7788,8 @@ async fn dream_scoped_read(
             ids_order.dedup();
             let mut pages = std::collections::HashMap::new();
             for id in &ids_order {
-                if let Ok(Some(page)) = state.store.lock().unwrap().get_page(&scope, id, &now) {
+                if let Ok(Some(page)) = state.store.lock().unwrap().get_page(&scope, id, &now, &dom)
+                {
                     pages.insert(id.clone(), page);
                 }
             }
@@ -6888,7 +7852,7 @@ async fn dream_scoped_read(
             }
             let guard = state.store.lock().unwrap();
             match guard.dream_memory_snapshot_valid(&scope,&req.runner_id,&job_id,req.dream_generation,&ids[0]) {
-                Ok(true)=>match guard.get_memory(&scope,&ids[0]){Ok(Some(m))=>Json(serde_json::json!({"request_id":req_id.0,"memory":{"memory_id":m.memory_id,"version":m.version,"kind":m.kind,"claim":m.claim,"evidence_refs":m.evidence_refs}})).into_response(),Ok(None)=>dream_read_error(&req_id.0,StoreError::StaleInput),Err(e)=>dream_read_error(&req_id.0,e)},
+                Ok(true)=>match guard.get_memory(&scope, &ids[0], &dom){Ok(Some(m))=>Json(serde_json::json!({"request_id":req_id.0,"memory":{"memory_id":m.memory_id,"version":m.version,"kind":m.kind,"claim":m.claim,"evidence_refs":m.evidence_refs}})).into_response(),Ok(None)=>dream_read_error(&req_id.0,StoreError::StaleInput),Err(e)=>dream_read_error(&req_id.0,e)},
                 Ok(false)=>dream_read_error(&req_id.0,StoreError::MemoryNotFound),Err(e)=>dream_read_error(&req_id.0,e),
             }
         }
@@ -7197,6 +8161,7 @@ async fn correct_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(memory_id): AxumPath<String>,
     body: Result<Json<CorrectRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -7230,6 +8195,7 @@ async fn correct_memory(
             )
         }
     };
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, Some(&origin));
     let req = memory_store_sqlite::CorrectRequest {
         expected_version: body.expected_version,
         origin,
@@ -7241,7 +8207,7 @@ async fn correct_memory(
         .store
         .lock()
         .unwrap()
-        .correct_memory(&scope, &memory_id, &req)
+        .correct_memory(&scope, &memory_id, &req, &dom)
     {
         Ok(out) => {
             // D6-8：新记忆入队向量索引（旧记忆向量已在 correct 事务内置 stale）。
@@ -7298,6 +8264,7 @@ async fn forget_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(memory_id): AxumPath<String>,
     body: Result<Json<ForgetRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -7331,6 +8298,7 @@ async fn forget_memory(
             )
         }
     };
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, Some(&origin));
     let req = memory_store_sqlite::ForgetRequest {
         expected_version: body.expected_version,
         origin,
@@ -7341,7 +8309,7 @@ async fn forget_memory(
         .store
         .lock()
         .unwrap()
-        .forget_memory(&scope, &memory_id, &req)
+        .forget_memory(&scope, &memory_id, &req, &dom)
     {
         Ok(out) => Json(serde_json::json!({
             "request_id": req_id.0,
@@ -7390,6 +8358,7 @@ async fn retire_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(memory_id): AxumPath<String>,
     body: Result<Json<RetireRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -7423,6 +8392,7 @@ async fn retire_memory(
             )
         }
     };
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, Some(&origin));
     let req = memory_store_sqlite::lifecycle::RetireRequest {
         expected_version: body.expected_version,
         actor_kind: "user",
@@ -7438,7 +8408,7 @@ async fn retire_memory(
         .store
         .lock()
         .unwrap()
-        .retire_memory(&scope, &memory_id, &req)
+        .retire_memory(&scope, &memory_id, &req, &dom)
     {
         Ok(true) => Json(serde_json::json!({
             "request_id": req_id.0,
@@ -7502,6 +8472,7 @@ async fn restore_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
     Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
     AxumPath(memory_id): AxumPath<String>,
     body: Result<Json<RestoreRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -7535,6 +8506,7 @@ async fn restore_memory(
             )
         }
     };
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, Some(&origin));
     let req = memory_store_sqlite::lifecycle::RestoreRequest {
         expected_version: body.expected_version,
         actor_kind: "user",
@@ -7549,7 +8521,7 @@ async fn restore_memory(
         .store
         .lock()
         .unwrap()
-        .restore_memory(&scope, &memory_id, &req)
+        .restore_memory(&scope, &memory_id, &req, &dom)
     {
         Ok(true) => Json(serde_json::json!({
             "request_id": req_id.0,
@@ -7620,6 +8592,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn version() -> impl IntoResponse {
+    // /v1/version 在 request_pipeline 里早于认证返回，没有 DomainCtx 扩展；
+    // 该端点不读取记忆，不参与域解析（doc7/04 §2.3）。
     Json(VersionResponse {
         protocol_version: PROTOCOL_VERSION,
         schema_version: SCHEMA_VERSION,
@@ -7779,6 +8753,7 @@ enabled = false
                 "user",
                 &occurred_at,
                 "仅用于本地测试的手动整理事件",
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap();
         store
@@ -7789,6 +8764,7 @@ enabled = false
                 Some("test-agent"),
                 Some("test-host"),
                 Some("test-session"),
+                &memory_domain::DomainScope::user_main(),
             )
             .unwrap()
             .unwrap();
@@ -7817,11 +8793,13 @@ enabled = false
             rerank: None,
             semantic_min_similarity: super::DEFAULT_SEMANTIC_MIN_SIMILARITY,
             recency_mode: "linear",
+            domains_enabled: false,
         };
         let response = dream_runner_claim(
             State(state.clone()),
             Extension(scope.clone()),
             Extension(RequestId("test-request".into())),
+            Extension(DomainCtx::main_only()),
             Ok(Json(DreamRunnerClaimRequest {
                 runner_id: "test-runner".into(),
             })),
