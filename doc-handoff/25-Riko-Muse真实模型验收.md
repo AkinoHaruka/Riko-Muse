@@ -1,0 +1,91 @@
+# 25 · Riko-Muse 真实模型验收（第一轮观察）
+
+> 日期：2026-10-06 · 分支 `Riko-Muse`（HEAD a282e76）· 执行：ZCode（Aki 在场）
+> 方法依 doc7/02 §下一步顺序第 1 条：真实模型验收。密钥来源 `模型.txt`（SiliconFlow
+> Qwen3.5-4B）；密钥只写仓库外临时 key 文件，验收结束已删除，本文档无任何凭据。
+> 语料：3 段自然中文对话（25 轮，user 17 / assistant 8），**先写对话、后标注**，
+> 不围绕 cue 字面量设计；语料是合成的，质量数字是观察样本，不是质量验收结论。
+
+## 1. 环境
+
+- 临时库（`%TEMP%/muse-real/muse-real.db`，schema 14，验收后已删除）；memoryd serve 端口 8796。
+- 提取 worker：`https://api.siliconflow.cn/v1/chat/completions` + `Qwen/Qwen3.5-4B`，
+  `model_extra_json = { enable_thinking = false }`，`model_max_tokens = 1024`。
+- 首轮 `model_timeout_secs` 用默认 30s → s2/s3 三次尝试全部 `MODEL_TIMEOUT` 转 dead
+  （L0 保留，符合设计）；提至 90s 后经 `/v1/jobs/{id}/retry` 重试成功。
+
+## 2. 写入管线（真实模型，9 次调用）
+
+| 作业 | 尝试 | 结果 |
+|---|---|---|
+| s1 | 1（30s 超时档） | succeeded |
+| s2 | 3 次 timeout → dead → 90s 档重试 1 次 | succeeded（共 4 次调用） |
+| s3 | 2 次 timeout → 90s 档重试 2 次 | succeeded（共 4 次调用） |
+
+**结果：22 条候选，全部 `held`，0 rejected，0 active。** held 原因分布：
+`UNCLEAR_SUBJECT ×8`、`NOT_EXPLICIT ×8`、`THIRD_PARTY ×4`、`MULTI_CLAIM ×1`、`TEMPORAL ×1`。
+kind 分布：fact 11 / preference 5 / instruction 3 / episode 3。
+
+具体例子（节选，均 held）：
+
+- `[fact|MULTI_CLAIM]` "我上周五说的是周三发工资，不对，我说错了，是这周三"——模型照抄整句
+  触发单命题门。
+- `[fact|THIRD_PARTY]` "老王不能吃海鲜，他对虾过敏"——第三人信息被准入拦下（本语料中
+  唯一"应该被拦"的条目，判定正确）。
+- `[preference|NOT_EXPLICIT]` "我一般左侧分批，跌 10% 买一点，越跌越买"——真实偏好但模型
+  claim 未改写为显式陈述，被 `NOT_EXPLICIT` 持有。
+
+**结论（如实）**：与 doc-handoff/19 的历史观察一致——Qwen3.5-4B 在 extract_v3 下的 claim
+写法偏"照抄原话"，未经显式主语/显式陈述改写，导致本语料 0 条进入 active。保护面
+（默认不信任、第三人拦截、时效拦截）按预期工作；**写入的"质量半区"（模型改写能力）
+是当前真空**，与 Muse 增量无关，属既有内核验收缺口。观察期继续收集样本，不预设方案。
+
+## 3. rupture 规则（同语料，先标注后扫描）
+
+17 条 user 轮次，人工标注 4 条真纠正（对 Agent 的纠正/边界）：s1#7"别这样跟我推抄底话术"、
+s2#4"你又来劝我早点睡了"、s2#7"上次你说汇报在周四，害我白请了半天假"、s3#4"不是这样的，
+我妈能吃微辣"。
+
+| | 标注为纠正（4） | 标注为非纠正（13） |
+|---|---|---|
+| 规则命中（4） | **TP 3**（s1#7、s2#4、s3#4） | **FP 1**：s1#4"不对，我说错了"——**自我纠正**，非对 Agent，规则无法区分 |
+| 规则未命中（13） | **FN 1**：s2#7 抱怨 Agent 过去错误，无 cue 字面量 | 12 正确沉默 |
+
+precision 3/4，recall 3/4。两个错误方向各有一个具体例子，方向与 Muse 文档 8.3-4 预判一致：
+误报由人工关线兜底，漏报需 V2（扩充 cue 或语境规则）。
+
+线程归组：4 条全落在同一个 7 天窗口线程（设计如此：v1 归组是时间桶不是话题桶），
+**线程 title 取首个 rupture 事件——恰好是那条误报**，作为已知局限记录（doc7/01 §1.3）。
+
+## 4. synthesis / compose / 关线（端到端）
+
+- synthesis v1（调度器自动生成）：纠正 4 / 用户 17，无纠正率 0.76，待修复线程 1——
+  指标在真实语料上计算正确；刷新幂等（无新触发条件不出版本）。
+- `POST /v1/context/compose` + `include_alignment: true`：响应含 `alignment` 对象，
+  text 前置 `<alignment_synthesis version="1">` 块；memory items 为空（无 active 记忆，
+  search 0 命中，`index_degraded=true`）——两路注入互不干扰。
+- `POST /v1/repair/threads/{id}/close`（reason=验收演练）：`changed=true`，synthesis 因
+  open 线程数变化生成 v2（open=0）。关线动作落 `audit_events`（`repair_thread_close`）。
+
+## 5. 未决事项：回环瞬时 404（第三轮出现，根因未定）
+
+验收收尾时 `POST /v1/alignment/synthesis` 一次 404（空响应体；同进程内其它 POST 均正常）。
+至此共三轮偶发（两次冒烟、一次本验收），均发生在 POST；受控复测 20/20（含同连接连发与
+新建连接连发）全部 200，**无法按需复现**。`netstat` 显示 8796 LISTENING 归属 PID 0，
+本机沙箱网络层嫌疑最大（见 doc-handoff/24 §4 首次记录）。处置：不判为应用缺陷；
+生产部署若复现，先抓响应头 `date`/`server` 与端口归属对比再定位。
+
+## 6. 模型调用与清理
+
+- 真实模型调用：9 次 attempts（SiliconFlow Qwen3.5-4B；含 5 次 timeout 失败调用）。
+  Gemini / OpenRouter 本轮未调用。
+- 验收后已停止 serve；临时 key 文件与令牌文件已删除；临时库与语料文件已删除。
+- 本文档不含凭据；语料引文为合成对话片段。
+
+## 7. 给下一轮的输入
+
+1. 写入质量真空在"模型改写"半区：观察期收集 0-active 现象的更多样本后再议
+   （改 extract prompt 需新建版本，冻结纪律见 AGENTS.md §5）。
+2. rupture V2 的两个候选方向已有具体例子锚定：自我纠正排除（FP 例）、
+   "上次你说…"式无字面量抱怨（FN 例）。仍按纪律等更多样本再动清单。
+3. DSH adapter 接线（下一步第 2 条）开工前先做 seam 现场核对。
