@@ -150,6 +150,28 @@ export class MemoryClient {
    * V2-P1 精读（doc7/05 §4）：id 可以是裸 memory_id，也可以是服务端生成的
    * riko:// 稳定引用。history=true 只在用户明确询问旧值/旧版本时使用。
    */
+  /** V2-R1（doc7/07 §5）：关系索引。 */
+  relationshipsIndex(limit?: number): Promise<ApiResult> {
+    const q = limit === undefined ? "" : "?limit=" + limit;
+    return this.get("/v1/relationships" + q, this.cfg.writeTimeoutMs);
+  }
+
+  /** V2-R1：按名称/别名解析实体；歧义时服务端返回候选列表而不是猜。 */
+  resolveRelationship(query: string): Promise<ApiResult> {
+    return this.get("/v1/relationships/resolve?q=" + encodeURIComponent(query), this.cfg.writeTimeoutMs);
+  }
+
+  /** V2-R1：按 entity_id 读详情（可带 expected_version 做并发校验）。 */
+  relationshipDetail(entityId: string, expectedVersion?: number): Promise<ApiResult> {
+    const q = expectedVersion === undefined ? "" : "?expected_version=" + expectedVersion;
+    return this.get("/v1/relationships/" + encodeURIComponent(entityId) + q, this.cfg.writeTimeoutMs);
+  }
+
+  /** V2-D1（doc7/06 §5）：四分面投影；缺省返回四段。 */
+  facets(kind?: string): Promise<ApiResult> {
+    const q = kind ? "?kind=" + encodeURIComponent(kind) : "";
+    return this.get("/v1/facets" + q, this.cfg.writeTimeoutMs);
+  }
   explainMemory(memoryId: string, history: boolean): Promise<ApiResult> {
     const q = history ? "?history=1" : "";
     return this.get(`/v1/memories/${encodeURIComponent(memoryId)}/explain${q}`, this.cfg.writeTimeoutMs);

@@ -23,7 +23,11 @@ import { isSubagentSessionHeader, type Logger } from "./events.js";
 declare module "@deepseek-ai/dsh-llm" {
   interface MessageSourceMap {
     /** 记忆上下文注入：producer 自有 kind（v4 格式要求），事件线拒绝其为用户证据。 */
-    "agent-memory": { kind: "agent-memory"; form: "recall" | "resident" | "retrieved" };
+    "agent-memory": {
+      kind: "agent-memory";
+      // V2-H1（doc7/09 §3）：bundle 分段后每段有自己的 form，便于事件线区分来源。
+      form: "recall" | "resident" | "retrieved" | "compact" | "alignment" | "relationships";
+    };
   }
 }
 
@@ -59,6 +63,49 @@ export function latestOriginalUserText(messages: readonly UserMessage[]): string
   return "";
 }
 
+/** V2-H1：bundle 分段形状（服务端 doc7/09 §2 契约）。 */
+export type BundleSegmentForm = "compact" | "alignment" | "relationships" | "retrieved";
+export const SEGMENT_FORMS: readonly BundleSegmentForm[] = [
+  "compact",
+  "alignment",
+  "relationships",
+  "retrieved",
+];
+
+export interface BundleSegment {
+  segment?: string;
+  domain_id?: string;
+  version?: number;
+  char_count?: number;
+  text?: string;
+  body?: string;
+  items?: Array<Record<string, unknown>>;
+}
+
+/**
+ * 把一段渲染成注入正文。服务端已做好预算与去重，这里只负责**保真呈现**：
+ * 逐字正文与稳定引用原样带出，不做摘要、不重排来源。
+ */
+export function segmentText(seg: BundleSegment): string {
+  if (typeof seg.text === "string" && seg.text.trim().length > 0) return seg.text;
+  if (typeof seg.body === "string" && seg.body.trim().length > 0) return seg.body;
+  const items = Array.isArray(seg.items) ? seg.items : [];
+  const lines: string[] = [];
+  for (const item of items) {
+    const refs = Array.isArray(item.stable_refs)
+      ? item.stable_refs.filter((x): x is string => typeof x === "string")
+      : [];
+    const detailRef = typeof item.detail_ref === "string" ? item.detail_ref : "";
+    const suffix = refs.length > 0 ? " <" + refs.join(" ") + ">" : detailRef ? " <" + detailRef + ">" : "";
+    if (typeof item.body === "string") {
+      lines.push("- " + item.body + suffix);
+    } else if (typeof item.display_name === "string") {
+      const relation = typeof item.relation === "string" ? "（" + item.relation + "）" : "";
+      lines.push("- " + item.display_name + relation + suffix);
+    }
+  }
+  return lines.join("\n");
+}
 function alreadyInjected(decision: PreStepDecision): boolean {
   if (decision.kind !== "enter") return false;
   return decision.messages.some((m) => m.source?.kind === PLUGIN_KIND);
@@ -205,23 +252,48 @@ export function makeBundleHook(
         logger.warn(`bundle 跳过注入 status=${r.status} request_id=${r.requestId ?? "?"}`);
         return decision;
       }
-      const body = (r.body ?? {}) as { resident?: { text?: string }; retrieved?: { text?: string } };
+      const body = (r.body ?? {}) as {
+        resident?: { text?: string };
+        retrieved?: { text?: string };
+        segments?: BundleSegment[];
+      };
       const messages: UserMessage[] = [];
-      if (body.resident?.text) {
-        messages.push(
-          createUserMessage({
-            content: [{ type: "text", text: wrapData("resident", body.resident.text) }],
-            source: { kind: PLUGIN_KIND, form: "resident" },
-          }),
-        );
-      }
-      if (body.retrieved?.text) {
-        messages.push(
-          createUserMessage({
-            content: [{ type: "text", text: wrapData("retrieved", body.retrieved.text) }],
-            source: { kind: PLUGIN_KIND, form: "retrieved" },
-          }),
-        );
+      // V2-H1（doc7/09 §3）：服务端给了 segments 就按序逐段注入，每段一条独立消息；
+      // 没有 segments（旧服务端）回退到 resident/retrieved 两段，行为与 D6 完全一致。
+      // 预算与去重由服务端负责（唯一真相），这里不再二次裁剪。
+      const segments = Array.isArray(body.segments)
+        ? body.segments.filter((seg) => seg && typeof seg.segment === "string")
+        : undefined;
+      if (segments && segments.length > 0) {
+        for (const seg of segments) {
+          const form = seg.segment as BundleSegmentForm;
+          if (!SEGMENT_FORMS.includes(form)) continue;
+          const text = segmentText(seg);
+          if (!text) continue; // 空段不加占位
+          messages.push(
+            createUserMessage({
+              content: [{ type: "text", text: wrapData(form, text) }],
+              source: { kind: PLUGIN_KIND, form },
+            }),
+          );
+        }
+      } else {
+        if (body.resident?.text) {
+          messages.push(
+            createUserMessage({
+              content: [{ type: "text", text: wrapData("resident", body.resident.text) }],
+              source: { kind: PLUGIN_KIND, form: "resident" },
+            }),
+          );
+        }
+        if (body.retrieved?.text) {
+          messages.push(
+            createUserMessage({
+              content: [{ type: "text", text: wrapData("retrieved", body.retrieved.text) }],
+              source: { kind: PLUGIN_KIND, form: "retrieved" },
+            }),
+          );
+        }
       }
       if (messages.length === 0) return decision; // 空结果不加占位（doc6/11 §5）
       // 前插：记忆上下文在原始用户正文之前（doc6/11 §2）；原消息对象不改写。

@@ -6334,6 +6334,12 @@ async fn get_resident_suggestions(
     }
 }
 
+/// V2-H1（doc7/09 §2）：bundle 统一预算与各分段上限（服务端常量，非模型自报）。
+const BUNDLE_TOTAL_CHARS: usize = 4000;
+const BUNDLE_COMPACT_CHARS: usize = 1200;
+const BUNDLE_ALIGNMENT_CHARS: usize = 600;
+const BUNDLE_RELATIONSHIP_ITEMS: usize = 8;
+
 async fn post_context_bundle(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,
@@ -6460,12 +6466,123 @@ async fn post_context_bundle(
     for i in &selection.items {
         source_versions.insert(i.memory_id.clone(), serde_json::json!(i.version));
     }
+    // ---- V2-H1（doc7/09 §2）：bundle 分段。compact/alignment/relationships 在检索之前
+    // 先算好，这样 retrieved 的 covered 集能天然排除 compact 已覆盖的原子来源（真去重）。
+    let mut used_total_chars: usize = 0usize;
+    // retrieved 在 covered 集里就已经排除了 compact 覆盖的来源，条目级计数会漏报，
+    // 因此在候选道合并处统计真实去重数（doc7/09 §2 规则 2）。
+    let mut retrieved_deduped_against_compact: usize = 0usize;
+    let mut compact_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut compact_seg_items: Vec<serde_json::Value> = Vec::new();
+    let mut compact_seg_chars = 0usize;
+    let mut compact_seg_omitted = 0usize;
+    let mut compact_seg_version = 0i64;
+    let mut compact_seg_complete = true;
+    {
+        let guard = state.store.lock().unwrap();
+        if let Ok(view) = guard.compact_view(&scope, &dom) {
+            compact_seg_version = view.batch_version;
+            for item in &view.items {
+                let refs: Vec<String> = item
+                    .sources
+                    .iter()
+                    .map(|(mid, v, _)| {
+                        memory_domain::refs::memory_stable_ref(
+                            &scope.tenant_id,
+                            &scope.user_id,
+                            &dom.write,
+                            mid,
+                            *v,
+                        )
+                    })
+                    .collect();
+                let cost = item.body.chars().count();
+                if compact_seg_chars + cost > BUNDLE_COMPACT_CHARS
+                    || used_total_chars + compact_seg_chars + cost > BUNDLE_TOTAL_CHARS
+                {
+                    compact_seg_omitted += 1;
+                    compact_seg_complete = false;
+                    continue;
+                }
+                compact_seg_chars += cost;
+                for (mid, _, _) in &item.sources {
+                    compact_ids.insert(mid.clone());
+                }
+                compact_seg_items.push(serde_json::json!({
+                    "body": item.body,
+                    "observed_or_inferred": item.observed_or_inferred,
+                    "stable_refs": refs,
+                }));
+            }
+            used_total_chars += compact_seg_chars;
+        }
+    }
+    let mut alignment_seg: Option<serde_json::Value> = None;
+    {
+        let guard = state.store.lock().unwrap();
+        if let Ok(Some(row)) = guard.alignment_synthesis_latest(&scope, &dom) {
+            let body: String = row.body.chars().take(BUNDLE_ALIGNMENT_CHARS).collect();
+            let body_chars = body.chars().count();
+            let complete = body_chars == row.body.chars().count();
+            if used_total_chars + body_chars <= BUNDLE_TOTAL_CHARS {
+                used_total_chars += body_chars;
+                alignment_seg = Some(serde_json::json!({
+                    "segment": "alignment",
+                    "domain_id": dom.write,
+                    "version": row.version,
+                    "char_count": body_chars,
+                    "complete": complete,
+                    "body": body,
+                }));
+            }
+        }
+    }
+    let mut relationships_seg_items: Vec<serde_json::Value> = Vec::new();
+    let mut relationships_seg_chars = 0usize;
+    let mut relationships_seg_omitted = 0usize;
+    let mut relationships_seg_total = 0usize;
+    let mut relationships_seg_batch = 0i64;
+    {
+        let guard = state.store.lock().unwrap();
+        if let Ok(index) = guard.relationship_index(&scope, &dom, BUNDLE_RELATIONSHIP_ITEMS) {
+            relationships_seg_total = index.total;
+            relationships_seg_batch = index.batch_version;
+            relationships_seg_omitted = index.omitted;
+            for e in &index.entities {
+                let cost = e.display_name.chars().count().saturating_add(
+                    e.relation
+                        .as_deref()
+                        .map(|r| r.chars().count())
+                        .unwrap_or(0),
+                );
+                if used_total_chars + relationships_seg_chars + cost > BUNDLE_TOTAL_CHARS {
+                    relationships_seg_omitted += 1;
+                    continue;
+                }
+                relationships_seg_chars += cost;
+                relationships_seg_items.push(serde_json::json!({
+                    "entity_id": e.entity_id,
+                    "entity_kind": e.entity_kind,
+                    "display_name": e.display_name,
+                    "relation": e.relation,
+                    "aliases": e.aliases,
+                    "version": e.version,
+                    "rank_source": e.rank_source,
+                    "detail_ref": e.detail_ref,
+                }));
+            }
+            used_total_chars += relationships_seg_chars;
+        }
+    }
+
     if !query_trim.is_empty() {
         let resident_ids: std::collections::HashSet<String> = selection
             .items
             .iter()
             .map(|i| i.memory_id.clone())
             .chain(selection.conflict_ids.iter().cloned())
+            // V2-H1：compact 已覆盖的原子来源不再进 retrieved（真去重）。
+            .chain(compact_ids.iter().cloned())
             .collect();
         let lane_k = q_items.max(memory_contract::ADJUDICATE_RECALL_TOP_K);
         // ---- 通道 1：词法记忆（FTS+grams 内部融合，单一词法通道排名）。----
@@ -6555,6 +6672,10 @@ async fn post_context_bundle(
         let mut mem_ids: Vec<String> = mem_lex.iter().map(|h| h.memory_id.clone()).collect();
         mem_ids.extend(mem_vec.iter().cloned());
         mem_ids.dedup();
+        retrieved_deduped_against_compact = mem_ids
+            .iter()
+            .filter(|id| compact_ids.contains(*id))
+            .count();
         let mut page_ids: Vec<String> = page_lex.clone();
         page_ids.extend(page_vec.iter().cloned());
         page_ids.dedup();
@@ -6811,6 +6932,46 @@ async fn post_context_bundle(
             }
         }
     }
+    // ---- V2-H1（doc7/09 §2）：分段数组与统一预算。空段仍然出现，调用方不必猜键。
+    let retrieved_seg_chars = retrieved_text.chars().count();
+    let deduped_against_compact = retrieved_deduped_against_compact;
+    let segments = serde_json::json!([
+        {
+            "segment": "compact",
+            "domain_id": dom.write,
+            "version": compact_seg_version,
+            "char_count": compact_seg_chars,
+            "complete": compact_seg_complete,
+            "omitted": compact_seg_omitted,
+            "items": compact_seg_items,
+        },
+        alignment_seg.unwrap_or_else(|| serde_json::json!({
+            "segment": "alignment",
+            "domain_id": dom.write,
+            "version": 0,
+            "char_count": 0,
+            "complete": true,
+        })),
+        {
+            "segment": "relationships",
+            "domain_id": dom.write,
+            "batch_version": relationships_seg_batch,
+            "total": relationships_seg_total,
+            "char_count": relationships_seg_chars,
+            "complete": relationships_seg_omitted == 0,
+            "omitted": relationships_seg_omitted,
+            "items": relationships_seg_items,
+        },
+        {
+            "segment": "retrieved",
+            "domain_id": dom.write,
+            "char_count": retrieved_seg_chars,
+            "complete": !retrieved_truncated,
+            "omitted": retrieved_omitted.len(),
+            "deduped": deduped_against_compact,
+            "text": retrieved_text,
+        },
+    ]);
     Json(serde_json::json!({
         "request_id": req_id.0,
         "agent_id": req.agent_id,
@@ -6821,6 +6982,8 @@ async fn post_context_bundle(
             "omitted": retrieved_omitted,
             "truncated": retrieved_truncated,
         },
+        "budget": { "total_chars": BUNDLE_TOTAL_CHARS, "used_chars": used_total_chars + retrieved_seg_chars },
+        "segments": segments,
         "lexical_status": lexical_status,
         "semantic_status": semantic_status,
         "rerank_status": rerank_status,

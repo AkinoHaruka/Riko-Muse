@@ -206,6 +206,54 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
       },
     }),
     defineTool({
+      name: "memory_relationships",
+      description:
+        "涉及具体人物或群组的事实、推荐、计划时调用。action=index 先看有预算的索引；action=resolve 用名字/昵称/角色称呼解析实体（歧义时返回候选，不要猜）；action=get 按 entity_id 读详情。详情里每条都带来源引用；回答前先读当前页。",
+      parameters: {
+        action: { type: "string", required: true, description: "index | resolve | get" },
+        query: { type: "string", description: "action=resolve 时的名称/昵称/角色称呼" },
+        entity_id: { type: "string", description: "action=get 时的 entity_id（来自 index/resolve，不要自造）" },
+        expected_version: { type: "number", description: "action=get 时可选；与当前版本不符会返回 409" },
+        limit: { type: "number", description: "action=index 时的条数上限" },
+      },
+      output: { schema: RESULT_SCHEMA, render: renderResult },
+      async execute(args: {
+        action: string;
+        query?: string;
+        entity_id?: string;
+        expected_version?: number;
+        limit?: number;
+      }) {
+        if (args.action === "index") {
+          return toToolResult(await svc.client.relationshipsIndex(args.limit));
+        }
+        if (args.action === "resolve") {
+          if (!args.query) {
+            return { ok: false, error: { code: "INVALID_FIELD", message: "action=resolve 需要 query" } };
+          }
+          return toToolResult(await svc.client.resolveRelationship(args.query));
+        }
+        if (args.action === "get") {
+          if (!args.entity_id) {
+            return { ok: false, error: { code: "INVALID_FIELD", message: "action=get 需要 entity_id" } };
+          }
+          return toToolResult(await svc.client.relationshipDetail(args.entity_id, args.expected_version));
+        }
+        return { ok: false, error: { code: "INVALID_FIELD", message: "action 必须是 index|resolve|get" } };
+      },
+    }),
+    defineTool({
+      name: "memory_facets",
+      description:
+        "需要按经历/观点/反思/处境四个分面查看已保存内容时调用（按需读取，不常驻）。缺省返回四段；每段只含当前有效来源，来源一改即不再返回。",
+      parameters: {
+        kind: { type: "string", description: "experience | opinions | reflections | world；缺省返回四段" },
+      },
+      output: { schema: RESULT_SCHEMA, render: renderResult },
+      async execute(args: { kind?: string }) {
+        return toToolResult(await svc.client.facets(args.kind));
+      },
+    }),    defineTool({
       name: "memory_remember",
       description: "持久保存本轮用户内容时调用。quote 必须是最近原始用户消息中的连续原文，kind 按原话选择；只有返回 ok=true 才能说已保存。",
       parameters: {

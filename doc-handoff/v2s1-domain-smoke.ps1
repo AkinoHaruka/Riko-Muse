@@ -155,6 +155,20 @@ $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 Write-Output ("D1_COMPACT_MAIN_AFTER_GRANT=" + $r.status + " item_count=" + (($r.body | ConvertFrom-Json).item_count))
 
+# V2-H1：bundle 分段（doc7/09 §2）
+$r = Call 'POST' "$b/v1/context/bundle" @{ agent_id='a'; query='昆明' } 'side_a'
+$seg = $r.body | ConvertFrom-Json
+$order = ($seg.segments | ForEach-Object { $_.segment }) -join ','
+$compactSeg = $seg.segments | Where-Object { $_.segment -eq 'compact' }
+$relSeg = $seg.segments | Where-Object { $_.segment -eq 'relationships' }
+$retSeg = $seg.segments | Where-Object { $_.segment -eq 'retrieved' }
+Write-Output ("H1_BUNDLE=" + $r.status + " segments=" + $order)
+Write-Output ("H1_BUDGET=" + $seg.budget.total_chars + " used=" + $seg.budget.used_chars + " within=" + ($seg.budget.used_chars -le $seg.budget.total_chars))
+Write-Output ("H1_COMPACT=" + $compactSeg.char_count + " complete=" + $compactSeg.complete + " items=" + $compactSeg.items.Count)
+Write-Output ("H1_RELATIONSHIPS=" + $relSeg.char_count + " complete=" + $relSeg.complete + " total=" + $relSeg.total)
+Write-Output ("H1_RETRIEVED=" + $retSeg.char_count + " deduped=" + $retSeg.deduped)
+Write-Output ("H1_LEGACY_KEYS=" + [bool]($seg.resident) + "/" + [bool]($seg.retrieved))
+
 # V2-B1/A1：后台闭环（doc7/08 §5）。本段不触发任何模型调用。
 $r = Call 'GET' "$b/v1/tasks/due" $null 'side_a'
 $due1 = $r.body | ConvertFrom-Json
