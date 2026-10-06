@@ -186,6 +186,26 @@ export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {
       },
     }),
     defineTool({
+      name: "memory_explain",
+      description:
+        "用户问「你从哪知道的 / 之前那条是什么 / 依据是什么」时调用。返回逐字证据（span 精确的原文引文）、说话角色、版本与取代关系、保存原因码与稳定引用。只读当前 scope 与读域集；forgotten/已删除内容不会返回。",
+      parameters: {
+        id: {
+          type: "string",
+          required: true,
+          description: "memory_id（来自 memory_search/memory_get）或服务端返回的 riko:// 稳定引用；不要自造",
+        },
+        history: {
+          type: "boolean",
+          description: "仅当用户明确询问已被纠正/替代的旧版本时设为 true；缺省只读当前有效版本",
+        },
+      },
+      output: { schema: RESULT_SCHEMA, render: renderResult },
+      async execute(args: { id: string; history?: boolean }) {
+        return toToolResult(await svc.client.explainMemory(args.id, args.history ?? false));
+      },
+    }),
+    defineTool({
       name: "memory_remember",
       description: "持久保存本轮用户内容时调用。quote 必须是最近原始用户消息中的连续原文，kind 按原话选择；只有返回 ok=true 才能说已保存。",
       parameters: {

@@ -478,10 +478,23 @@ impl Store {
         let row = self
             .conn()
             .query_row(
-                "SELECT kind, claim, status, version, occurred_at, valid_until, origin_agent_id, updated_at
-                 FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3
-                   AND domain_id IN (SELECT value FROM json_each(?4))",
-                params![scope.tenant_id, scope.user_id, memory_id, dom.read_json()],
+                // V2-P1（doc7/05 §1）：普通读同样是统一可见性判定——不再只靠 M1 调度器
+                // 把行改成 expired 之后才不可见。
+                &format!(
+                    "SELECT m.kind, m.claim, m.status, m.version, m.occurred_at, m.valid_until,
+                            m.origin_agent_id, m.updated_at
+                     FROM memories m
+                     WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3
+                       AND ({})",
+                    crate::explain::visible_memory_sql(false)
+                ),
+                params![
+                    scope.tenant_id,
+                    scope.user_id,
+                    memory_id,
+                    now_rfc3339()?,
+                    dom.read_json()
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -756,17 +769,16 @@ impl Store {
             let row = self
                 .conn()
                 .query_row(
+                    // V2-P1（doc7/05 §1）：可见性只有一个谓词，检索各道合并后统一过闸，
+                    // 同时覆盖 valid_until、retired 与「至少一条有效来源」。
                     &format!(
-                        "SELECT kind, claim, status, version FROM memories
-                         WHERE tenant_id=? AND user_id=? AND id=? AND {status_clause}
-                           AND domain_id IN (SELECT value FROM json_each(?))
-                           AND (valid_until IS NULL OR valid_until > ?)
-                           AND NOT EXISTS (SELECT 1 FROM memory_retirements r
-                                           WHERE r.tenant_id=memories.tenant_id AND r.user_id=memories.user_id
-                                             AND r.memory_id=memories.id)
-                         ORDER BY updated_at DESC"
+                        "SELECT m.kind, m.claim, m.status, m.version FROM memories m
+                         WHERE m.tenant_id=? AND m.user_id=? AND m.id=?
+                           AND ({})
+                         ORDER BY m.updated_at DESC",
+                        crate::explain::visible_memory_sql(include_history)
                     ),
-                    params![scope.tenant_id, scope.user_id, id, dom.read_json(), now],
+                    params![scope.tenant_id, scope.user_id, id, now, dom.read_json()],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,

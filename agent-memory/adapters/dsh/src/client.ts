@@ -146,6 +146,15 @@ export class MemoryClient {
     return this.get(`/v1/memories/${encodeURIComponent(memoryId)}`, this.cfg.writeTimeoutMs);
   }
 
+  /**
+   * V2-P1 精读（doc7/05 §4）：id 可以是裸 memory_id，也可以是服务端生成的
+   * riko:// 稳定引用。history=true 只在用户明确询问旧值/旧版本时使用。
+   */
+  explainMemory(memoryId: string, history: boolean): Promise<ApiResult> {
+    const q = history ? "?history=1" : "";
+    return this.get(`/v1/memories/${encodeURIComponent(memoryId)}/explain${q}`, this.cfg.writeTimeoutMs);
+  }
+
   remember(request: Record<string, unknown>): Promise<ApiResult> {
     return this.post("/v1/memories/remember", request, this.cfg.writeTimeoutMs);
   }

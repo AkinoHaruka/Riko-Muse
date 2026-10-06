@@ -44,6 +44,7 @@
 | 01-数据模型与规则.md | 迁移 0014 全部 DDL、rupture 规则、线程归组、synthesis 派生、purge 闭包扩展 |
 | 02-施工任务卡.md | M1/M2/M3 逐卡验收标准与验证档位 |
 | 04-V2-S1-记忆域施工规范.md | V2-S1 迁移 0015、域解析/授权矩阵、存储层契约与验收（其余 V2 卡施工时先补规范） |
+| 05-V2-P1-精读与explain施工规范.md | V2-P1 统一可见性谓词、`memory_explain` 读模型、`riko://` 稳定引用与验收（不新增迁移） |
 
 ## V2 卡登记（2026-10-06，依据 Muse-V2迭代开发文档 00/06）
 
@@ -54,7 +55,7 @@
 |---|---|---|
 | V2-00 | 基线核对、证据纠偏、doc7 依赖规范先行 | 本文件 + 04 号规范 |
 | V2-S1 | 记忆域与 side-chat 隔离（迁移 0015） | **内核与 HTTP 层已实施**：168 项 workspace 测试全绿、临时库 HTTP 冒烟通过，见 [交接 26](../doc-handoff/26-V2-S1记忆域交付记录.md)。未接线：Dream 作业域（`dream_worker.rs` 13 处 `/*DOM:dream-job-domain-pending*/`）、CLI 子命令（17 处 `/*DOM*/`）。真实 DSH 闭环与真实模型未验证 |
-| V2-P1 | quote/speaker 多证据读取、explain、stable_ref | 待施工（V2 文档 04） |
+| V2-P1 | quote/speaker 多证据读取、explain、stable_ref | **已实施**（规范 05）：统一可见性谓词、`memory_explain`、`riko://` 稳定引用、`GET /v1/memories/{id}/explain`、适配器 `memory_explain` 工具；181 项 Rust 测试 + 19 项适配器测试全绿，临时库 HTTP 冒烟通过。见 [交接 27](../doc-handoff/27-V2-P1精读与explain交付记录.md) |
 | V2-R1 | people/groups 索引、别名解析、详情延迟读取、关系维护任务 | 待施工（V2 文档 01） |
 | V2-D1 | 四分面蒸馏、compact_memory、只读 Markdown 投影 | 待施工（V2 文档 03） |
 | V2-B1/A1 | upkeep/Relationships/nightly 复盘/quiet pass + 复盘→修复行动 | 待施工（V2 文档 08） |

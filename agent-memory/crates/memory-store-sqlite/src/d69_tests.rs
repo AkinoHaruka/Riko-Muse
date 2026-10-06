@@ -1188,13 +1188,18 @@ fn purge_two_phase_closure_and_tombstones() {
         )
         .unwrap();
     assert_eq!(preview.evidence_ids.len(), 1);
-    assert!(
-        store
-            .get_memory(&scope, &mid, &memory_domain::DomainScope::user_main())
-            .unwrap()
-            .is_some(),
-        "preview 只读业务记忆"
-    );
+    // V2-P1（doc7/05 §1）：读接口统一按「至少一条未被 forget 抑制的来源」判可见，
+    // 本用例为 C09 依赖专门插了 suppressed_sources 行，get_memory 因此不可见是**预期**。
+    // 本用例真正要证的是「preview 只读、业务行仍在」，所以改查规范行本身。
+    let still_active: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'",
+            rusqlite::params![scope.tenant_id, scope.user_id, mid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(still_active, 1, "preview 只读业务记忆：行仍在且 active");
     let conf_target: String = store
         .conn()
         .query_row(
@@ -1507,15 +1512,18 @@ fn retention_removes_memories_only_when_all_sources_expire_in_the_same_batch() {
             .is_none(),
         "同一批次内全部支持证据到期，L1 应进入 purge 闭包"
     );
+    // V2-P1：共享记忆仍有存活来源，因此读得到；这里改用规范行探针，
+    // 与本用例「只有全部来源同批到期才 purge」的意图直接对应。
     assert!(
         store
-            .get_memory(
-                &scope,
-                &shared_memory,
-                &memory_domain::DomainScope::user_main()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'",
+                rusqlite::params![scope.tenant_id, scope.user_id, shared_memory],
+                |r| r.get::<_, i64>(0),
             )
             .unwrap()
-            .is_some(),
+            == 1,
         "仍有未到期来源时不得删除 L1"
     );
     let surviving_sources: i64 = store.conn().query_row(
@@ -1697,10 +1705,17 @@ fn retention_does_not_purge_expired_memory_used_by_recoverable_dream_job() {
         store.retention_run(&scope).unwrap().is_none(),
         "过期 L1 的 purge 闭包不能删除仍由可恢复 Dream job 冻结的 L0"
     );
-    assert!(store
-        .get_memory(&scope, &memory, &memory_domain::DomainScope::user_main())
-        .unwrap()
-        .is_some());
+    // V2-P1：本用例把 valid_until 显式设成过去时间，读接口按新契约必须立刻不可见；
+    // 这里要证的是「L1 行没有被 purge 掉」，所以直接查规范行。
+    let row_left: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, memory],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(row_left, 1, "过期 L1 行仍在（未被 purge 闭包删除）");
     let evidence_exists: i64 = store
         .conn()
         .query_row(

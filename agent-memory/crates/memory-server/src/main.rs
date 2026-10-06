@@ -984,6 +984,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/memories/remember", post(remember_memory))
                 .route("/v1/memories/search", post(search_memories))
                 .route("/v1/memories/{memory_id}", get(get_memory))
+                .route("/v1/memories/{memory_id}/explain", get(explain_memory))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -3573,6 +3574,128 @@ struct MemoryDetailResponse {
     valid_until: Option<String>,
     origin_agent_id: String,
     evidence_refs: Vec<serde_json::Value>,
+}
+
+// ---- V2-P1 精读（doc7/05 §3、§4）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplainQuery {
+    /// \`history=1|true\` 才返回 superseded/expired 链；缺省 active-only。
+    #[serde(default)]
+    history: Option<String>,
+}
+
+/// \`GET /v1/memories/{memory_id}/explain\`。\`memory_id\` 既可以是裸 ID，也可以是
+/// URL 编码后的 \`riko://memory/...\` 稳定引用；引用里的 tenant/user 必须与认证 scope
+/// 完全一致，domain 必须在本次读域集内，否则按不存在处理（不得跨 scope / 跨域）。
+async fn explain_memory(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    AxumPath(memory_id): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<ExplainQuery>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let include_history = matches!(
+        query.history.as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    );
+
+    let lookup_id = if memory_id.starts_with(memory_domain::refs::MEMORY_REF_PREFIX) {
+        let Some(parsed) = memory_domain::refs::parse_memory_ref(&memory_id) else {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "稳定引用格式不合法",
+            );
+        };
+        // 引用不是凭据：解析出的身份必须与令牌解析出的 scope 一致。
+        if parsed.tenant_id != scope.tenant_id || parsed.user_id != scope.user_id {
+            return err(
+                &req_id.0,
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "记忆不存在或不可见",
+            );
+        }
+        if !dom.allows_read(&parsed.domain_id) {
+            return err(
+                &req_id.0,
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "记忆不存在或不可见",
+            );
+        }
+        parsed.memory_id
+    } else {
+        memory_id
+    };
+
+    let result =
+        state
+            .store
+            .lock()
+            .unwrap()
+            .memory_explain(&scope, &lookup_id, &dom, include_history);
+    match result {
+        Ok(Some(ex)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "memory_id": ex.memory_id,
+            "kind": ex.kind,
+            "claim": ex.claim,
+            "status": ex.status,
+            "version": ex.version,
+            "domain_id": ex.domain_id,
+            "source_class": ex.source_class,
+            "occurred_at": ex.occurred_at,
+            "valid_from": ex.valid_from,
+            "valid_until": ex.valid_until,
+            "created_at": ex.created_at,
+            "updated_at": ex.updated_at,
+            "speaker": ex.speaker,
+            "subject": ex.subject,
+            "subject_source": ex.subject_source,
+            "reason_code": ex.reason_code,
+            "stable_ref": ex.stable_ref,
+            "visible": ex.visible,
+            "relations": {
+                "superseded_by": ex.relations.superseded_by,
+                "supersedes": ex.relations.supersedes,
+                "retired": ex.relations.retired,
+                "retirement_reason_code": ex.relations.retirement_reason_code,
+            },
+            "evidence": ex.evidence.iter().map(|e| serde_json::json!({
+                "evidence_id": e.evidence_id,
+                "start_byte": e.start_byte,
+                "end_byte": e.end_byte,
+                "quote": e.quote,
+                "span_exact": e.span_exact,
+                "role": e.role,
+                "source_kind": e.source_kind,
+                "occurred_at": e.occurred_at,
+                "host_id": e.host_id,
+                "session_id": e.session_id,
+                "suppressed": e.suppressed,
+                "tombstoned": e.tombstoned,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(None) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "记忆不存在或不可见",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("精读失败: {e}"),
+        ),
+    }
 }
 
 async fn get_memory(

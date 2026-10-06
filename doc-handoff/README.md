@@ -49,7 +49,8 @@
 | [23 Android Bridge 生产部署与连通验证](23-Android-Bridge生产部署与连通验证.md) | 生产 DSH profile 更新、缺失配置修复、回滚备份与 Android 模拟器连接验证 |
 | [24 Riko-Muse 交付记录](24-Riko-Muse交付记录.md) | doc7（M1/M2/M3）交付：迁移 0014、rupture/repair、alignment synthesis、compose opt-in、purge 闭包扩展、验证档位与未接线边界 |
 | [25 Riko-Muse 真实模型验收](25-Riko-Muse真实模型验收.md) | 三轮真实模型观察；含 extract_v3 的 0-active 问题、extract_v4 的同语料 7/15 active 结果、保护门核对与清理记录 |
-| [26 V2-S1 记忆域交付记录](26-V2-S1记忆域交付记录.md) | **最新**：接手上一轮中断（208 编译错误）后的修复、V2-S1 内核与 HTTP 层实施、5 个真实缺陷、168 项测试与临时库 HTTP 冒烟证据、未接线边界 |
+| [26 V2-S1 记忆域交付记录](26-V2-S1记忆域交付记录.md) | 接手上一轮中断（208 编译错误）后的修复、V2-S1 内核与 HTTP 层实施、5 个真实缺陷、168 项测试与临时库 HTTP 冒烟证据、未接线边界 |
+| [27 V2-P1 精读与 explain 交付记录](27-V2-P1精读与explain交付记录.md) | **最新**：统一可见性谓词（修 `get_memory` 不看 `valid_until` 的真实缺陷）、`memory_explain` 逐字证据读模型、`riko://` 稳定引用、explain 端点与适配器工具；含一次规范自我修订（墓碑不进读谓词）与三处测试探针更新 |
 
 ## 30 秒状态
 

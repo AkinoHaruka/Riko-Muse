@@ -116,6 +116,21 @@ $r = Call 'POST' "$b/v1/memories/search" @{ query='昆明' } 'user_main'
 Write-Output ("ON_SEARCH_MAIN=" + $r.status + " " + $r.body)
 $r = Call 'POST' "$b/v1/memories/search" @{ query='昆明' } 'side_a'
 Write-Output ("ON_SEARCH_SIDE=" + $r.status + " " + $r.body)
+# V2-P1：精读端点（doc7/05 §4）
+$r = Call 'GET' "$b/v1/memories/$memId/explain" $null 'side_a'
+Write-Output ("P1_EXPLAIN_SIDE=" + $r.status + " " + $r.body)
+$ref = ($r.body | ConvertFrom-Json).stable_ref
+$enc = [uri]::EscapeDataString($ref)
+$r = Call 'GET' "$b/v1/memories/$enc/explain" $null 'side_a'
+Write-Output ("P1_EXPLAIN_BY_REF=" + $r.status + " " + $r.body)
+$r = Call 'GET' "$b/v1/memories/$memId/explain?history=1" $null 'side_a'
+Write-Output ("P1_EXPLAIN_HISTORY=" + $r.status + " visible=" + (($r.body | ConvertFrom-Json).visible))
+$r = Call 'GET' "$b/v1/memories/$memId/explain" $null 'user_main'
+Write-Output ("P1_EXPLAIN_MAIN_NO_LEAK=" + $r.status + " " + $r.body)
+$fake = [uri]::EscapeDataString('riko://memory/t/other-user/user_main/' + $memId + '@1')
+$r = Call 'GET' "$b/v1/memories/$fake/explain" $null 'side_a'
+Write-Output ("P1_EXPLAIN_FOREIGN_SCOPE=" + $r.status + " " + $r.body)
+
 $r = Call 'GET' "$b/v1/domains/bindings" $null $null
 Write-Output ("ON_BINDINGS=" + $r.status + " " + $r.body)
 $r = Call 'POST' "$b/v1/domains/grants" @{ reader_domain='user_main'; granted_domain='side_a'; reason='smoke' } $null

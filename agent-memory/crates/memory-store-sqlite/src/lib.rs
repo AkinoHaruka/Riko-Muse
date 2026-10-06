@@ -119,6 +119,7 @@ pub mod domains;
 pub mod dream_jobs;
 pub mod dream_read;
 pub mod evidence;
+pub mod explain;
 pub mod jobs;
 pub mod lifecycle;
 pub mod memories;
@@ -133,6 +134,8 @@ pub mod semantic_index;
 pub mod soul;
 #[cfg(test)]
 mod v2_domain_tests;
+#[cfg(test)]
+mod v2_p1_tests;
 
 pub use diagnostics::{CandidateDetail, CandidateListItem, JobDetail, JobDoctorStats, JobListItem};
 pub use evidence::IngestOutcome;

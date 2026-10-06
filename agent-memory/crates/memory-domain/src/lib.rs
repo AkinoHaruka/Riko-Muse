@@ -2,6 +2,7 @@
 //! 纯 Rust，不依赖存储或网络。
 
 pub mod domains;
+pub mod refs;
 pub mod rupture;
 
 pub use domains::{DomainScope, USER_MAIN_DOMAIN};
