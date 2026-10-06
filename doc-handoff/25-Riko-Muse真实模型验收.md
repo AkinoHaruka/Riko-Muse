@@ -89,3 +89,52 @@ precision 3/4，recall 3/4。两个错误方向各有一个具体例子，方向
 2. rupture V2 的两个候选方向已有具体例子锚定：自我纠正排除（FP 例）、
    "上次你说…"式无字面量抱怨（FN 例）。仍按纪律等更多样本再动清单。
 3. DSH adapter 接线（下一步第 2 条）开工前先做 seam 现场核对。
+
+## 8. 第二轮：换模型验收（2026-10-06，用户改了 `模型.txt` 优先级后执行）
+
+用户将优先级调整为：1 OpenRouter `inclusionai/ling-3.1-flash` → 2 Gemini →
+3 SiliconFlow。同协议、**同一份语料**重跑（可比性）。
+
+### 8.1 优先级 1：OpenRouter——不可用（凭据过期）
+
+3 个作业 × 3 次尝试共 **9 次调用全部 HTTP 401**，OpenRouter 返回
+`"API key expired"`（直连探测确认）。凭据问题，非代码问题；401 不产生 token 消耗。
+作业按设计转 dead，L0 保留。
+
+### 8.2 优先级 2：Gemini 3.5 Flash Lite——通过
+
+- 探测 1 次 + 提取 3 次（每作业 1 次即成功，90s 超时档）= **4 次成功调用**。
+  对比第一轮：Qwen3.5-4B 同超时档每作业要 4 次尝试，Gemini 延迟显著更好。
+- **14 条候选，全部 held，0 active**（与 Qwen 定性一致：模型都偏照抄原话），
+  但候选数 22 → 14。held 分布：`UNCLEAR_SUBJECT ×4`、`NOT_EXPLICIT ×4`、
+  `MULTI_CLAIM ×3`、`THIRD_PARTY ×1`、`TEMPORAL ×1`。
+- 闸门一致性：`我爸不吃香菜，我妈不碰辣` 被 `MULTI_CLAIM` 正确拦下（两命题）；
+  家庭成员被 `THIRD_PARTY` 持有；一次性语境 `TEMPORAL`。
+
+### 8.3 跨模型对照（本轮核心结论）
+
+| | Qwen3.5-4B（第一轮） | Gemini 3.5 Flash Lite（第二轮） |
+|---|---|---|
+| 每作业调用次数 | 1 / 4 / 4 | 1 / 1 / 1 |
+| 候选数 | 22 | 14 |
+| active | **0** | **0** |
+| held 占比 | 100% | 100% |
+| rupture 命中集合 | 4 条（3 TP / 1 FP） | **逐条相同** |
+| synthesis 指标 | 4/17, 0.76 | 4/17, 0.76 |
+
+两个结论：(a) **换模型不改变"0 active"现象**——写入质量瓶颈在 extract_v3 的模型改写
+半区，与具体小模型关系不大，两个供应商一致；(b) **模型更换完全不扰动 rupture/synthesis
+层**（确定性规则与指标逐条复现）——关注点分离按设计工作。
+
+### 8.4 附带观察
+
+- `extraction_jobs.error_code` 在作业 succeeded 后保留最后一次失败的错误码
+  （显示 `MODEL_HTTP_ERROR` 但实为成功）——既有内核的展示层行为，非本批引入，仅记录。
+- 本轮 rupture/synthesis/compose/关线端到端全部复现第一轮结果；synthesis 版本链
+  （空窗口基线 v1 → 扫描后 v2 → 关线后 v3）按触发策略推进，行为符合 doc7/01 §1.4。
+
+### 8.5 调用与清理（第二轮）
+
+- 模型调用：OpenRouter 9 次（全部 401，未产生 token）+ Gemini 4 次（全 200）。
+- 临时 key/令牌/库文件验收后删除；本文档无凭据。
+
