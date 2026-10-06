@@ -15,7 +15,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 0015→15（doc7/04）：V2-S1 记忆域——memory_domains / 会话绑定 / 跨域授权 /
 /// 证据域映射；一等对象加 domain_id（缺省 user_main）；alignment_synthesis、
 /// purge_tombstones 主键重建；pages_published_unique 加域。
-pub const SCHEMA_VERSION: u32 = 15;
+/// 0016→16（doc7/06）：V2-D1 蒸馏视图——derived_items（compact_memory + 四分面）、
+/// derived_item_sources（逐条来源）、derived_exports（只读投影 manifest）。
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；

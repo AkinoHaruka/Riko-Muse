@@ -655,6 +655,22 @@ impl Store {
             "DELETE FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
             params![scope.tenant_id, scope.user_id, memory_id],
         )?;
+        // 7.5 V2-D1（doc7/06 §4）：派生视图闭包——先删该记忆的派生来源行，
+        // 再删因此变成零来源的孤立条目；否则 compact/分面会留下无法定位的正文。
+        tx.execute(
+            "DELETE FROM derived_item_sources
+             WHERE tenant_id=?1 AND user_id=?2 AND memory_id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+        )?;
+        tx.execute(
+            "DELETE FROM derived_items
+             WHERE tenant_id=?1 AND user_id=?2
+               AND NOT EXISTS (SELECT 1 FROM derived_item_sources s
+                   WHERE s.tenant_id=derived_items.tenant_id
+                     AND s.user_id=derived_items.user_id
+                     AND s.item_id=derived_items.id)",
+            params![scope.tenant_id, scope.user_id],
+        )?;
         // 8. 记忆墓碑。
         tx.execute(
             "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, domain_id, source_kind, source_id, created_at)

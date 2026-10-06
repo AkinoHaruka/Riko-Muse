@@ -71,6 +71,26 @@ enum Commands {
         #[command(subcommand)]
         action: CandidatesAction,
     },
+    /// V2-D1 蒸馏视图（doc7/06 §5）：重建 compact_memory 与四个分面
+    Derived {
+        #[command(subcommand)]
+        action: DerivedAction,
+    },
+    /// V2-D1 只读 Markdown 投影（doc7/06 §5）：渲染 compact/分面/清单到授权目录
+    Export {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        /// 目标目录；按 <tenant>/<user>/<domain> 分层写入，不落到全用户混合目录
+        #[arg(long)]
+        out: PathBuf,
+        /// 缺省 user_main；side 域须显式指定
+        #[arg(long, default_value = "user_main")]
+        domain: String,
+    },
     /// Soul（用户编辑人格）管理（doc6/03 §1、doc6/06 §2；本机可信 CLI）
     Soul {
         #[command(subcommand)]
@@ -239,6 +259,21 @@ enum JobAction {
         /// 运维原因 1—256 字符；不得填用户正文或密钥（写入审计）
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DerivedAction {
+    /// 重建 compact_memory 与四个分面（同事务整体替换，batch_version 递增）
+    Refresh {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
 }
 
@@ -985,6 +1020,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/memories/search", post(search_memories))
                 .route("/v1/memories/{memory_id}", get(get_memory))
                 .route("/v1/memories/{memory_id}/explain", get(explain_memory))
+                // V2-D1（doc7/06 §5）：蒸馏视图
+                .route("/v1/compact", get(get_compact))
+                .route("/v1/facets", get(get_facets))
+                .route("/v1/derived/refresh", post(refresh_derived))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -1061,6 +1100,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[memoryd] 监听 {addr}（loopback only）");
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app).await?;
+            Ok(())
+        }
+        Commands::Derived { action } => match action {
+            DerivedAction::Refresh {
+                config,
+                tenant,
+                user,
+                domain,
+            } => {
+                let cfg = Config::load(&config)?;
+                let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+                let scope = ScopeKey {
+                    tenant_id: tenant,
+                    user_id: user,
+                };
+                let dom = cli_domain_scope(&store, &scope, &domain)?;
+                let out = store
+                    .derived_refresh(&scope, &dom)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "已重建 batch_version={} compact={} 分面={}（上一批条目 {}）",
+                    out.batch_version, out.compact_items, out.facet_items, out.stale_removed
+                );
+                Ok(())
+            }
+        },
+        Commands::Export {
+            config,
+            tenant,
+            user,
+            out,
+            domain,
+        } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey {
+                tenant_id: tenant,
+                user_id: user,
+            };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
+            let written = export_markdown_projection(&mut store, &scope, &dom, &out)?;
+            println!("已导出 {} 个文件到 {}", written, out.display());
             Ok(())
         }
         Commands::Job { action } => match action {
@@ -3018,6 +3099,121 @@ async fn delete_domain_grant(
         .into_response()
 }
 
+/// CLI 的域上下文（doc7/06 §5）：可信运维路径显式给出域名，服务端核其存在且 active。
+fn cli_domain_scope(
+    store: &memory_store_sqlite::Store,
+    scope: &ScopeKey,
+    domain: &str,
+) -> Result<memory_domain::DomainScope, String> {
+    store
+        .domain_require_active(scope, domain)
+        .map_err(|e| format!("域不可用: {e}"))?;
+    Ok(memory_domain::DomainScope::resolve(
+        domain,
+        domain != memory_domain::USER_MAIN_DOMAIN,
+        &[],
+        domain,
+    ))
+}
+
+/// V2-D1 只读 Markdown 投影（doc7/06 §5）。
+///
+/// 先写临时目录再整体替换，避免半成品覆盖上一版；每行带稳定引用与来源；
+/// manifest 入库（正文不入库），失败记 incomplete 而不是假装成功。
+fn export_markdown_projection(
+    store: &mut memory_store_sqlite::Store,
+    scope: &ScopeKey,
+    dom: &memory_domain::DomainScope,
+    out: &std::path::Path,
+) -> Result<usize, String> {
+    let (entries, batch) = store
+        .derived_export_entries(scope, dom)
+        .map_err(|e| e.to_string())?;
+    let base = out
+        .join(&scope.tenant_id)
+        .join(&scope.user_id)
+        .join(&dom.write);
+    let staging = base.with_extension(format!("staging-{}", uuid::Uuid::now_v7()));
+    let mut written = 0usize;
+    let mut outcome = "complete";
+    let mut render = |rel: &str, body: String| -> Result<(), String> {
+        let target = staging.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&target, body).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+
+    let render_view = |store: &memory_store_sqlite::Store,
+                       kind: &str,
+                       dom: &memory_domain::DomainScope|
+     -> Result<String, String> {
+        let view = store
+            .derived_view_readable(scope, dom, kind)
+            .map_err(|e| e.to_string())?;
+        let mut text = format!(
+            "# {kind}\n\n<!-- batch_version={} items={} skipped_stale={} -->\n",
+            view.batch_version,
+            view.items.len(),
+            view.skipped_stale
+        );
+        for item in &view.items {
+            let refs: Vec<String> = item
+                .sources
+                .iter()
+                .map(|(mid, v, _)| {
+                    memory_domain::refs::memory_stable_ref(
+                        &scope.tenant_id,
+                        &scope.user_id,
+                        &dom.write,
+                        mid,
+                        *v,
+                    )
+                })
+                .collect();
+            text.push_str(&format!("- {}  <sub>{}</sub>\n", item.body, refs.join(" ")));
+        }
+        Ok(text)
+    };
+
+    for entry in &entries {
+        match render_view(store, &entry.document_kind, dom) {
+            Ok(text) => render(&entry.path, text)?,
+            Err(e) => {
+                eprintln!("[memoryd] 导出 {entry:?} 失败: {e}");
+                outcome = "incomplete";
+            }
+        }
+    }
+    // manifest.json：版本、条目数、生成时刻与 outcome。
+    let manifest = serde_json::json!({
+        "tenant_id": scope.tenant_id,
+        "user_id": scope.user_id,
+        "domain_id": dom.write,
+        "batch_version": batch,
+        "outcome": outcome,
+        "generated_at": memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?,
+        "files": entries,
+        "note": "文件行号只是该导出版本的位置，不是主键；正文以数据库为准",
+    });
+    render(
+        "manifest.json",
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )?;
+
+    std::fs::create_dir_all(base.parent().unwrap_or(out)).map_err(|e| e.to_string())?;
+    if base.exists() {
+        std::fs::remove_dir_all(&base).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&staging, &base).map_err(|e| e.to_string())?;
+    store
+        .derived_write_manifest(scope, dom, batch, &entries, outcome)
+        .map_err(|e| e.to_string())?;
+    Ok(written)
+}
+
 fn err(req_id: &str, status: StatusCode, code: ErrorCode, msg: &str) -> Response {
     (status, Json(ErrorResponse::new(req_id, code, msg))).into_response()
 }
@@ -3589,6 +3785,191 @@ struct ExplainQuery {
 /// \`GET /v1/memories/{memory_id}/explain\`。\`memory_id\` 既可以是裸 ID，也可以是
 /// URL 编码后的 \`riko://memory/...\` 稳定引用；引用里的 tenant/user 必须与认证 scope
 /// 完全一致，domain 必须在本次读域集内，否则按不存在处理（不得跨 scope / 跨域）。
+// ---- V2-D1 蒸馏视图端点（doc7/06 §5）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FacetsQuery {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+async fn get_compact(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.compact_view(&scope, &dom) {
+        Ok(view) => Json(derived_view_response(&req_id.0, &scope, &dom, &view)).into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取 compact 失败: {e}"),
+        ),
+    }
+}
+
+fn derived_view_response(
+    req_id: &str,
+    scope: &ScopeKey,
+    dom: &memory_domain::DomainScope,
+    view: &memory_store_sqlite::derived::DerivedView,
+) -> serde_json::Value {
+    let _ = req_id;
+    serde_json::json!({
+        "request_id": req_id,
+        "document_kind": view.document_kind,
+        "batch_version": view.batch_version,
+        "item_count": view.items.len(),
+        "skipped_stale": view.skipped_stale,
+        "total_chars": view.total_chars,
+        "budget_items": view.budget_items,
+        "budget_chars": view.budget_chars,
+        "items": view.items.iter().map(|i| serde_json::json!({
+            "item_id": i.id,
+            "position": i.position,
+            "body": i.body,
+            "observed_or_inferred": i.observed_or_inferred,
+            "generator_version": i.generator_version,
+            "source_fingerprint": i.source_fingerprint,
+            "sources": i.sources.iter().map(|(mid, v, sha)| serde_json::json!({
+                "memory_id": mid,
+                "memory_version": v,
+                "claim_sha256": sha,
+                "stable_ref": memory_domain::refs::memory_stable_ref(
+                    &scope.tenant_id, &scope.user_id, &dom.write, mid, *v),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn get_facets(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    axum::extract::Query(query): axum::extract::Query<FacetsQuery>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match query.kind.as_deref() {
+        Some(kind) => {
+            // 先归一化再校验：裸名与带 facet_ 前缀都接受（doc7/06 §5）。
+            let full = if kind.starts_with("facet_") {
+                kind.to_string()
+            } else {
+                format!("facet_{kind}")
+            };
+            if !memory_store_sqlite::derived::is_facet(&full) {
+                return err(
+                    &req_id.0,
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidField,
+                    "kind 必须是 experience|opinions|reflections|world（可带 facet_ 前缀）",
+                );
+            }
+            match guard.facet_view(&scope, &dom, &full) {
+                Ok(view) => {
+                    Json(derived_view_response(&req_id.0, &scope, &dom, &view)).into_response()
+                }
+                Err(e) => err(
+                    &req_id.0,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                    &format!("读取分面失败: {e}"),
+                ),
+            }
+        }
+        None => {
+            let mut facets = serde_json::Map::new();
+            for facet in memory_store_sqlite::derived::FACETS {
+                match guard.facet_view(&scope, &dom, facet) {
+                    Ok(view) => {
+                        facets.insert(
+                            facet.to_string(),
+                            derived_view_response(&req_id.0, &scope, &dom, &view),
+                        );
+                    }
+                    Err(e) => {
+                        return err(
+                            &req_id.0,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ErrorCode::Internal,
+                            &format!("读取分面失败: {e}"),
+                        )
+                    }
+                }
+            }
+            Json(serde_json::json!({
+                "request_id": req_id.0,
+                "facets": facets,
+            }))
+            .into_response()
+        }
+    }
+}
+
+async fn refresh_derived(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.derived_refresh(&scope, &dom) {
+        Ok(out) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "status": "ok",
+            "batch_version": out.batch_version,
+            "compact_items": out.compact_items,
+            "facet_items": out.facet_items,
+            "previous_items": out.stale_removed,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("重建派生视图失败: {e}"),
+        ),
+    }
+}
+
 async fn explain_memory(
     State(state): State<AppState>,
     Extension(scope): Extension<ScopeKey>,

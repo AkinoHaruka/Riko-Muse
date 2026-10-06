@@ -114,6 +114,7 @@ mod d67_tests;
 mod d68_tests;
 #[cfg(test)]
 mod d69_tests;
+pub mod derived;
 pub mod diagnostics;
 pub mod domains;
 pub mod dream_jobs;
@@ -132,6 +133,8 @@ pub mod purge;
 pub mod resident;
 pub mod semantic_index;
 pub mod soul;
+#[cfg(test)]
+mod v2_d1_tests;
 #[cfg(test)]
 mod v2_domain_tests;
 #[cfg(test)]

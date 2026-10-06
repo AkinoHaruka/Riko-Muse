@@ -71,8 +71,8 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
             r.get(0)
         })
         .unwrap();
-    // 按迁移纪律随新增迁移同步：0015（doc7/04 V2-S1 记忆域）起为 15。
-    assert_eq!(applied, 15);
+    // 按迁移纪律随新增迁移同步：0016（doc7/06 V2-D1 蒸馏视图）起为 16。
+    assert_eq!(applied, 16);
     assert_eq!(
         store
             .dream_live_runner_count("9999-01-01T00:00:00Z")
