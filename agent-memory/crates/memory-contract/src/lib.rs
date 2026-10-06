@@ -10,7 +10,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// prompt_version/admission_version 分别选提示词与准入规则。0005 起新增表
 /// （doc6/02）：0005 soul/resident/audit/receipts；0006 派生知识文档、问题目录、
 /// 整理作业与页面索引；历史迁移 0001—0004 冻结不改。
-pub const SCHEMA_VERSION: u32 = 13;
+/// 0014→14（doc7/01）：Riko-Muse 增量——rupture_events / repair_threads /
+/// alignment_synthesis；M1 valid_until 到期转 expired 复用既有 status 枚举，不新增表。
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// 提取 Prompt 版本（doc/13 §4），随任务保存。新建作业一律写当前版本。
 /// doc2/05 §3：更新 Prompt 必须新建版本并保留老版本处理未完成作业；

@@ -201,6 +201,20 @@ enum Commands {
         #[arg(long)]
         user: String,
     },
+    /// doc7（Riko-Muse）M1：执行一轮 valid_until 到期转换（无 LLM）
+    ExpireRun {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// doc7（Riko-Muse）M2/M3：对一个 scope 执行 rupture 扫描 + synthesis 刷新（无 LLM）
+    MuseScan {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+    },
     /// SQLite 在线一致性备份（VACUUM INTO）
     Backup {
         #[arg(long)]
@@ -854,6 +868,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
+            // doc7（Riko-Muse）：M1 到期转换 + M2 rupture 扫描 + M3 synthesis 刷新。
+            // 纯 Rust/SQLite，无 LLM（doc7/01 §2/§6）；15 分钟 tick，与 retention 同模式。
+            let muse_state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+                loop {
+                    tick.tick().await;
+                    // M1：到期记忆转 expired（全 scope 单批）。
+                    let expired = {
+                        match muse_state.store.lock() {
+                            Ok(mut s) => s.expire_due_memories(),
+                            Err(_) => {
+                                eprintln!("[memoryd] Muse 调度器无法取得 Store 锁");
+                                continue;
+                            }
+                        }
+                    };
+                    match expired {
+                        Ok(0) => {}
+                        Ok(n) => eprintln!("[memoryd] 到期转换：{n} 条记忆已转 expired"),
+                        Err(error) => eprintln!("[memoryd] 到期转换失败: {error}"),
+                    }
+                    // M2/M3：逐 scope 扫描 rupture 并按策略刷新 synthesis。
+                    let scopes = {
+                        match muse_state.store.lock() {
+                            Ok(s) => match s.all_scopes() {
+                                Ok(scopes) => scopes,
+                                Err(error) => {
+                                    eprintln!("[memoryd] Muse scope 扫描失败: {error}");
+                                    continue;
+                                }
+                            },
+                            Err(_) => continue,
+                        }
+                    };
+                    for scope in scopes {
+                        let scan = match muse_state.store.lock() {
+                            Ok(mut s) => s.rupture_scan(&scope),
+                            Err(_) => {
+                                eprintln!("[memoryd] Muse 调度器无法取得 Store 锁");
+                                continue;
+                            }
+                        };
+                        match scan {
+                            Ok(out) if out.inserted_ruptures > 0 || out.opened_threads > 0 => {
+                                eprintln!(
+                                    "[memoryd] rupture 扫描（{}/{}）：新事件 {} 条、新线程 {}",
+                                    scope.tenant_id,
+                                    scope.user_id,
+                                    out.inserted_ruptures,
+                                    out.opened_threads
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("[memoryd] rupture 扫描失败: {error}");
+                                continue;
+                            }
+                        }
+                        let refreshed = match muse_state.store.lock() {
+                            Ok(mut s) => s.alignment_synthesis_refresh(&scope),
+                            Err(_) => {
+                                eprintln!("[memoryd] Muse 调度器无法取得 Store 锁");
+                                continue;
+                            }
+                        };
+                        if let Err(error) = refreshed {
+                            eprintln!("[memoryd] synthesis 刷新失败: {error}");
+                        }
+                    }
+                }
+            });
             let addr: SocketAddr = cfg.listen_addr.parse().expect("配置已校验为 loopback");
             let app = Router::new()
                 .route("/v1/health", get(health))
@@ -907,6 +993,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/dream/jobs/{job_id}/read", post(dream_scoped_read))
                 .route("/v1/resident/page-pins", post(post_page_pin))
                 .route("/v1/resident/page-pins/{page_id}", delete(delete_page_pin))
+                // doc7（Riko-Muse）：alignment synthesis、repair 线程与 rupture 诊断。
+                .route(
+                    "/v1/alignment/synthesis",
+                    get(get_alignment_synthesis).post(refresh_alignment_synthesis),
+                )
+                .route("/v1/repair/threads", get(list_repair_threads))
+                .route(
+                    "/v1/repair/threads/{thread_id}/close",
+                    post(close_repair_thread),
+                )
+                .route("/v1/ruptures", get(list_ruptures))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     request_pipeline,
@@ -1366,6 +1463,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 None => println!("retention 无操作（策略未配置/关闭或本批次已执行）"),
             }
+            Ok(())
+        }
+        Commands::ExpireRun { config } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let n = store.expire_due_memories().map_err(|e| e.to_string())?;
+            println!("到期转换完成：{n} 条记忆已转 expired");
+            Ok(())
+        }
+        Commands::MuseScan {
+            config,
+            tenant,
+            user,
+        } => {
+            let cfg = Config::load(&config)?;
+            let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+            let scope = ScopeKey {
+                tenant_id: tenant,
+                user_id: user,
+            };
+            let scan = store.rupture_scan(&scope).map_err(|e| e.to_string())?;
+            println!(
+                "rupture 扫描完成：扫描事件 {} 条、新 rupture {} 条、新线程 {}",
+                scan.scanned_events, scan.inserted_ruptures, scan.opened_threads
+            );
+            let synthesis = store
+                .alignment_synthesis_refresh(&scope)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "synthesis 版本 {}：窗口 {} → {}，纠正 {}/{}，无纠正率 {:.2}，待修复线程 {}",
+                synthesis.version,
+                synthesis.window_since,
+                synthesis.window_until,
+                synthesis.rupture_turns,
+                synthesis.user_turns,
+                synthesis.correction_free_rate,
+                synthesis.open_repair_threads
+            );
             Ok(())
         }
     }
@@ -2700,6 +2835,10 @@ struct ComposeRequest {
     query: String,
     max_items: Option<usize>,
     max_chars: Option<usize>,
+    /// doc7（Riko-Muse）M3：true 时响应附带 alignment synthesis（缺省 false，
+    /// 缺省时响应与旧版逐字节一致——v1 契约不变）。
+    #[serde(default)]
+    include_alignment: bool,
 }
 
 async fn compose_context(
@@ -2763,15 +2902,264 @@ async fn compose_context(
                 .into_iter()
                 .map(|(memory_id, evidence_ids)| serde_json::json!({"memory_id": memory_id, "evidence_ids": evidence_ids}))
                 .collect();
-            Json(serde_json::json!({
+            // doc7（Riko-Muse）M3：opt-in 注入 alignment synthesis。缺省 false 时不取
+            // 不附（响应结构与旧版一致）；取最新版本，若存在则在 text 头部前置
+            // <alignment_synthesis> 块并附 "alignment" 对象。
+            let mut alignment_json: Option<serde_json::Value> = None;
+            let mut final_text = text;
+            if body.include_alignment {
+                let synthesis = {
+                    let guard = state.store.lock().unwrap();
+                    guard.alignment_synthesis_latest(&scope)
+                };
+                match synthesis {
+                    Ok(Some(row)) => {
+                        final_text = format!(
+                            "<alignment_synthesis version=\"{}\">\n{}\n</alignment_synthesis>\n{}",
+                            row.version, row.body, final_text
+                        );
+                        alignment_json = Some(serde_json::json!({
+                            "version": row.version,
+                            "window_since": row.window_since,
+                            "window_until": row.window_until,
+                            "rupture_turns": row.rupture_turns,
+                            "user_turns": row.user_turns,
+                            "correction_free_rate": row.correction_free_rate,
+                            "open_repair_threads": row.open_repair_threads,
+                            "body": row.body,
+                            "generated_at": row.generated_at,
+                        }));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return err(
+                            &req_id.0,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ErrorCode::Internal,
+                            &e.to_string(),
+                        )
+                    }
+                }
+            }
+            let mut payload = serde_json::json!({
                 "request_id": req_id.0,
-                "text": text,
+                "text": final_text,
                 "items": item_objs,
                 "truncated": truncated,
                 "index_degraded": index_degraded
-            }))
-            .into_response()
+            });
+            if let Some(alignment) = alignment_json {
+                payload["alignment"] = alignment;
+            }
+            return Json(payload).into_response();
         }
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
+    }
+}
+
+// ---- doc7（Riko-Muse）：alignment synthesis / repair 线程 / rupture 诊断 ----
+
+async fn get_alignment_synthesis(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+) -> Response {
+    let guard = state.store.lock().unwrap();
+    match guard.alignment_synthesis_latest(&scope) {
+        Ok(Some(row)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "synthesis": alignment_json(&row),
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "synthesis": serde_json::Value::Null,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn refresh_alignment_synthesis(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+) -> Response {
+    let mut guard = state.store.lock().unwrap();
+    match guard.alignment_synthesis_refresh(&scope) {
+        Ok(row) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "synthesis": alignment_json(&row),
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
+    }
+}
+
+fn alignment_json(row: &memory_store_sqlite::alignment::AlignmentSynthesisRow) -> serde_json::Value {
+    serde_json::json!({
+        "version": row.version,
+        "window_since": row.window_since,
+        "window_until": row.window_until,
+        "rupture_turns": row.rupture_turns,
+        "user_turns": row.user_turns,
+        "correction_free_rate": row.correction_free_rate,
+        "open_repair_threads": row.open_repair_threads,
+        "body": row.body,
+        "source_refs": serde_json::from_str::<serde_json::Value>(&row.source_refs_json)
+            .unwrap_or(serde_json::Value::Null),
+        "generated_at": row.generated_at,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct RepairThreadsListQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_repair_threads(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<RepairThreadsListQuery>,
+) -> Response {
+    if let Some(s) = query.status.as_deref() {
+        if !matches!(s, "open" | "closed") {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "status 只能是 open/closed",
+            );
+        }
+    }
+    let limit = query.limit.unwrap_or(50);
+    let guard = state.store.lock().unwrap();
+    match guard.repair_threads_list(&scope, query.status.as_deref(), limit) {
+        Ok(rows) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "threads": rows.iter().map(|r| serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "status": r.status,
+                "rupture_count": r.rupture_count,
+                "first_rupture_at": r.first_rupture_at,
+                "last_rupture_at": r.last_rupture_at,
+                "closed_at": r.closed_at,
+                "close_reason": r.close_reason,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairThreadCloseRequest {
+    reason: String,
+}
+
+async fn close_repair_thread(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    body: Result<Json<RepairThreadCloseRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "须为 {\"reason\": …} 的合法 JSON",
+            )
+        }
+    };
+    if body.reason.is_empty() || body.reason.chars().count() > 200 {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "reason 须 1—200 字符",
+        );
+    }
+    let mut guard = state.store.lock().unwrap();
+    match guard.repair_thread_close(&scope, &thread_id, &body.reason, "api") {
+        Ok(changed) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "changed": changed,
+        }))
+        .into_response(),
+        Err(memory_store_sqlite::StoreError::ThreadNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "修复线程不存在或不属于当前 scope",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RupturesListQuery {
+    limit: Option<usize>,
+}
+
+async fn list_ruptures(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<RupturesListQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(50);
+    let guard = state.store.lock().unwrap();
+    match guard.ruptures_list(&scope, limit) {
+        Ok(rows) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "ruptures": rows.iter().map(|r| serde_json::json!({
+                "id": r.id,
+                "evidence_id": r.evidence_id,
+                "host_id": r.host_id,
+                "session_id": r.session_id,
+                "event_seq": r.event_seq,
+                "signal": r.signal,
+                "cue": r.cue,
+                "start_byte": r.start_byte,
+                "end_byte": r.end_byte,
+                "thread_id": r.thread_id,
+                "detected_at": r.detected_at,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
         Err(e) => err(
             &req_id.0,
             StatusCode::INTERNAL_SERVER_ERROR,

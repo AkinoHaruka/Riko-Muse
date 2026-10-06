@@ -410,6 +410,29 @@ impl Store {
                 "DELETE FROM suppressed_sources WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3 AND forgotten_memory_id=?4",
                 params![scope.tenant_id, scope.user_id, eid, memory_id],
             )?;
+            // 3c-bis. doc7（Riko-Muse）：rupture 事件随 L0 证据闭包删除（来源不可反查即
+            // 不可留存）；随之清理失去全部 rupture 的线程与引用它们的 synthesis 版本
+            // （synthesis 是纯派生物，与 pages 的 purge 同待遇）。
+            tx.execute(
+                "DELETE FROM rupture_events WHERE tenant_id=?1 AND user_id=?2 AND evidence_id=?3",
+                params![scope.tenant_id, scope.user_id, eid],
+            )?;
+            tx.execute(
+                "DELETE FROM repair_threads WHERE tenant_id=?1 AND user_id=?2
+                   AND id NOT IN (SELECT DISTINCT thread_id FROM rupture_events
+                                  WHERE tenant_id=?1 AND user_id=?2 AND thread_id IS NOT NULL)",
+                params![scope.tenant_id, scope.user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM alignment_synthesis WHERE tenant_id=?1 AND user_id=?2 AND (
+                   EXISTS (SELECT 1 FROM json_each(alignment_synthesis.source_refs_json, '$.rupture_event_ids') je
+                           WHERE je.value NOT IN (SELECT id FROM rupture_events
+                                                  WHERE tenant_id=?1 AND user_id=?2))
+                   OR EXISTS (SELECT 1 FROM json_each(alignment_synthesis.source_refs_json, '$.thread_ids') jt
+                              WHERE jt.value NOT IN (SELECT id FROM repair_threads
+                                                     WHERE tenant_id=?1 AND user_id=?2)))",
+                params![scope.tenant_id, scope.user_id],
+            )?;
             // 3d. 删事件本体 + 墓碑（source_id=content sha，防 spool 重放复活）。
             tx.execute(
                 "DELETE FROM evidence_events WHERE tenant_id=?1 AND user_id=?2 AND id=?3",

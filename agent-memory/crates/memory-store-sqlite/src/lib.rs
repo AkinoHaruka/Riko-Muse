@@ -87,11 +87,14 @@ pub enum StoreError {
     StaleInput,
     #[error("adjudication 输出必须对每个冻结候选恰好包含一项裁决")]
     InvalidAdjudicationCoverage,
+    #[error("修复线程不存在或不属于当前 scope")]
+    ThreadNotFound,
     #[error("时间溢出: {0}")]
     Time(String),
 }
 
 pub mod adjudication;
+pub mod alignment;
 pub mod consolidation_jobs;
 #[cfg(test)]
 mod d65_tests;
@@ -101,6 +104,8 @@ mod d67_tests;
 mod d68_tests;
 #[cfg(test)]
 mod d69_tests;
+#[cfg(test)]
+mod muse_tests;
 pub mod diagnostics;
 pub mod dream_jobs;
 pub mod dream_read;
