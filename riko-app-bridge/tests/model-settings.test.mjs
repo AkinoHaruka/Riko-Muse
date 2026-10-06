@@ -27,7 +27,13 @@ test("mobile model settings follow DSH settings and write-only credential flows"
           },
         },
       },
-      user: { providers: {} },
+      user: {
+        providers: {
+          openai: {
+            models: [{ id: "gpt-test" }],
+          },
+        },
+      },
     },
     credentials: new Map(),
     failAcmeCredentialOnce: true,
@@ -130,6 +136,7 @@ test("mobile model settings follow DSH settings and write-only credential flows"
     const described = await request("/model-settings");
     assert.equal(described.status, 200);
     assert.equal(described.body.providers[0].id, "openai");
+    assert.equal(described.body.providers[0].modelsOverride, true);
     assert.equal(JSON.stringify(described.body).includes(bridgeToken), false);
 
     const keyWrite = await request("/model-settings/providers/openai/credential", "POST", {
@@ -139,6 +146,20 @@ test("mobile model settings follow DSH settings and write-only credential flows"
     assert.equal(keyWrite.status, 200);
     assert.equal(state.namespace.value.providers.openai.apiKeyEnv, "OPENAI_API_KEY");
     assert.equal(state.credentials.get("OPENAI_API_KEY"), "fake-openai-key-never-returned");
+
+    const presetDiscovery = await request("/model-settings/discover", "POST", { provider: "openai" });
+    assert.equal(presetDiscovery.status, 200);
+    assert.deepEqual(state.discoveredRequest, { provider: "openai" });
+    assert.equal(presetDiscovery.body.models[0].id, "discovered-model");
+
+    const modelWrite = await request("/model-settings/providers/openai/models", "PUT", {
+      expectedRevision: 2,
+      models: [{ id: "gpt-test" }, { id: "model-from-provider-catalog" }],
+    });
+    assert.equal(modelWrite.status, 200);
+    assert.deepEqual(state.namespace.value.providers.openai.models.map((model) => model.id), [
+      "gpt-test", "model-from-provider-catalog",
+    ]);
 
     const discovery = await request("/model-settings/discover", "POST", {
       baseURL: "https://gateway.example/v1",
@@ -154,9 +175,9 @@ test("mobile model settings follow DSH settings and write-only credential flows"
       displayName: "Acme Gateway",
       baseURL: "https://gateway.example/v1",
       api: "openai-completions",
-      expectedRevision: 2,
+      expectedRevision: 3,
       apiKey: "fake-acme-key-never-returned",
-      models: [{ id: "acme-chat", name: "Acme Chat", contextWindow: 64000 }],
+      models: [{ id: "gpt-test", name: "Acme Chat", contextWindow: 64000 }],
     };
     const firstCreate = await request("/model-settings/custom-providers", "POST", customProvider);
     assert.equal(firstCreate.status, 502);
@@ -166,6 +187,14 @@ test("mobile model settings follow DSH settings and write-only credential flows"
     assert.equal(retryCreate.status, 200);
     assert.equal(state.namespace.value.providers["acme-gateway"].apiKeyEnv, "ACME_GATEWAY_API_KEY");
     assert.equal(state.credentials.get("ACME_GATEWAY_API_KEY"), "fake-acme-key-never-returned");
+    assert.equal(state.namespace.value.providers.openai.models[0].id, "gpt-test");
+    assert.equal(state.namespace.value.providers["acme-gateway"].models[0].id, "gpt-test");
+
+    const modelReset = await request("/model-settings/providers/openai/models", "DELETE", {
+      expectedRevision: 4,
+    });
+    assert.equal(modelReset.status, 200);
+    assert.equal("models" in state.namespace.value.providers.openai, false);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(directory, { recursive: true, force: true });

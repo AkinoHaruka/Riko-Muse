@@ -32,9 +32,10 @@ The bridge token is separate from provider API keys. It authorizes only bridge o
 The bridge exposes health, model catalog and selection, Riko-App session list/create/history, prompt submission, live event stream, cancellation, and model settings:
 
 - `GET /model-settings` returns provider profiles, the DSH settings revision, and credential configured/not-configured flags.
-- `POST /model-settings/discover` calls DSH `llm.discoverModels` for a configured provider endpoint.
+- `POST /model-settings/discover` calls DSH `llm.discoverModels` for a compatible provider endpoint or a DSH preset provider's built-in catalog. Native Gemini reads the model catalog bundled with the installed DSH; it does not call Google's model-list API.
 - `POST|DELETE /model-settings/providers/{id}/credential` writes or removes a provider credential.
-- `POST /model-settings/custom-providers` and `PUT|DELETE /model-settings/custom-providers/{id}` manage custom OpenAI/Anthropic-compatible providers and separately stored credentials.
+- `PUT|DELETE /model-settings/providers/{id}/models` saves a per-provider model allowlist or restores the DSH-inherited catalog. Model identity is `(provider, model id)`, so equal IDs from different providers remain distinct.
+- `POST /model-settings/custom-providers` and `PUT|DELETE /model-settings/custom-providers/{id}` manage custom OpenAI/Anthropic-compatible providers and the DSH-native Google/Gemini provider. Native Gemini is saved under provider ID `google` with the profile `api` omitted, so DSH keeps its catalog-native `google-generative-ai` implementation. Only model IDs present in the installed DSH Google catalog are accepted. Provider credentials are stored separately through DSH `credentials`.
 
 New sessions use the `riko` Agent preset. The registry prevents this API from addressing unrelated DSH sessions. History returns 20 messages by default and permits up to 50 per page.
 

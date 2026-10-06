@@ -1,7 +1,9 @@
-# 三个上游参考仓库：各自是独立 git 仓库，只读参考，不做嵌套跟踪
+# 上游参考仓库：各自是独立 git 仓库，只读参考，不做嵌套跟踪
 EverOS/
 hindsight/
 tencentdb-agent-memory/
+deepseek-harness/
+MiMo-Code/
 
 # WorkBuddy 项目数据（非临时缓存，但不应进入本项目 git）
 .workbuddy/
