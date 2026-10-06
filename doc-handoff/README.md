@@ -1,8 +1,10 @@
 # Agent-Memory 实施交接说明（给下一个 Harness）
 
-> **当前实施更新（2026-09-29）**：D6-11—D6-15 已实施并提交，schema 13。当前 Rust workspace `fmt/test/build` 均通过；适配器 `npm test` 20/20 通过。官方 DSH + 本地固定响应验证了受限 Dream child 的提取/裁决，以及主题页创建和基于已读页面版本的更新。Android 模型设置 Bridge 接口与 debug 设置页已实现，模拟器构建/安装通过，模型凭据只写入 DSH credential store；生产 DSH Bridge 尚未更新，完整插件激活与服务器端模型设置尚未验证。此轮未调用真实模型、未触碰 dana/realtest 原库。D6 详情见 [20](20-D6-11-15交付记录.md)，Bridge 与 DSH 版本证据见 [21](21-DSH-0.2适配.md)。
+> **Riko-Muse 增量交付（2026-10-06，分支 `Riko-Muse`，未提交）**：按用户决定依 `Muse文档/` 实施内核增量（规范 `doc7/`）。schema 13→14：新增 `0014_muse_alignment.sql`（rupture_events / repair_threads / alignment_synthesis）；M1 `valid_until` 到期自动转 `expired`（15 分钟 tick 调度器 + CLI `expire-run`，审计 actor=system）；M2 rupture 确定性规则检测（`RUPTURE_CUES_V1` 冻结清单，无 LLM）+ repair 线程 7 天归组与显式关线；M3 相处指南确定性派生（版本化、来源可溯）+ `POST /v1/context/compose` opt-in `include_alignment` 注入（缺省响应与旧版同键同序）。新端点：`GET/POST /v1/alignment/synthesis`、`GET /v1/repair/threads`、`POST /v1/repair/threads/{id}/close`、`GET /v1/ruptures`；CLI 新增 `muse-scan`。purge/retention 闭包扩展至新表。`cargo test --workspace` 172 项全过（含 muse_tests 10 项）；临时库 CLI/HTTP 冒烟通过。真实 DSH/真实模型未调用；DSH 适配器消费 `alignment` 未接线；dana/realtest 原库未触碰。详见 [24](24-Riko-Muse交付记录.md)。
 
-> **DSH 0.2 适配（2026-09-29）**：本地官方 clone 已快进到 `0.2.0-rc.1 / 4878cdabd87d4041bdaff61d04c966883b9fd07a` 并成功构建 host 库。Riko bundle `0.5.1` 更新了 DSH peer 范围和 preset 表达式，已推送 GitHub；在独立 DSH home/profile 中安装成功，`--dump-config` 确认 `preset-riko` 与 adapter 行进入组合配置。当前 `npm test` 20/20 通过。此证据不代表插件已在启用凭据的 profile 中启动，也不代表真实 memoryd/模型链路通过；pnpm 仍报告 profile 未直接安装这些 host peer 包。完整记录见 [21](21-DSH-0.2适配.md)。
+> **当前实施更新（2026-09-29）**：D6-11—D6-15 已实施并提交，schema 13。当前 Rust workspace `fmt/test/build` 均通过；适配器 `npm test` 20/20 通过。官方 DSH + 本地固定响应验证了受限 Dream child 的提取/裁决，以及主题页创建和基于已读页面版本的更新。Android 模型设置 Bridge `0.1.1` 已部署到生产 DSH `web` profile；补齐 profile 配置后重启了 DSH runtime。Android 模拟器现已通过认证连接线上 Riko preset，读取 health、model catalog、model-settings 与提供商状态成功。未调用模型 API；尚未验证 Android 中密钥写入、自定义提供商保存/发现后实际发起模型对话。dana/realtest 原库未触碰。详见 [23](23-Android-Bridge生产部署与连通验证.md)。
+
+> **DSH 0.2 适配（2026-09-29）**：原本机官方 clone 有大量既存删除，已完整移至 `%LOCALAPPDATA%\Temp\deepseek-harness-prior-20260929` 保留；`deepseek-harness/` 已从官方仓库重新克隆为 `0.2.0-rc.2 / 639ed015397290b3745d163aafe02ffee4aa3f84`，工作树干净。`pnpm install --ignore-scripts` 与 `build:lib:host` 通过。Riko Memory 与 Riko-App Bridge 已在隔离 profile 安装，`--dump-config` 显示两个 bundle；官方 DSH rc.2 Web 实际启动，Bridge health 返回 200，Riko preset session create/list 成功。Memory adapter 随 preset 挂载，但未发送 prompt，因此 L0 事件写入、记忆召回/注入和模型行为未验证。全量 `pnpm run build` 的 Web Vite/esbuild 步骤遇到 Windows `Access is denied`，Web UI 全量构建未验证。Bridge health 响应仍报告旧的 `0.2.0-rc.1` 元数据版本。未调用模型 API，未操作服务器。完整记录见 [21](21-DSH-0.2适配.md) 与 [22](22-DSH-rc2本机安装验证.md)。
 
 > **真实模型质量测试背景（2026-09-28，D6-11—15 开工前）**：D6 规范差距修复已按五组实施；当时 schema 11。受控 OpenRouter + 官方 DSH Dream 单样本已走到 Rust adjudication 和 Active memory；Gemini 真实响应解码与 3072 维向量保存通过。取消 bundle/query 固定延迟预算后，以 `gemini-embedding-001` 对同一合成零词法 query 复测 1 次：端到端 1084 ms，`semantic_status=ok`，目标以 `reason=semantic` 进入 retrieved。它证明旧 800 ms 截止不再提前降级该样本，不代表整体语义质量或正确沉默已通过。请求仍受 `embedding_timeout_secs`（默认 30 秒）保护；DSH bundle hook 跟随调用取消。该阶段未调用 OpenRouter/Chat，真实模型检索质量仍需更多有对照样本。完整证据见 [17](17-D6真实模型端到端验证.md) §8.9；首次失败与保护修复见 [17](17-D6真实模型端到端验证.md) §1—7 和 [18](18-D6真实模型验证保护修复.md)。dana/realtest 原库未触碰、未升级。
 
@@ -41,16 +43,19 @@
 | [19 D6 记忆写入与召回质量探针](19-D6记忆写入与召回质量探针.md) | 写入候选忠实度、词法/语义召回命中与误召回；区分本轮实测、历史样本和未完成链路 |
 | [20 D6-11—D6-15 交付记录](20-D6-11-15交付记录.md) | 受限 Dream child、job-scoped 只读、页面创建/更新、FTS/grams 修复、本机与官方 DSH 固定响应验收 |
 | [21 DSH 0.2 适配](21-DSH-0.2适配.md) | 本地 clone 更新、bundle 兼容范围、公开发布、隔离 profile 安装与组合配置验收 |
+| [22 DSH rc.2 本机安装验证](22-DSH-rc2本机安装验证.md) | 官方 clone 重克隆、rc.2 构建、隔离安装、Web/Bridge/session 实测与边界 |
+| [23 Android Bridge 生产部署与连通验证](23-Android-Bridge生产部署与连通验证.md) | 生产 DSH profile 更新、缺失配置修复、回滚备份与 Android 模拟器连接验证 |
+| [24 Riko-Muse 交付记录](24-Riko-Muse交付记录.md) | doc7（M1/M2/M3）交付：迁移 0014、rupture/repair、alignment synthesis、compose opt-in、purge 闭包扩展、验证档位与未接线边界 |
 
 ## 30 秒状态
 
 ```
 根仓库 branch/HEAD：开工现场检查；D6 实施已有独立 Git 提交，当前 HEAD 以 `git rev-parse` 为准
-当前实现：D6-11—D6-15 已实施；schema 13（`0001`—`0010` 保持不变，追加 `0011`—`0013`）。官方 DSH HEAD `4878cdabd87d4041bdaff61d04c966883b9fd07a`；适配证据见 [21](21-DSH-0.2适配.md)。
-验证：当前 `cargo fmt --all -- --check`、`cargo test --workspace`、`cargo build --workspace` 通过；DSH adapter `npm test` 20/20 通过。官方 DSH + 固定响应跑通 Dream child 提取→Rust 候选/Active、主题页创建和更新；真实端点未调用。Android debug 构建通过并已装入模拟器，Bridge 的模型设置接口有本机确定性测试；生产服务器尚未部署。D6 具体结果见 [20](20-D6-11-15交付记录.md)。
-历史真实模型证据仍见 16—19 号记录；不得将那些样本延伸成 D6-11—15 新流程的真实模型验收。未验证：新 child workflow 的真实模型质量、主题整理语义质量、完整 E01—E25、规模性能、安装部署。dana/realtest 原库未打开、未升级。
+当前实现：D6-11—D6-15 已实施；schema 13（`0001`—`0010` 保持不变，追加 `0011`—`0013`）。官方 DSH HEAD `639ed015397290b3745d163aafe02ffee4aa3f84`（0.2.0-rc.2）；适配证据见 [22](22-DSH-rc2本机安装验证.md)。
+验证：当前 `cargo fmt --all -- --check`、`cargo test --workspace`、`cargo build --workspace` 通过；DSH adapter `npm test` 20/20 通过。官方 DSH + 固定响应跑通 Dream child 提取→Rust 候选/Active、主题页创建和更新；真实端点未调用。Android debug 构建通过并装入模拟器；生产 `riko.asia` Bridge 已部署 `@riko/riko-app-api@0.1.1`，Android 认证连接及模型设置读取已实测。尚未验证凭据写入、自定义 provider 保存/发现和通过该设置发起真实模型对话。D6 具体结果见 [20](20-D6-11-15交付记录.md)，生产 Android Bridge 证据见 [23](23-Android-Bridge生产部署与连通验证.md)。
+历史真实模型证据仍见 16—19 号记录；不得将那些样本延伸成 D6-11—15 新流程的真实模型验收。未验证：新 child workflow 的真实模型质量、主题整理语义质量、完整 E01—E25、规模性能、dana/realtest 用户库升级与 memoryd 生产部署。Riko-App Bridge 生产部署是独立状态，见 23。dana/realtest 原库未打开、未升级。
 数据库边界：dana/realtest 原库未打开或升级；任何迁移演练只用临时库/副本
-用户工作区：D6 规范、实现与交接记录已提交；官方 `deepseek-harness/` clone 当前有本地删除状态与临时构建目录，按只读边界保持原样。`MiMo-Code/`、`doc2/`、`doc3/`、`doc5/` 仍为本地参考目录，不纳入本项目提交。Riko-App 根目录不是 Git 仓库，其本地 Android 源码不在本仓库提交范围内。
+用户工作区：官方 `deepseek-harness/` 已重克隆为干净 rc.2 clone，保持未跟踪/只读；原有带删除状态的 clone 完整保留在 `%LOCALAPPDATA%\Temp\deepseek-harness-prior-20260929`。`MiMo-Code/`、`doc2/`、`doc3/`、`doc5/` 仍为本地参考目录，不纳入本项目提交。Riko-App 根目录不是 Git 仓库，其本地 Android 源码不在本仓库提交范围内；其 debug APK 已安装于 `emulator-5554` 并成功连通生产 Bridge（详细边界见 23）。
 ```
 
 ## 最重要的三条禁区

@@ -10,17 +10,18 @@
 - 记忆可信度由「可定位的用户证据 + Rust 准入规则」决定，模型输出只是候选。
 - 首版从空库开始，不迁移 Riko／Companion 旧数据；不做模型海试或大规模基准。
 
-## 2. 当前状态（2026-09-29）
+## 2. 当前状态（2026-10-06）
 
 ```
-当前基线：main（每次开工现场核对 branch、HEAD、status；不要依赖文档中的旧 SHA）
-DSH 适配：官方本地 clone 已更新到 `0.2.0-rc.1 / 4878cdabd87d4041bdaff61d04c966883b9fd07a`；Riko Memory bundle `0.5.1` 已发布，本地拆分后的 adapter 版本为 `0.5.2`、尚未发布。隔离 profile 安装与配置组合曾通过，完整插件激活/内核连接未验证。Riko-App Bridge 已拆分为根目录独立包 `riko-app-bridge/`，生产主机尚未更新；证据见 `doc-handoff/21-DSH-0.2适配.md`
+当前基线：分支 Riko-Muse（2026-10-06 自 main @ a870855 切出，Riko-Muse 工作未提交；每次开工现场核对 branch、HEAD、status；不要依赖文档中的旧 SHA）
+Riko-Muse（doc7/）：按用户决定依 Muse文档/ 实施内核增量（M1/M2/M3），schema 13→14（新增 0014_muse_alignment.sql；0001—0013 冻结不动）。M1 valid_until 到期自动转 expired（调度器+CLI expire-run，审计 actor=system）；M2 rupture 确定性规则检测（RUPTURE_CUES_V1 冻结清单，无 LLM）+ repair 线程 7 天归组与显式关线；M3 alignment synthesis 确定性派生（版本化、来源可溯）+ compose opt-in include_alignment（缺省响应与旧版同键同序）。新端点 alignment/repair/ruptures，CLI muse-scan；purge/retention 闭包扩展至新表。cargo test --workspace 172 项全过 + 临时库 CLI/HTTP 冒烟通过。真实 DSH/真实模型未调用；DSH 适配器消费 alignment 未接线；dana/realtest 原库未触碰。施工规范 doc7/README.md + doc7/01、doc7/02；交付记录 doc-handoff/24
+DSH 适配：官方本地 clone 已重克隆到 `0.2.0-rc.2 / 639ed015397290b3745d163aafe02ffee4aa3f84`。Riko-App Bridge `@riko/riko-app-api@0.1.1` 已安装到生产 `riko-dsh-runtime` 的 `web` profile；为适配服务器未设置的两个 env var，在 profile patch 中显式指定既有 token/会话注册表文件；备份见 `doc-handoff/23`。重启后，Android 模拟器已认证连接线上 Riko preset，并成功读取 health、model catalog、model-settings/提供商状态。模型凭据写入、自定义 provider 保存/发现、真实模型对话仍未验证。rc.2 本机独立 profile 证据见 `doc-handoff/22`，生产部署证据见 `doc-handoff/23`。
 v1（doc/ 卡 0–6）、v2（doc2/ 卡 V2-0…V2-6）、doc4（D4-0…D4-7）、doc5（D5-0…D5-6）：已交付；已验证档位见 doc-handoff/README.md
-现有内核 schema 13（迁移 0001—0013）；`0001`—`0013` 均冻结，新增迁移须从 `0014` 顺序递增；D5 新作业 extract_v3/admit_v2，历史版本按作业行冻结
+现有内核 schema 14（迁移 0001—0014；Riko-Muse 分支）；`0001`—`0013` 均冻结，新增迁移须从 `0015` 顺序递增；D5 新作业 extract_v3/admit_v2，历史版本按作业行冻结
 remember 直写内容护栏按用户决定全部解除；保留 scope、最新用户证据、逐字 span、幂等与审计（doc-handoff/12）
-D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DSH 固定响应证据见 doc-handoff/20。真实模型质量、全量 E01—E25、性能、用户库升级和部署仍未验证/未执行；新开发以 doc6 当前规范和最新交接记录为准
-用户库 dana/realtest 未升级；没有单独部署指令不得触碰，升级前先只读快照并按交接记录处理 index_dirty
-最新实施入口：doc-handoff/README.md + doc-handoff/20-D6-11-15交付记录.md + doc-handoff/21-DSH-0.2适配.md + doc6/README.md + doc6/08-施工任务卡.md
+D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DSH 固定响应证据见 doc-handoff/20。记忆内核真实模型质量、全量 E01—E25、性能、dana/realtest 升级与 memoryd 生产部署仍未验证/未执行；Riko-App Bridge 生产部署状态单列见 doc-handoff/23。新开发以 doc6/doc7 当前规范和最新交接记录为准（doc7 变更须先更新规范）
+用户库 dana/realtest 未升级；没有单独部署指令不得触碰，升级前先只读快照并按交接记录处理 index_dirty（注意：Riko-Muse 分支的二进制会把库自动迁到 schema 14）
+最新实施入口：doc-handoff/README.md + doc-handoff/24-Riko-Muse交付记录.md + doc-handoff/20-D6-11-15交付记录.md + doc-handoff/21-DSH-0.2适配.md + doc-handoff/22-DSH-rc2本机安装验证.md + doc-handoff/23-Android-Bridge生产部署与连通验证.md + doc6/README.md + doc6/08-施工任务卡.md + doc7/README.md + doc7/02-施工任务卡.md
 ```
 
 ## 3. 目录与只读边界
@@ -33,8 +34,10 @@ D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DS
 | `doc2/` | v2 施工规范（官方 DSH 源码事实 + 修复任务卡 + 运行手册） |
 | `doc5/` | doc5 记忆质量规则（产品决定与施工规范，已实施；未跟踪） |
 | `doc6/` | D6 产品与施工规范（D6-0—D6-15 已实施；人格/Soul、Resident、语义召回与合并、Dream、生命周期治理及受限 child 整理） |
+| `doc7/` | Riko-Muse 施工规范（Muse 增量能力 M1/M2/M3，schema 14；分支 Riko-Muse） |
+| `Muse文档/` | 璃对 Muse 记忆系统的逆向分析 + 与本仓库源码的对照（doc7 的立项依据；未跟踪） |
 | `doc-handoff/` | 交接文档：环境复现、已完成证据、待办与冲突、可复制交接 Prompt |
-| `deepseek-harness/` | 官方 DSH clone（`4878cdabd87d4041bdaff61d04c966883b9fd07a`，0.2.0-rc.1）——**未跟踪、只读参考**，不提交、不改源码 |
+| `deepseek-harness/` | 官方 DSH clone（`639ed015397290b3745d163aafe02ffee4aa3f84`，0.2.0-rc.2）——**未跟踪、只读参考**，不提交、不改源码 |
 | `EverOS/`、`hindsight/`、`tencentdb-agent-memory/` | 上游参考仓库，**只读**，算法来源见 `doc/02` |
 | `.workbuddy/` | 项目数据，**不要删除** |
 
