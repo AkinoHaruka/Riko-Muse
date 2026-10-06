@@ -1,6 +1,6 @@
 # Riko-Muse
 
-> [Riko-Memory](https://github.com/AkinoHaruka/Riko-Memory) 记忆内核的 **Muse 增量线**：`Riko-Muse` 分支独立成库，承载依 Muse 逆向文档实施的三项内核能力（M1/M2/M3，schema 13 → 14）。
+> [Riko-Memory](https://github.com/AkinoHaruka/Riko-Memory) 记忆内核的 **Muse 增量线**：`Riko-Muse` 分支独立成库，承载依 Muse 逆向文档实施的内核增量（M1—M4，schema 13 → 14）。
 
 Riko-Memory 是 Rust 优先的通用 Agent 长期记忆内核：claim（声明）为原子单位，Rust 服务端 `memoryd`（SQLite + HTTP v1）是唯一裁决者，模型输出只是候选；同一用户的多个 Agent 共享记忆，不同用户按服务端 Bearer 令牌隔离。
 
@@ -13,6 +13,7 @@ Riko-Memory 是 Rust 优先的通用 Agent 长期记忆内核：claim（声明�
 | **M1** | `valid_until` 到期自动转 `expired` | 15 分钟 tick 调度器 + CLI `expire-run`；CAS 转换、`memory_revisions` 审计（actor=system）、语义向量失效、索引标脏 |
 | **M2** | rupture（纠正/裂痕）+ repair（修复线程） | 确定性规则匹配用户消息（`RUPTURE_CUES_V1` 冻结清单，**无 LLM**）；线程 7 天窗口归组，显式关线写审计 |
 | **M3** | alignment synthesis（相处指南） | 确定性派生、版本递增、来源可溯（`source_refs_json` 记录 rupture/线程 ID）；经 compose **opt-in** 注入上下文 |
+| **M4** | `extract_v4` rewrite + `admit_v4` | 提取后批量改写候选以补齐显式主语；保留原始 quote、来源 span 和内容政策准入门。实现及同语料验收见 [doc7/03](doc7/03-extract_v4-rewrite.md) 与 [doc-handoff/25 §9](doc-handoff/25-Riko-Muse真实模型验收.md)。 |
 
 依据 Muse 文档自身的证伪结论，刻意**不做**：salience 显著度评分（已证伪）、向量检索主路径（词法 FTS5+中文二元字+RRF 优先，`semantic_vectors` 扩展位保留）、bank//MEMORY.md 等文件真相源层、Muse 的 forget plan/confirm 宿主流程（内核已有 forget + 防重放 + purge 两阶段）。完整范围冻结见 [doc7/README.md](doc7/README.md)。
 
