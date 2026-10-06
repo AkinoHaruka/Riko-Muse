@@ -13,7 +13,7 @@
 ## 2. 当前状态（2026-10-06）
 
 ```
-当前基线：分支 `Riko-Muse`；每次开工现场核对 branch、HEAD、status，不依赖文档中的旧 SHA。接手时 HEAD 为 `2033da9`（M1—M4 已提交）。工作区另有 Riko-App Bridge 0.1.2 未提交改动，尚未验证。
+当前基线：分支 `Riko-Muse`；每次开工现场核对 branch、HEAD、status，不依赖文档中的旧 SHA。接手时 HEAD 为 `2033da9`，V2-S1 交付提交为 `611ef7f`。工作区另有 Riko-App Bridge 0.1.2 未提交改动，尚未验证。
 Riko-Muse（doc7/）：schema 15（`0015_memory_domains.sql`；`0001`—`0014` 冻结不动）。M1 `valid_until` 到期自动转 expired；M2 确定性 rupture 检测 + repair 线程；M3 alignment synthesis + compose opt-in；M4 新增 `extract_v4` rewrite 与 `admit_v4`，同语料 Gemini 样本从 v3 的 0/14 active 到 v4 的 7/15 active，内容政策门保持生效。M1—M3 构建/测试及临时库 CLI/HTTP 冒烟见 doc-handoff/24；M4 真实模型观察和验证边界见 doc-handoff/25 §9。真实 DSH 闭环、DSH 适配器消费 alignment、dana/realtest 原库升级均未完成/未触碰。
 V2-S1 记忆域（Muse-V2迭代开发文档 02 / doc7/04）：内核与 HTTP 层已实施——域注册/会话绑定/跨域授权/证据域映射、`DomainScope` 读域集闭包、`[domains] enabled`（缺省 false）、7 个 `/v1/domains*` 管理端点、写路径（写域取自可信会话绑定）与读路径（域头 + 授权）接线、8 项 `v2_domain_tests`。`cargo test --workspace` 168 passed/0 failed，另有临时库 HTTP 冒烟。记录见 doc-handoff/26。**未接线**：Dream 作业域（`dream_worker.rs` 13 处 `/*DOM:dream-job-domain-pending*/`）、CLI 子命令（`main.rs` 17 处 `/*DOM*/`，按主域处理是本项目选择但未写入规范）；V2-P1/R1/D1/B1/A1/H1/Q1 未开工。
 DSH 适配：官方本地 clone `0.2.0-rc.2 / 639ed015397290b3745d163aafe02ffee4aa3f84`。Bridge `@riko/riko-app-api@0.1.1` 已安装到生产 `riko-dsh-runtime` 的 `web` profile；Android 已认证读取 health、model catalog、model-settings。凭据写入、自定义 provider 保存/发现和经 Android 设置发起真实模型对话仍未验证；证据见 `doc-handoff/22`、`23`。当前工作树中的 Bridge 0.1.2 修改尚未验证，也未部署。

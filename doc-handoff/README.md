@@ -54,8 +54,8 @@
 ## 30 秒状态
 
 ```
-根仓库 branch/HEAD：开工现场检查；本次观察时为 `Riko-Muse` / `2033da9`（V2-S1 交付尚未提交）。官方 DSH HEAD `639ed015397290b3745d163aafe02ffee4aa3f84`（0.2.0-rc.2）。
-当前实现：schema 15。Muse M1—M4 已提交（详见 [24](24-Riko-Muse交付记录.md)、[25 §9](25-Riko-Muse真实模型验收.md)）；**V2-S1 记忆域已实施但未提交**，见 [26](26-V2-S1记忆域交付记录.md)。Bridge `0.1.2` 正在工作树修改中，尚未验证/部署；生产仍为 `0.1.1`，状态和边界见 [23](23-Android-Bridge生产部署与连通验证.md)。
+根仓库 branch/HEAD：开工现场检查；本次观察时为 `Riko-Muse` / `611ef7f`（V2-S1 交付提交）。官方 DSH HEAD `639ed015397290b3745d163aafe02ffee4aa3f84`（0.2.0-rc.2）。
+当前实现：schema 15。Muse M1—M4 已提交（详见 [24](24-Riko-Muse交付记录.md)、[25 §9](25-Riko-Muse真实模型验收.md)）；**V2-S1 记忆域已实施并提交（`611ef7f`）**，见 [26](26-V2-S1记忆域交付记录.md)。Bridge `0.1.2` 正在工作树修改中，尚未验证/部署；生产仍为 `0.1.1`，状态和边界见 [23](23-Android-Bridge生产部署与连通验证.md)。
 验证：`cargo test --workspace` **168 passed / 0 failed**（含 V2-S1 的 8 项 `v2_domain_tests`）；`cargo fmt --all`、`cargo build --workspace` 通过；V2-S1 另有临时库 HTTP 冒烟（域管理端点、域头读、绑定写路径、授权跨读）。历史档位：M1—M3 的 172 项测试见 [24](24-Riko-Muse交付记录.md)，M4 的 156 项记录见 [25 §9](25-Riko-Muse真实模型验收.md)。未验证：真实 DSH 宿主闭环、adapter 对 alignment/域选择器的消费、Dream 作业域接线、整体记忆质量、规模性能、dana/realtest 用户库升级和 memoryd 生产部署。dana/realtest 原库未打开、未升级。
 数据库边界：dana/realtest 原库未打开或升级；任何迁移演练只用临时库/副本
 用户工作区：官方 `deepseek-harness/` 已重克隆为干净 rc.2 clone，保持未跟踪/只读；原有带删除状态的 clone 完整保留在 `%LOCALAPPDATA%\Temp\deepseek-harness-prior-20260929`。`MiMo-Code/`、`doc2/`、`doc3/`、`doc5/` 仍为本地参考目录，不纳入本项目提交。Riko-App 根目录不是 Git 仓库，其本地 Android 源码不在本仓库提交范围内；其 debug APK 已安装于 `emulator-5554` 并成功连通生产 Bridge（详细边界见 23）。
