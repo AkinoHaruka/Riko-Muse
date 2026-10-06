@@ -76,6 +76,11 @@ enum Commands {
         #[command(subcommand)]
         action: DerivedAction,
     },
+    /// V2-Q1 上下文条目（doc7/10 §5）：从可见 L0 事件确定性切块
+    Entries {
+        #[command(subcommand)]
+        action: EntriesAction,
+    },
     /// V2-B1 后台调度（doc7/08 §5）：只回答「该不该跑」，不触发任何调用
     Tasks {
         #[command(subcommand)]
@@ -269,6 +274,21 @@ enum JobAction {
         /// 运维原因 1—256 字符；不得填用户正文或密钥（写入审计）
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EntriesAction {
+    /// 重建本域条目（整体替换、batch_version 递增）
+    Refresh {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
 }
 
@@ -1123,6 +1143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/relationships/refresh", post(refresh_relationships))
                 .route("/v1/relationships/{entity_id}", get(get_relationship))
                 // V2-B1/A1（doc7/08 §5）：后台调度判定、任务回执与修复行动。
+                // V2-Q1（doc7/10 §5）：上下文条目（补充道，不改 claim/page）。
+                .route("/v1/entries/refresh", post(entries_refresh))
+                .route("/v1/entries/search", post(entries_search))
+                .route("/v1/entries/{entry_id}", get(get_entry))
                 .route("/v1/tasks/due", get(tasks_due))
                 .route("/v1/tasks/run", post(tasks_run))
                 .route(
@@ -1215,6 +1239,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+        Commands::Entries { action } => match action {
+            EntriesAction::Refresh {
+                config,
+                tenant,
+                user,
+                domain,
+            } => {
+                let cfg = Config::load(&config)?;
+                let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
+                let scope = ScopeKey {
+                    tenant_id: tenant,
+                    user_id: user,
+                };
+                let dom = cli_domain_scope(&store, &scope, &domain)?;
+                let o = store
+                    .entries_refresh(&scope, &dom)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "batch_version={} entries={} sources={} previous={}",
+                    o.batch_version, o.entries, o.sources, o.previous_entries
+                );
+                Ok(())
+            }
+        },
         Commands::Tasks { action } => match action {
             TasksAction::Due {
                 config,
@@ -4347,6 +4395,157 @@ async fn close_repair_action(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidField,
             &format!("关闭被拒: {e}"),
+        ),
+    }
+}
+
+// ---- V2-Q1 上下文条目端点（doc7/10 §5）----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntrySearchRequest {
+    query: String,
+    limit: Option<usize>,
+}
+
+async fn entries_refresh(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.entries_refresh(&scope, &dom) {
+        Ok(o) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "status": "ok",
+            "batch_version": o.batch_version,
+            "entries": o.entries,
+            "sources": o.sources,
+            "previous_entries": o.previous_entries,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("条目重建失败: {e}"),
+        ),
+    }
+}
+
+async fn entries_search(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    body: Result<Json<EntrySearchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    // entry 召回是**补充道**：不改 claim/page 两道，也不改 bundle 的既有分段语义。
+    match guard.entries_search(
+        &scope,
+        &dom,
+        &body.query,
+        body.limit.unwrap_or(8).clamp(1, 32),
+    ) {
+        Ok(r) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "hits": r.hits,
+            "count": r.hits.len(),
+            "skipped_stale": r.skipped_stale,
+            "lane": "entry",
+            "semantic_status": if state.embedding.is_some() { "configured" } else { "unavailable" },
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("条目检索失败: {e}"),
+        ),
+    }
+}
+
+async fn get_entry(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    AxumPath(entry_id): AxumPath<String>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.entry_get(&scope, &dom, &entry_id) {
+        Ok(Some(e)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "entry_id": e.entry_id,
+            "domain_id": e.domain_id,
+            "session_id": e.session_id,
+            "title": e.title,
+            "body": e.body,
+            "first_event_seq": e.first_event_seq,
+            "last_event_seq": e.last_event_seq,
+            "version": e.version,
+            "batch_version": e.batch_version,
+            "generator_version": memory_store_sqlite::entries::ENTRY_GENERATOR_VERSION,
+            "sources": e.sources,
+        }))
+        .into_response(),
+        Ok(None) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "条目不存在或来源已失效",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取条目失败: {e}"),
         ),
     }
 }

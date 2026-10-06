@@ -701,6 +701,40 @@ impl Store {
                      AND i.entity_id=relationship_entities.id)",
             params![scope.tenant_id, scope.user_id],
         )?;
+        // 7.7 V2-Q1（doc7/10 §3）：entry 闭包——删掉指向已不存在证据的来源行，
+        // 再删零来源条目与其词法索引；不允许没有来源的条目存活。
+        tx.execute(
+            "DELETE FROM entry_sources
+             WHERE tenant_id=?1 AND user_id=?2
+               AND evidence_id NOT IN (SELECT id FROM evidence_events
+                   WHERE tenant_id=?1 AND user_id=?2)",
+            params![scope.tenant_id, scope.user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM entry_fts WHERE entry_id IN (
+                 SELECT d.id FROM context_entries d
+                 WHERE d.tenant_id=?1 AND d.user_id=?2
+                   AND NOT EXISTS (SELECT 1 FROM entry_sources s
+                       WHERE s.tenant_id=d.tenant_id AND s.user_id=d.user_id AND s.entry_id=d.id))",
+            params![scope.tenant_id, scope.user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM entry_grams WHERE tenant_id=?1 AND user_id=?2 AND entry_id IN (
+                 SELECT d.id FROM context_entries d
+                 WHERE d.tenant_id=?1 AND d.user_id=?2
+                   AND NOT EXISTS (SELECT 1 FROM entry_sources s
+                       WHERE s.tenant_id=d.tenant_id AND s.user_id=d.user_id AND s.entry_id=d.id))",
+            params![scope.tenant_id, scope.user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM context_entries
+             WHERE tenant_id=?1 AND user_id=?2
+               AND NOT EXISTS (SELECT 1 FROM entry_sources s
+                   WHERE s.tenant_id=context_entries.tenant_id
+                     AND s.user_id=context_entries.user_id
+                     AND s.entry_id=context_entries.id)",
+            params![scope.tenant_id, scope.user_id],
+        )?;
         // 8. 记忆墓碑。
         tx.execute(
             "INSERT OR IGNORE INTO purge_tombstones (tenant_id, user_id, domain_id, source_kind, source_id, created_at)

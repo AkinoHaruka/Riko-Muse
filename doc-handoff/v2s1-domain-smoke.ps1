@@ -155,6 +155,30 @@ $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 $r = Call 'GET' "$b/v1/compact" $null 'user_main'
 Write-Output ("D1_COMPACT_MAIN_AFTER_GRANT=" + $r.status + " item_count=" + (($r.body | ConvertFrom-Json).item_count))
 
+# V2-Q1：上下文条目（doc7/10 §5）。确定性切块，不调用任何模型。
+$r = Call 'POST' "$b/v1/entries/refresh" @{ } 'side_a'
+$er = $r.body | ConvertFrom-Json
+Write-Output ("Q1_REFRESH=" + $r.status + " entries=" + $er.entries + " sources=" + $er.sources + " batch=" + $er.batch_version)
+$r = Call 'POST' "$b/v1/entries/search" @{ query='昆明' } 'side_a'
+$es = $r.body | ConvertFrom-Json
+Write-Output ("Q1_SEARCH=" + $r.status + " count=" + $es.count + " stale=" + $es.skipped_stale + " lane=" + $es.lane + " semantic=" + $es.semantic_status)
+if ($es.count -gt 0) {
+  $eid = $es.hits[0].entry_id
+  $r = Call 'GET' "$b/v1/entries/$eid" $null 'side_a'
+  $eg = $r.body | ConvertFrom-Json
+  Write-Output ("Q1_GET=" + $r.status + " sources=" + $eg.sources.Count + " generator=" + $eg.generator_version)
+  Write-Output ("Q1_VERBATIM=" + ($eg.body -like '*昆明*'))
+  Write-Output ("Q1_SPAN_OK=" + ($eg.sources[0].end_byte -gt 0))
+  Write-Output ("Q1_ENTRY_DOMAIN=" + $eg.domain_id + " requested=side_a")
+}
+$r = Call 'GET' "$b/v1/entries/no-such-entry" $null 'side_a'
+Write-Output ("Q1_GET_MISSING=" + $r.status)
+$r = Call 'POST' "$b/v1/entries/search" @{ query='昆明' } $null
+$esm = $r.body | ConvertFrom-Json
+# 注意：本脚本更早处已授予主域读 side_a（跨域读取），所以这里是「授权后可见」，
+# 不是域隔离失效；无授权时的隔离由 Rust 用例 entries_are_domain_scoped 断言。
+Write-Output ("Q1_MAIN_AFTER_GRANT=" + $r.status + " count=" + $esm.count)
+
 # V2-H1：bundle 分段（doc7/09 §2）
 $r = Call 'POST' "$b/v1/context/bundle" @{ agent_id='a'; query='昆明' } 'side_a'
 $seg = $r.body | ConvertFrom-Json

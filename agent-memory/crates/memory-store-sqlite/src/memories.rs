@@ -154,6 +154,11 @@ pub fn has_history_cue(query: &str) -> bool {
 }
 
 /// FTS5 MATCH 转义：每个 token 变 quoted term（doc/13 §6）。
+/// V2-Q1：entry 检索复用同一 FTS 查询构造（只暴露给 crate 内）。
+pub(crate) fn fts_match_query_pub(tokens: &[String]) -> Option<String> {
+    fts_match_query(tokens)
+}
+
 fn fts_match_query(tokens: &[String]) -> Option<String> {
     if tokens.is_empty() {
         return None;

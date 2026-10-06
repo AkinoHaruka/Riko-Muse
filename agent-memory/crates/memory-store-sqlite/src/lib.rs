@@ -122,6 +122,7 @@ pub mod diagnostics;
 pub mod domains;
 pub mod dream_jobs;
 pub mod dream_read;
+pub mod entries;
 pub mod evidence;
 pub mod explain;
 pub mod jobs;
@@ -145,6 +146,8 @@ mod v2_d1_tests;
 mod v2_domain_tests;
 #[cfg(test)]
 mod v2_p1_tests;
+#[cfg(test)]
+mod v2_q1_tests;
 #[cfg(test)]
 mod v2_r1_tests;
 

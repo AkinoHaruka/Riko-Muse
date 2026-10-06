@@ -54,7 +54,8 @@
 | [28 V2-D1 蒸馏与投影交付记录](28-V2-D1蒸馏与投影交付记录.md) | 迁移 0016（schema 16）、`facet_v1` 确定性四分面、compact 双预算与 Resident 去重、来源失效即时屏蔽、purge 闭包、`/v1/compact`+`/v1/facets`+`/v1/derived/refresh`、`memoryd export` 只读 Markdown 投影；含 4 个实施期缺陷 |
 | [29 V2-R1 关系图谱交付记录](29-V2-R1关系图谱交付记录.md) | 迁移 0017（schema 17）、`entity_v1` 确定性投影（两种句式 + 代词/长度/多候选拒绝规则）、索引/get/resolve、分级排序、来源失效即时屏蔽、purge 闭包、域隔离；含 3 个实施期缺陷与 THIRD_PARTY 政策边界（完整人物覆盖仍受限） |
 | [30 V2-B1/A1 后台闭环交付记录](30-V2-B1A1后台闭环交付记录.md) | 迁移 0018（schema 18）、处理账本、四项独立开关的调度纯函数与 Rust 侧信号计数、`rupture_v2` 目标分类（自我修正 FP / 漏检抱怨 FN 均修）、修复行动授权与复发观察；含 5 个实施期缺陷与「内容生成需真实模型」的边界 |
-| [31 V2-H1 宿主闭环交付记录](31-V2-H1宿主闭环交付记录.md) | **最新**：bundle 四段（compact/alignment/relationships/retrieved）+ 统一预算 + 候选级真去重、适配器按序注入且保留旧键回退、`memory_relationships`/`memory_facets` 工具；含 DSH clone HEAD 与 seam 现场核对事实。**真实 DSH + 真实模型闭环仍未验证** |
+| [31 V2-H1 宿主闭环交付记录](31-V2-H1宿主闭环交付记录.md) | bundle 四段（compact/alignment/relationships/retrieved）+ 统一预算 + 候选级真去重、适配器按序注入且保留旧键回退、`memory_relationships`/`memory_facets` 工具；含 DSH clone HEAD 与 seam 现场核对事实。**真实 DSH + 真实模型闭环仍未验证** |
+| [32 V2-Q1 上下文条目交付记录](32-V2-Q1上下文条目交付记录.md) | **最新**：迁移 0019（schema 19）、`entry_v1` 逐字切块、读时来源失效即时屏蔽、purge 闭包、entry 词法补充道与同语料三路对照；含 2 个实施期缺陷与「向量只入队不调模型」的边界 |
 
 ## 30 秒状态
 

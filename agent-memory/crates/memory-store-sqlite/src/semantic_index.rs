@@ -189,6 +189,27 @@ impl Store {
                     (v, content_sha256_hex(&fingerprint_text))
                 }))
             }
+            // V2-Q1（doc7/10 §7）：entry 也参与版本化绑定；向量只入队，不在这里调用模型。
+            // 条目内容即逐字正文，因此指纹 = title + body（version 由条目版本给出）。
+            "entry" => {
+                let row: Option<(i64, String, String)> = self
+                    .conn()
+                    .query_row(
+                        "SELECT version, title, body FROM context_entries
+                         WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='active'
+                           AND EXISTS (SELECT 1 FROM entry_sources s
+                             WHERE s.tenant_id=context_entries.tenant_id
+                               AND s.user_id=context_entries.user_id
+                               AND s.entry_id=context_entries.id)",
+                        params![scope.tenant_id, scope.user_id, object_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                Ok(row.map(|(v, title, body)| {
+                    let text = format!("{title}\n{body}");
+                    (v, content_sha256_hex(&text))
+                }))
+            }
             _ => Err(StoreError::StateConflict),
         }
     }
