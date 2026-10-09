@@ -62,6 +62,31 @@ pub struct ProposeAction<'a> {
     pub generator_version: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Commitment {
+    pub id: String,
+    pub memory_id: String,
+    pub kind: String,
+    pub due_at: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub fulfilled_at: Option<String>,
+}
+
+fn map_commitment(r: &rusqlite::Row<'_>) -> rusqlite::Result<Commitment> {
+    Ok(Commitment {
+        id: r.get(0)?,
+        memory_id: r.get(1)?,
+        kind: r.get(2)?,
+        due_at: r.get(3)?,
+        status: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        fulfilled_at: r.get(7)?,
+    })
+}
+
 fn map_action(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepairAction> {
     Ok(RepairAction {
         id: r.get(0)?,
@@ -602,6 +627,101 @@ impl Store {
                 unprocessed,
             },
         })
+    }
+
+    pub fn commitment_create(
+        &mut self,
+        scope: &ScopeKey,
+        memory_id: &str,
+        kind: &str,
+        due_at: Option<&str>,
+    ) -> Result<String, StoreError> {
+        if !["deadline", "reminder", "promise"].contains(&kind) {
+            return Err(StoreError::StateConflict);
+        }
+
+        let exists: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            params![scope.tenant_id, scope.user_id, memory_id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Err(StoreError::MemoryNotFound);
+        }
+
+        let id = Uuid::now_v7().to_string();
+        let now = now_rfc3339()?;
+        self.conn_mut().execute(
+            "INSERT INTO commitments
+               (id, memory_id, kind, due_at, status, created_at, updated_at, fulfilled_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5, NULL)",
+            params![id, memory_id, kind, due_at, now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn commitment_list(
+        &self,
+        scope: &ScopeKey,
+        status: Option<&str>,
+        due_before: Option<&str>,
+    ) -> Result<Vec<Commitment>, StoreError> {
+        let sql = "SELECT c.id, c.memory_id, c.kind, c.due_at, c.status, c.created_at, c.updated_at, c.fulfilled_at
+                   FROM commitments c
+                   JOIN memories m ON c.memory_id = m.id AND m.tenant_id = ?1 AND m.user_id = ?2
+                   WHERE (?3 IS NULL OR c.status = ?3)
+                     AND (?4 IS NULL OR (c.due_at IS NOT NULL AND c.due_at < ?4))
+                   ORDER BY c.due_at, c.created_at";
+        let mut stmt = self.conn().prepare(sql)?;
+        let rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, status, due_before],
+            map_commitment,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn commitment_fulfill(&mut self, scope: &ScopeKey, id: &str) -> Result<bool, StoreError> {
+        let now = now_rfc3339()?;
+        let n = self.conn_mut().execute(
+            "UPDATE commitments
+             SET status = 'fulfilled', fulfilled_at = ?3, updated_at = ?3
+             WHERE id = ?4
+               AND status IN ('pending', 'overdue')
+               AND memory_id IN (
+                   SELECT id FROM memories
+                   WHERE tenant_id = ?1 AND user_id = ?2
+               )",
+            params![scope.tenant_id, scope.user_id, now, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn commitment_cancel(&mut self, scope: &ScopeKey, id: &str) -> Result<bool, StoreError> {
+        let now = now_rfc3339()?;
+        let n = self.conn_mut().execute(
+            "UPDATE commitments
+             SET status = 'cancelled', updated_at = ?3
+             WHERE id = ?4
+               AND status IN ('pending', 'overdue')
+               AND memory_id IN (
+                   SELECT id FROM memories
+                   WHERE tenant_id = ?1 AND user_id = ?2
+               )",
+            params![scope.tenant_id, scope.user_id, now, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn commitment_tick_overdue(&mut self) -> Result<u64, StoreError> {
+        let now = now_rfc3339()?;
+        let n = self.conn_mut().execute(
+            "UPDATE commitments
+             SET status = 'overdue', updated_at = ?1
+             WHERE status = 'pending' AND due_at IS NOT NULL AND due_at < ?1",
+            params![now],
+        )?;
+        Ok(n as u64)
     }
 }
 

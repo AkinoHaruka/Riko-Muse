@@ -1161,6 +1161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "/v1/repair/actions/{action_id}/close",
                     post(close_repair_action),
                 )
+                .route("/v1/commitments", get(list_commitments).post(create_commitment))
+                .route("/v1/commitments/{id}/fulfill", post(fulfill_commitment))
+                .route("/v1/commitments/{id}/cancel", post(cancel_commitment))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -4395,6 +4398,194 @@ async fn close_repair_action(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidField,
             &format!("关闭被拒: {e}"),
+        ),
+    }
+}
+
+// ---- 承诺端点 ----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitmentsQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    due_before: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCommitmentRequest {
+    memory_id: String,
+    kind: String,
+    #[serde(default)]
+    due_at: Option<String>,
+}
+
+async fn list_commitments(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<CommitmentsQuery>,
+) -> Response {
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.commitment_list(&scope, query.status.as_deref(), query.due_before.as_deref()) {
+        Ok(list) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "count": list.len(),
+            "commitments": list,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取承诺列表失败: {e}"),
+        ),
+    }
+}
+
+async fn create_commitment(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    body: Result<Json<CreateCommitmentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "字段缺失、类型错误或含未知字段",
+            )
+        }
+    };
+    if body.kind != "deadline" && body.kind != "reminder" && body.kind != "promise" {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "kind 必须是 deadline|reminder|promise 之一",
+        );
+    }
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.commitment_create(&scope, &body.memory_id, &body.kind, body.due_at.as_deref()) {
+        Ok(id) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "id": id,
+        }))
+        .into_response(),
+        Err(StoreError::MemoryNotFound) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "引用的记忆不存在",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            &format!("创建承诺失败: {e}"),
+        ),
+    }
+}
+
+async fn fulfill_commitment(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.commitment_fulfill(&scope, &id) {
+        Ok(true) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "id": id,
+            "status": "fulfilled",
+        }))
+        .into_response(),
+        Ok(false) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "承诺不存在或状态不可达成",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("达成承诺失败: {e}"),
+        ),
+    }
+}
+
+async fn cancel_commitment(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let mut guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    match guard.commitment_cancel(&scope, &id) {
+        Ok(true) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "id": id,
+            "status": "cancelled",
+        }))
+        .into_response(),
+        Ok(false) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "承诺不存在或状态不可取消",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("取消承诺失败: {e}"),
         ),
     }
 }
