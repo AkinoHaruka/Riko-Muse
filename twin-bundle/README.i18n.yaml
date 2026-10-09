@@ -1,0 +1,43 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write packages/bundle/twin-bundle/README.md
+/:
+  en: 04b8d4f63fe84379
+  zh: 1745c22c681c3b55
+/deepseek-ai-dsh-twin-bundle:
+  en: e660426abce0f601
+  zh: 02fb00dd897e4410
+/deepseek-ai-dsh-twin-bundle/summary:
+  en: 299cff18d8fb7817
+  zh: 723761f2142f7c6c
+/deepseek-ai-dsh-twin-bundle/table-of-contents:
+  en: d152484eb41ac6b4
+  zh: 3eaa889f39470150
+/deepseek-ai-dsh-twin-bundle/use-this-package:
+  en: bbff250eba0f1b89
+  zh: b20a47f82d8ab6e0
+/deepseek-ai-dsh-twin-bundle/use-this-package/install-into-a-profile:
+  en: 0cdca5095cc4bb2c
+  zh: fcfdac8eceb4d28d
+/deepseek-ai-dsh-twin-bundle/use-this-package/what-you-get:
+  en: 64c2cbde1493d4ba
+  zh: f0da706cf3eec6eb
+/deepseek-ai-dsh-twin-bundle/understand-the-implementation:
+  en: b89035cf32156779
+  zh: 86ffb7a68aaddae9
+/deepseek-ai-dsh-twin-bundle/further-exploration:
+  en: bdafb05394161d5e
+  zh: 0da652ea239858f7
+/deepseek-ai-dsh-twin-bundle/model-experience:
+  en: 6cebcc714927d403
+  zh: 72374ddd4c6c04e1
+/deepseek-ai-dsh-twin-bundle/model-experience/kv-cache-effect:
+  en: 33970f21c0e50f7b
+  zh: 43fd67520930ef51
+/deepseek-ai-dsh-twin-bundle/known-limitations-and-deferred-work:
+  en: 2373272592732196
+  zh: c7b87f30a4a4fd0e
+/deepseek-ai-dsh-twin-bundle/known-limitations-and-deferred-work/dev-note:
+  en: e67f633dc6fe7773
+  zh: bd8a8936229e035e

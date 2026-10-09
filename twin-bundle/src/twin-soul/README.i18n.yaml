@@ -1,0 +1,10 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write packages/bundle/twin-bundle/src/twin-soul/README.md
+/twin-soul:
+  en: 0f8fee2cb7f65c49
+  zh: 1a39e5ee05606942
+/twin-soul/responsibility-and-next-integration:
+  en: 29efe39e2a5dfb73
+  zh: 98ab5664d3c80498

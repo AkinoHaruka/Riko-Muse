@@ -1,0 +1,10 @@
+# Independent Twin plugin rows. Add a profile patch targeting one id to disable it.
+- insert:
+    - id: twin-memory
+      name: 'twin-bundle/twin-memory'
+    - id: twin-soul
+      name: 'twin-bundle/twin-soul'
+    - id: twin-dream
+      name: 'twin-bundle/twin-dream'
+    - id: twin-companion
+      name: 'twin-bundle/twin-companion'
