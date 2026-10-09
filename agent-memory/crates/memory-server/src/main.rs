@@ -1166,6 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/commitments/{id}/cancel", post(cancel_commitment))
                 .route("/v1/recall/log", get(list_recall_log))
                 .route("/v1/recall/log/{id}", get(get_recall_log))
+                .route("/v1/candidates", get(list_candidates_http))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -4666,6 +4667,93 @@ async fn get_recall_log(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal,
             &format!("读取召回日志失败: {e}"),
+        ),
+    }
+}
+
+// ---- F4：held candidates HTTP 只读视图 ----
+
+#[derive(Debug, Deserialize)]
+struct CandidatesQuery {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_candidates_http(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<CandidatesQuery>,
+) -> Response {
+    // 只允许 status=held（只读视图专注于 held 队列）
+    let status = query.status.as_deref().unwrap_or("held");
+    if status != "held" {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "本接口仅支持 status=held",
+        );
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            );
+        }
+    };
+    match guard.list_candidates(&scope, "held", limit as usize, None) {
+        Ok(list) => {
+            let mut items = Vec::with_capacity(list.len());
+            for item in list {
+                let (evidence_quote, claim_text, kind, reason_code, created_at, id) =
+                    match guard.get_candidate(&scope, &item.id) {
+                        Ok(Some(detail)) => (
+                            detail.quote.clone(),
+                            detail.quote,
+                            detail.kind,
+                            detail.reason_code,
+                            detail.created_at,
+                            detail.id,
+                        ),
+                        Ok(None) => (
+                            String::new(),
+                            String::new(),
+                            item.kind,
+                            item.reason_code,
+                            item.created_at,
+                            item.id,
+                        ),
+                        Err(e) => {
+                            return err(
+                                &req_id.0,
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                ErrorCode::Internal,
+                                &format!("读取候选详情失败: {e}"),
+                            );
+                        }
+                    };
+                items.push(serde_json::json!({
+                    "id": id,
+                    "claim_text": claim_text,
+                    "kind": kind,
+                    "reason_code": reason_code,
+                    "created_at": created_at,
+                    "evidence_quote": evidence_quote,
+                }));
+            }
+            Json(items).into_response()
+        }
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取候选列表失败: {e}"),
         ),
     }
 }
