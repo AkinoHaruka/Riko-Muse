@@ -141,6 +141,8 @@ pub mod soul;
 #[cfg(test)]
 mod f1_commitment_tests;
 #[cfg(test)]
+mod f2_recall_log_tests;
+#[cfg(test)]
 mod v2_background_tests;
 #[cfg(test)]
 mod v2_d1_tests;

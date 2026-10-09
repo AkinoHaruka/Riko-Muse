@@ -72,7 +72,7 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
         })
         .unwrap();
     // 按迁移纪律随新增迁移同步：0020（增补篇 F1 commitment）起为 20。
-    assert_eq!(applied, 20);
+    assert_eq!(applied, 21);
     assert_eq!(
         store
             .dream_live_runner_count("9999-01-01T00:00:00Z")

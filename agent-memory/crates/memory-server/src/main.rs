@@ -1164,6 +1164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/commitments", get(list_commitments).post(create_commitment))
                 .route("/v1/commitments/{id}/fulfill", post(fulfill_commitment))
                 .route("/v1/commitments/{id}/cancel", post(cancel_commitment))
+                .route("/v1/recall/log", get(list_recall_log))
+                .route("/v1/recall/log/{id}", get(get_recall_log))
                 .route("/v1/memories/{memory_id}/correct", post(correct_memory))
                 .route("/v1/memories/{memory_id}/forget", post(forget_memory))
                 .route("/v1/memories/{memory_id}/retire", post(retire_memory))
@@ -4590,6 +4592,84 @@ async fn cancel_commitment(
     }
 }
 
+// ---- 召回日志端点 ----
+
+#[derive(Debug, Deserialize)]
+struct RecallLogQuery {
+    limit: Option<i64>,
+    query_like: Option<String>,
+}
+
+async fn list_recall_log(
+    State(state): State<AppState>,
+    Extension(req_id): Extension<RequestId>,
+    axum::extract::Query(query): axum::extract::Query<RecallLogQuery>,
+) -> Response {
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            );
+        }
+    };
+    let limit = query.limit.unwrap_or(50);
+    match guard.recall_log_list(limit, query.query_like.as_deref()) {
+        Ok(entries) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "count": entries.len(),
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取召回日志列表失败: {e}"),
+        ),
+    }
+}
+
+async fn get_recall_log(
+    State(state): State<AppState>,
+    Extension(req_id): Extension<RequestId>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let guard = match state.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            );
+        }
+    };
+    match guard.recall_log_get(id) {
+        Ok(Some(entry)) => Json(serde_json::json!({
+            "request_id": req_id.0,
+            "entry": entry,
+        }))
+        .into_response(),
+        Ok(None) => err(
+            &req_id.0,
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "召回日志不存在",
+        ),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &format!("读取召回日志失败: {e}"),
+        ),
+    }
+}
+
 // ---- V2-Q1 上下文条目端点（doc7/10 §5）----
 
 #[derive(Debug, Deserialize)]
@@ -5351,6 +5431,21 @@ async fn search_memories(
     );
     match result {
         Ok((hits, degraded)) => {
+            let hit_ids: Vec<String> = hits.iter().map(|h| h.memory_id.clone()).collect();
+            let hit_ids_json = serde_json::to_string(&hit_ids).unwrap_or_default();
+            // 写入 recall 日志（失败不影响主流程）
+            {
+                if let Ok(mut guard) = state.store.lock() {
+                    let _ = guard.recall_log_write(
+                        &body.query,
+                        &hit_ids_json,
+                        None,  // scores 暂不记录
+                        None,  // rank 暂不记录
+                        None,  // cutoff_reason 暂不记录
+                        None,  // excluded 暂不记录
+                    );
+                }
+            }
             let items: Vec<serde_json::Value> = hits
                 .into_iter()
                 .map(|h: SearchHit| {

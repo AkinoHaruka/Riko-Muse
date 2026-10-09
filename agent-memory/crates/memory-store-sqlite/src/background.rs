@@ -6,7 +6,7 @@
 
 use memory_domain::{DomainScope, ScopeKey};
 use rusqlite::{params, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{now_rfc3339, Store, StoreError};
@@ -84,6 +84,31 @@ fn map_commitment(r: &rusqlite::Row<'_>) -> rusqlite::Result<Commitment> {
         created_at: r.get(5)?,
         updated_at: r.get(6)?,
         fulfilled_at: r.get(7)?,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecallLogEntry {
+    pub id: i64,
+    pub ts: String,
+    pub query: String,
+    pub hit_ids: String, // JSON
+    pub scores: Option<String>,
+    pub rank: Option<String>,
+    pub cutoff_reason: Option<String>,
+    pub excluded: Option<String>,
+}
+
+fn map_recall_log(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecallLogEntry> {
+    Ok(RecallLogEntry {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        query: r.get(2)?,
+        hit_ids: r.get(3)?,
+        scores: r.get(4)?,
+        rank: r.get(5)?,
+        cutoff_reason: r.get(6)?,
+        excluded: r.get(7)?,
     })
 }
 
@@ -720,6 +745,60 @@ impl Store {
              SET status = 'overdue', updated_at = ?1
              WHERE status = 'pending' AND due_at IS NOT NULL AND due_at < ?1",
             params![now],
+        )?;
+        Ok(n as u64)
+    }
+
+    pub fn recall_log_write(
+        &mut self,
+        query: &str,
+        hit_ids: &str,
+        scores: Option<&str>,
+        rank: Option<&str>,
+        cutoff_reason: Option<&str>,
+        excluded: Option<&str>,
+    ) -> Result<i64, StoreError> {
+        let ts = now_rfc3339()?;
+        self.conn_mut().execute(
+            "INSERT INTO recall_log (ts, query, hit_ids, scores, rank, cutoff_reason, excluded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![ts, query, hit_ids, scores, rank, cutoff_reason, excluded],
+        )?;
+        Ok(self.conn().last_insert_rowid())
+    }
+
+    pub fn recall_log_list(
+        &self,
+        limit: i64,
+        query_like: Option<&str>,
+    ) -> Result<Vec<RecallLogEntry>, StoreError> {
+        let pattern = query_like.map(|q| format!("%{q}%"));
+        let sql = "SELECT id, ts, query, hit_ids, scores, rank, cutoff_reason, excluded
+                   FROM recall_log
+                   WHERE (?1 IS NULL OR query LIKE ?1)
+                   ORDER BY id DESC
+                   LIMIT ?2";
+        let mut stmt = self.conn().prepare(sql)?;
+        let rows = stmt.query_map(params![pattern, limit], map_recall_log)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn recall_log_get(&self, id: i64) -> Result<Option<RecallLogEntry>, StoreError> {
+        let sql = "SELECT id, ts, query, hit_ids, scores, rank, cutoff_reason, excluded
+                   FROM recall_log
+                   WHERE id = ?1";
+        let entry = self
+            .conn()
+            .query_row(sql, params![id], map_recall_log)
+            .optional()?;
+        Ok(entry)
+    }
+
+    pub fn recall_log_retention(&mut self, days: i64) -> Result<u64, StoreError> {
+        let n = self.conn_mut().execute(
+            "DELETE FROM recall_log
+             WHERE datetime(ts) < datetime('now', '-' || ?1 || ' days')",
+            params![days],
         )?;
         Ok(n as u64)
     }
