@@ -35,7 +35,8 @@ D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DS
 
 | 路径 | 性质 |
 |---|---|
-| `agent-memory/` | 记忆内核唯一实现目录：`crates/`（Rust）、`migrations/`、`adapters/dsh/`（仅记忆适配器）、`config.example.toml`、`README.md` |
+| riko-memory/` | 记忆内核唯一实现目录：`crates/`（Rust）、`migrations/`、`config.example.toml`、`README.md` |
+| `riko-dsh/` | DSH 插件（TypeScript）：记忆宿主适配器，通过 HTTP 调用 riko-memory；独立安装 |
 | `riko-app-bridge/` | 独立 DSH Host bundle：Riko-App HTTP Bridge；不属于记忆插件，单独构建、测试与安装 |
 | `doc/` | v1 规范：目标、数据模型、HTTP v1、算法契约、任务卡 |
 | `doc2/` | v2 施工规范（官方 DSH 源码事实 + 修复任务卡 + 运行手册） |
@@ -78,13 +79,13 @@ D6-0—D6-15 已有实现；D6-11—D6-15 的 Rust/TypeScript 检查与官方 DS
 
 ```bash
 # Rust 内核
-cd agent-memory && cargo build --workspace && cargo test --workspace
+cd riko-memory && cargo build --workspace && cargo test --workspace
 ./target/debug/memoryd serve --config <本机 config.toml>     # 版本/健康：curl /v1/version /v1/health
 ./target/debug/memoryd principal add --tenant <t> --user <u> --token-out <file> --db <db>
 ./target/debug/memoryd doctor|rebuild-index|backup --config <file>
 
 # DSH 适配器（依赖官方 clone 先构建）
-cd agent-memory/adapters/dsh && npm install
+cd riko-dsh && npm install
 ./node_modules/.bin/tsc --noEmit -p tsconfig.json && ./node_modules/.bin/tsc -p tsconfig.json
 
 # 官方 DSH clone（本机已装好，一般无需重跑）

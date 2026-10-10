@@ -60,8 +60,8 @@
                     * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
                     * Please avoid commands that may produce a very large amount of output.
                     * Please run long lived commands in the background, e.g. 'Start-Job' or 'Start-Process'.
-          - id: agent-memory
-            name: '@agent-memory/dsh-adapter'
+          - id: riko-dsh
+            name: '@riko/dsh'
             disabled: !!js "!(process.env.AGENT_MEMORY_TOKEN_FILE && process.env.AGENT_MEMORY_SPOOL_DIR && process.env.AGENT_MEMORY_HOST_ID)"
             config:
               memoryUrl: http://127.0.0.1:8791

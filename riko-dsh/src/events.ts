@@ -220,7 +220,7 @@ export class EventPipeline {
       this.logger.warn("CAPTURE_GAP: 未装载 sessionQuery，无法对已知 session 定点对账");
     }
     this.logger.info?.(
-      "agent-memory: 未覆盖窗口声明——首次捕获前即崩溃的 session 无法枚举，不能自动恢复",
+      "riko-dsh: 未覆盖窗口声明——首次捕获前即崩溃的 session 无法枚举，不能自动恢复",
     );
   }
 
@@ -458,7 +458,7 @@ export class EventPipeline {
       if (result.failure === "unauthorized") {
         this.unauthorizedPaused = true;
         this.logger.error(
-          `agent-memory: 内核返回 401，暂停该令牌全部出站发送；请检查 userTokenFile 配置（spool 保留，换令牌后可继续）`,
+          `riko-dsh: 内核返回 401，暂停该令牌全部出站发送；请检查 userTokenFile 配置（spool 保留，换令牌后可继续）`,
         );
         return;
       }
@@ -466,7 +466,7 @@ export class EventPipeline {
         this.permanentlyBroken.add(sessionId);
         const err = (result.body ?? {}) as { error?: { code?: string } };
         this.logger.error(
-          `agent-memory: 内核永久拒绝 op=${item.op.opId} status=${result.status} code=${err.error?.code ?? "?"} request_id=${result.requestId ?? "?"}；该 session 停止发送，等待修复映射/冲突`,
+          `riko-dsh: 内核永久拒绝 op=${item.op.opId} status=${result.status} code=${err.error?.code ?? "?"} request_id=${result.requestId ?? "?"}；该 session 停止发送，等待修复映射/冲突`,
         );
         return;
       }
@@ -501,7 +501,7 @@ export class EventPipeline {
         return true;
       }
       this.logger.error(
-        `agent-memory: 内核协议不兼容 protocol_version=${body.protocol_version ?? "?"}（适配器=1），暂停出站请求`,
+        `riko-dsh: 内核协议不兼容 protocol_version=${body.protocol_version ?? "?"}（适配器=1），暂停出站请求`,
       );
       return false;
     }

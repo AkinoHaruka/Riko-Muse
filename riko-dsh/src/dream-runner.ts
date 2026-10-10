@@ -324,7 +324,7 @@ export class DreamRunner {
     try {
       if (!this.validParent(agent)) return;
       const request: SubagentStartRequest = {
-        label: `agent-memory:${work.phase}`,
+        label: `riko-dsh:${work.phase}`,
         prompt: [{ type: "text", text: textPrompt(work) }],
         parent: agent,
         signal,

@@ -1,11 +1,11 @@
 {
-  "name": "@agent-memory/dsh-adapter",
+  "name": "@riko/dsh",
   "version": "0.5.2",
   "description": "Riko Memory 的 DSH Riko preset bundle 与记忆宿主适配器",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AkinoHaruka/Riko-Memory.git",
-    "directory": "adapters/dsh"
+    "directory": "riko-dsh"
   },
   "type": "module",
   "main": "dist/index.js",

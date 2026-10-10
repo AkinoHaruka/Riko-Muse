@@ -103,7 +103,7 @@ function toToolResult(
   }
   if (USER_FIXABLE.has(code)) return { ok: false, error: { code, message } };
   // 基础设施/协议错误：抛出并记录 request_id，不把失败包装成成功。
-  throw new Error(`agent-memory 内核错误 code=${code} request_id=${r.requestId ?? "?"}: ${message}`);
+  throw new Error(`riko-memory 内核错误 code=${code} request_id=${r.requestId ?? "?"}: ${message}`);
 }
 
 export function buildMemoryTools(svc: ToolServices): ToolDefinition[] {

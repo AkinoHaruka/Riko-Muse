@@ -21,7 +21,7 @@ import { EventPipeline, isCapturableSessionHeader, type GapChecker, type Logger 
 import { Spool } from "./spool.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
-export const name = "agent-memory";
+export const name = "riko-dsh";
 export const inject = ["tools", "subagents"];
 
 /** D6 capability（doc6/06 §1）：v6 注入（Soul section + bundle 前插）所需。 */
@@ -47,7 +47,7 @@ function makeLogger(ctx: Context): Logger {
 function readToken(path: string): string {
   // ESM import（G-02 修复）：禁止裸 require。
   const token = readFileSync(path, "utf8").trim();
-  if (!token) throw new Error(`agent-memory: 令牌文件为空: ${path}`);
+  if (!token) throw new Error(`riko-dsh: 令牌文件为空: ${path}`);
   return token;
 }
 
@@ -141,7 +141,7 @@ class AgentMemoryPlugin {
           || binding.parentAgentId === String(child.id)) return;
         const scoped = child.ctx as { tools?: { register(definition: unknown): () => void } };
         if (!scoped.tools || typeof scoped.tools.register !== "function") {
-          throw new Error("agent-memory: DSH Dream child 没有 scoped tools.register；拒绝以全局工具替代");
+          throw new Error("riko-dsh: DSH Dream child 没有 scoped tools.register；拒绝以全局工具替代");
         }
         for (const tool of buildDreamReadTools(this.client, binding, String(child.id))) {
           scoped.tools.register(tool);
@@ -164,7 +164,7 @@ class AgentMemoryPlugin {
     }
 
     this.logger.info?.(
-      `agent-memory: 已加载 capture=${this.cfg.captureEnabled} injection=${this.cfg.injectionEnabled} `
+      `riko-dsh: 已加载 capture=${this.cfg.captureEnabled} injection=${this.cfg.injectionEnabled} `
       + `tools=${this.cfg.toolsEnabled} contextBundle=${this.cfg.contextBundleEnabled}`,
     );
   }
@@ -184,7 +184,7 @@ class AgentMemoryPlugin {
       throw new Error(`${detail}；requireContextBundle=true，拒绝装载（不落回旧注入模式）`);
     }
     this.cfg = { ...this.cfg, contextBundleEnabled: false, injectionEnabled: false };
-    this.logger.error?.(`agent-memory: ${detail}；已停用全部自动注入（capture 与工具不受影响）`);
+    this.logger.error?.(`riko-dsh: ${detail}；已停用全部自动注入（capture 与工具不受影响）`);
   }
 
   /** 注册 system-prompt/assemble waterfall：唯一 Soul system section。 */
@@ -257,12 +257,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     void plugin.dispose().catch((e: unknown) => {
       // 收尾失败只记录：未 ack spool 已保留，不影响 DSH。
       const anyCtx = ctx as { logger?: { error(m: string): void } };
-      anyCtx.logger?.error(`agent-memory: 卸载收尾异常: ${String(e)}`);
+      anyCtx.logger?.error(`riko-dsh: 卸载收尾异常: ${String(e)}`);
     });
   });
   plugin.start().catch((e: unknown) => {
     const anyCtx = ctx as { logger?: { error(m: string): void } };
-    anyCtx.logger?.error(`agent-memory: 启动失败: ${e instanceof Error ? e.message : String(e)}`);
+    anyCtx.logger?.error(`riko-dsh: 启动失败: ${e instanceof Error ? e.message : String(e)}`);
     throw e;
   });
 }

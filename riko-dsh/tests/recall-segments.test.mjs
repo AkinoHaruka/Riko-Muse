@@ -38,7 +38,7 @@ test("segments are injected in order as separate user-role messages", async () =
   assert.equal(out.messages.length, 2);
   assert.equal(out.messages[0].source.form, "compact");
   assert.equal(out.messages[1].source.form, "retrieved");
-  for (const m of out.messages) assert.equal(m.source.kind, "agent-memory");
+  for (const m of out.messages) assert.equal(m.source.kind, "riko-memory");
   const compactText = out.messages[0].content.map((b) => b.text).join("\n");
   assert.match(compactText, /住在昆明/);
   assert.match(compactText, /riko:\/\/memory\/t\/u\/user_main\/m1@1/);
