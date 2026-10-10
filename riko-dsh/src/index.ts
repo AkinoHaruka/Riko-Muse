@@ -19,10 +19,11 @@ import { MemoryClient } from "./client.js";
 import { loadConfig, type AdapterConfig } from "./config.js";
 import { EventPipeline, isCapturableSessionHeader, type GapChecker, type Logger } from "./events.js";
 import { Spool } from "./spool.js";
+import { registerTwinSoul } from "./soul.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
 export const name = "riko-dsh";
-export const inject = ["tools", "subagents"];
+export const inject = ["tools", "subagents", "systemPrompt"];
 
 /** D6 capability（doc6/06 §1）：v6 注入（Soul section + bundle 前插）所需。 */
 const REQUIRED_CAPABILITY = "context_bundle_v1";
@@ -252,6 +253,7 @@ class AgentMemoryPlugin {
 /** Cordis 插件入口：apply 必须同步完成装载契约，异步启动错误要可见。 */
 export function apply(ctx: Context, config: Config = {}): void {
   const plugin = new AgentMemoryPlugin(ctx, config);
+  registerTwinSoul(ctx);
   // ctx.effect：卸载时由宿主回收；dispose 返回 Promise，由 Cordis 等待真实收尾。
   (ctx as { effect: (register: () => (() => void) | Promise<void>) => void }).effect(() => () => {
     void plugin.dispose().catch((e: unknown) => {

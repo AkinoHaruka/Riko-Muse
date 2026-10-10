@@ -26,6 +26,10 @@ The default memory service address is `http://127.0.0.1:8791`. If the service us
 
 The token file must remain outside Git and outside the plugin package. Do not put token contents in the profile patch or environment variable; only the token file path is configured.
 
+## Twin personality
+
+The bundle includes an editable `soul.md` at the `@riko/dsh` package root. It is injected as the `twin-soul` system prompt section and watched while DSH is running, so saving the file takes effect without a restart. Set `RIKO_DSH_SOUL_FILE` to an absolute or relative path to use a different local file. The file-based section is independent of the API-backed `riko-dsh:soul` section; both are included in the assembled prompt.
+
 ## Riko-App API Bridge
 
 The Android app's HTTP bridge is a separate DSH bundle in the repository's `riko-app-bridge/` directory. Install it independently from this memory adapter. It owns the `/riko-app-api/v1` routes, model settings proxy, app-only bearer token, and Riko-App session registry. See `../../../riko-app-bridge/README.md` for installation and configuration. Installing this memory bundle alone does not install or activate the Bridge.
