@@ -33,3 +33,19 @@ test("case insensitive matching", () => {
   assert.equal(decideApproval("RM")?.kind, "ask");
   assert.equal(decideApproval("Curl")?.kind, "ask");
 });
+
+test("invalid regex in RIKO_DSH_SENSITIVE_TOOLS is skipped without throwing", () => {
+  const orig = process.env.RIKO_DSH_SENSITIVE_TOOLS;
+  try {
+    process.env.RIKO_DSH_SENSITIVE_TOOLS = "[unclosed_regex, safe_extra_tool";
+    // Should not throw SyntaxError
+    assert.equal(decideApproval("read_file"), null);
+    assert.equal(decideApproval("safe_extra_tool")?.kind, "ask");
+  } finally {
+    if (orig === undefined) {
+      delete process.env.RIKO_DSH_SENSITIVE_TOOLS;
+    } else {
+      process.env.RIKO_DSH_SENSITIVE_TOOLS = orig;
+    }
+  }
+});

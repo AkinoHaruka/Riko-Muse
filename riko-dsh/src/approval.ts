@@ -31,11 +31,15 @@ const SENSITIVE_PATTERNS: RegExp[] = [
 /** Extra patterns from config (comma-separated). */
 function extraPatterns(): RegExp[] {
   const raw = process.env.RIKO_DSH_SENSITIVE_TOOLS ?? "";
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => new RegExp(s, "i"));
+  const patterns: RegExp[] = [];
+  for (const s of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    try {
+      patterns.push(new RegExp(s, "i"));
+    } catch (err) {
+      console.warn(`[riko-dsh] Invalid regex pattern in RIKO_DSH_SENSITIVE_TOOLS: "${s}"`, err);
+    }
+  }
+  return patterns;
 }
 
 function isSensitive(toolName: string): boolean {

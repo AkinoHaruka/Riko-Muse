@@ -89,6 +89,14 @@ fn commitment_four_state_lifecycle() {
     let list = store.commitment_list(&scope, Some("cancelled"), None).unwrap();
     let item = list.iter().find(|c| c.id == c2).expect("commitment c2 is cancelled");
     assert_eq!(item.status, "cancelled");
+
+    // 6. exists 与 get 验证
+    assert!(store.commitment_exists(&scope, &c1).unwrap());
+    assert_eq!(store.commitment_get(&scope, &c1).unwrap().unwrap().status, "fulfilled");
+    assert!(store.commitment_exists(&scope, &c2).unwrap());
+    assert_eq!(store.commitment_get(&scope, &c2).unwrap().unwrap().status, "cancelled");
+    assert!(!store.commitment_exists(&scope, "non-existent-id").unwrap());
+    assert!(store.commitment_get(&scope, "non-existent-id").unwrap().is_none());
 }
 
 #[test]

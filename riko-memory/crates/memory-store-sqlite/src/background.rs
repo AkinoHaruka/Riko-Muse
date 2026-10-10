@@ -706,6 +706,37 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn commitment_get(
+        &self,
+        scope: &ScopeKey,
+        id: &str,
+    ) -> Result<Option<Commitment>, StoreError> {
+        let sql = "SELECT c.id, c.memory_id, c.kind, c.due_at, c.status, c.created_at, c.updated_at, c.fulfilled_at
+                   FROM commitments c
+                   JOIN memories m ON c.memory_id = m.id AND m.tenant_id = ?1 AND m.user_id = ?2
+                   WHERE c.id = ?3";
+        let mut stmt = self.conn().prepare(sql)?;
+        let mut rows = stmt.query_map(
+            params![scope.tenant_id, scope.user_id, id],
+            map_commitment,
+        )?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn commitment_exists(&self, scope: &ScopeKey, id: &str) -> Result<bool, StoreError> {
+        let count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM commitments c
+             JOIN memories m ON c.memory_id = m.id AND m.tenant_id = ?1 AND m.user_id = ?2
+             WHERE c.id = ?3",
+            params![scope.tenant_id, scope.user_id, id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn commitment_fulfill(&mut self, scope: &ScopeKey, id: &str) -> Result<bool, StoreError> {
         let now = now_rfc3339()?;
         let n = self.conn_mut().execute(

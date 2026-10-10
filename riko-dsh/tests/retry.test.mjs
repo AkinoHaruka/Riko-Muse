@@ -1,7 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-const { decideRetry, clearRetryState } = await import("../dist/retry.js");
+const {
+  decideRetry,
+  clearRetryState,
+  recordAttempt,
+  getAttemptCount,
+  deleteAttempt,
+  getAttemptsSize,
+  MAX_ATTEMPTS,
+  ATTEMPTS_TTL_MS,
+} = await import("../dist/retry.js");
 
 function failure(overrides = {}) {
   return { message: "error", code: "UNKNOWN", ...overrides };
@@ -55,4 +64,31 @@ test("other errors retry once", () => {
   clearRetryState();
   assert.equal(decideRetry(failure({ status: 500 }), 0).action?.kind, "retry");
   assert.equal(decideRetry(failure({ status: 500 }), 1).action, undefined);
+});
+
+test("attempts map expires keys after TTL", () => {
+  clearRetryState();
+  const now = Date.now();
+  recordAttempt("req-1", 1, now);
+  assert.equal(getAttemptCount("req-1", now), 1);
+
+  // Still active within TTL
+  assert.equal(getAttemptCount("req-1", now + ATTEMPTS_TTL_MS - 1000), 1);
+
+  // Expired past TTL
+  assert.equal(getAttemptCount("req-1", now + ATTEMPTS_TTL_MS + 1000), 0);
+  assert.equal(getAttemptsSize(), 0);
+});
+
+test("attempts map enforces MAX_ATTEMPTS capacity limit", () => {
+  clearRetryState();
+  const now = Date.now();
+  for (let i = 0; i < MAX_ATTEMPTS + 50; i++) {
+    recordAttempt(`req-${i}`, 1, now + i);
+  }
+  assert.equal(getAttemptsSize(), MAX_ATTEMPTS);
+  // Oldest keys should be evicted
+  assert.equal(getAttemptCount("req-0", now + MAX_ATTEMPTS + 50), 0);
+  // Newer keys should still exist
+  assert.equal(getAttemptCount(`req-${MAX_ATTEMPTS + 49}`, now + MAX_ATTEMPTS + 50), 1);
 });

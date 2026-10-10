@@ -23,8 +23,59 @@ interface RequestErrorPayload {
   signal: AbortSignal;
 }
 
+interface AttemptEntry {
+  count: number;
+  updatedAt: number;
+}
+
+export const MAX_ATTEMPTS = 1000;
+export const ATTEMPTS_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 /** Track retry attempts per request key. */
-const attempts = new Map<string, number>();
+const attempts = new Map<string, AttemptEntry>();
+
+function pruneAttempts(now = Date.now()): void {
+  for (const [key, entry] of attempts.entries()) {
+    if (now - entry.updatedAt > ATTEMPTS_TTL_MS) {
+      attempts.delete(key);
+    }
+  }
+  while (attempts.size > MAX_ATTEMPTS) {
+    const oldestKey = attempts.keys().next().value;
+    if (oldestKey === undefined) break;
+    attempts.delete(oldestKey);
+  }
+}
+
+export function getAttemptCount(key: string, now = Date.now()): number {
+  const entry = attempts.get(key);
+  if (!entry) return 0;
+  if (now - entry.updatedAt > ATTEMPTS_TTL_MS) {
+    attempts.delete(key);
+    return 0;
+  }
+  return entry.count;
+}
+
+export function recordAttempt(key: string, count: number, now = Date.now()): void {
+  pruneAttempts(now);
+  attempts.delete(key);
+  attempts.set(key, { count, updatedAt: now });
+  if (attempts.size > MAX_ATTEMPTS) {
+    const oldestKey = attempts.keys().next().value;
+    if (oldestKey !== undefined) {
+      attempts.delete(oldestKey);
+    }
+  }
+}
+
+export function deleteAttempt(key: string): void {
+  attempts.delete(key);
+}
+
+export function getAttemptsSize(): number {
+  return attempts.size;
+}
 
 function requestKey(p: RequestErrorPayload): string {
   const sid = String(p.agent.session?.id ?? "unknown");
@@ -83,16 +134,16 @@ export function registerRetryPolicy(ctx: Context): void {
     next: () => Promise<RequestErrorAction>,
   ): Promise<RequestErrorAction> => {
     const key = requestKey(payload);
-    const count = attempts.get(key) ?? 0;
+    const count = getAttemptCount(key);
     const { action, delayMs } = decideRetry(payload.failure, count);
 
     if (!action) {
-      attempts.delete(key);
+      deleteAttempt(key);
       warn(ctx, `not retrying ${payload.provider} failure (status=${payload.failure.status}, attempts=${count})`);
       return next();
     }
 
-    attempts.set(key, count + 1);
+    recordAttempt(key, count + 1);
     warn(ctx, `retrying ${payload.provider} failure in ${delayMs}ms (attempt ${count + 1}, status=${payload.failure.status})`);
 
     if (delayMs > 0) {
@@ -104,7 +155,7 @@ export function registerRetryPolicy(ctx: Context): void {
         }, { once: true });
       }).catch(() => {
         // Aborted during backoff; fall through to default handling.
-        attempts.delete(key);
+        deleteAttempt(key);
         return next();
       });
     }

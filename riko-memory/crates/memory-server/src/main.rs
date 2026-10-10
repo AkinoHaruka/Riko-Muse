@@ -4539,12 +4539,26 @@ async fn fulfill_commitment(
             "status": "fulfilled",
         }))
         .into_response(),
-        Ok(false) => err(
-            &req_id.0,
-            StatusCode::NOT_FOUND,
-            ErrorCode::NotFound,
-            "承诺不存在或状态不可达成",
-        ),
+        Ok(false) => match guard.commitment_exists(&scope, &id) {
+            Ok(true) => err(
+                &req_id.0,
+                StatusCode::CONFLICT,
+                ErrorCode::StateConflict,
+                "承诺状态不可达成",
+            ),
+            Ok(false) => err(
+                &req_id.0,
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "承诺不存在",
+            ),
+            Err(e) => err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                &format!("查询承诺失败: {e}"),
+            ),
+        },
         Err(e) => err(
             &req_id.0,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4578,12 +4592,26 @@ async fn cancel_commitment(
             "status": "cancelled",
         }))
         .into_response(),
-        Ok(false) => err(
-            &req_id.0,
-            StatusCode::NOT_FOUND,
-            ErrorCode::NotFound,
-            "承诺不存在或状态不可取消",
-        ),
+        Ok(false) => match guard.commitment_exists(&scope, &id) {
+            Ok(true) => err(
+                &req_id.0,
+                StatusCode::CONFLICT,
+                ErrorCode::StateConflict,
+                "承诺状态不可取消",
+            ),
+            Ok(false) => err(
+                &req_id.0,
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "承诺不存在",
+            ),
+            Err(e) => err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                &format!("查询承诺失败: {e}"),
+            ),
+        },
         Err(e) => err(
             &req_id.0,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4617,7 +4645,7 @@ async fn list_recall_log(
             );
         }
     };
-    let limit = query.limit.unwrap_or(50);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
     match guard.recall_log_list(limit, query.query_like.as_deref()) {
         Ok(entries) => Json(serde_json::json!({
             "request_id": req_id.0,
@@ -10842,5 +10870,219 @@ enabled = false
         let retry_at = chrono::DateTime::parse_from_rfc3339(&job.run_after).unwrap();
         assert!(retry_at > chrono::Utc::now() + chrono::Duration::hours(23));
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn commitment_fulfill_and_cancel_404_vs_409() {
+        let mut store =
+            Store::open_in_memory(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations"))
+                .unwrap();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-memory-commitment-test-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let token_path = temp_dir.join("principal.token");
+        store
+            .principal_add("test-tenant", "test-user", &token_path)
+            .unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let scope = store.verify_token(token.trim()).unwrap().unwrap();
+
+        let origin = Origin {
+            host_id: "test-host".into(),
+            agent_id: "test-agent".into(),
+            session_id: "test-session".into(),
+        };
+        let occurred_at = chrono::Utc::now();
+        let ev = store
+            .record_evidence(
+                &scope,
+                &origin,
+                1,
+                "user",
+                "user",
+                &occurred_at,
+                "仅用于本地测试的手动整理事件",
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
+        let ev_id = match ev {
+            memory_store_sqlite::IngestOutcome::Recorded(id) => id,
+            memory_store_sqlite::IngestOutcome::AlreadyRecorded(id) => id,
+        };
+        let mem_outcome = store
+            .remember(
+                &scope,
+                &origin,
+                &ev_id,
+                "仅用于本地测试的手动整理事件",
+                memory_domain::MemoryKind::Instruction,
+                &memory_domain::DomainScope::user_main(),
+            )
+            .unwrap();
+        let mem_id = match mem_outcome {
+            memory_store_sqlite::RememberOutcome::Created { memory_id, .. } => memory_id,
+            memory_store_sqlite::RememberOutcome::Dedup { memory_id, .. } => memory_id,
+        };
+
+        let state = AppState {
+            store: Arc::new(Mutex::new(store)),
+            embedding: None,
+            rerank: None,
+            semantic_min_similarity: super::DEFAULT_SEMANTIC_MIN_SIMILARITY,
+            recency_mode: "linear",
+            domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
+        };
+
+        // 1. 不存在的 commitment ID -> 404 NOT_FOUND
+        let resp_fulfill_404 = fulfill_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-1".into())),
+            AxumPath("non-existent".into()),
+        )
+        .await;
+        assert_eq!(resp_fulfill_404.status(), StatusCode::NOT_FOUND);
+
+        let resp_cancel_404 = cancel_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-2".into())),
+            AxumPath("non-existent".into()),
+        )
+        .await;
+        assert_eq!(resp_cancel_404.status(), StatusCode::NOT_FOUND);
+
+        // 2. 创建 commitment c1，先 fulfill -> 200 OK
+        let c1 = state
+            .store
+            .lock()
+            .unwrap()
+            .commitment_create(&scope, &mem_id, "deadline", None)
+            .unwrap();
+
+        let resp_fulfill_ok = fulfill_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-3".into())),
+            AxumPath(c1.clone()),
+        )
+        .await;
+        assert_eq!(resp_fulfill_ok.status(), StatusCode::OK);
+
+        // 再次 fulfill c1 -> 409 CONFLICT
+        let resp_fulfill_409 = fulfill_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-4".into())),
+            AxumPath(c1.clone()),
+        )
+        .await;
+        assert_eq!(resp_fulfill_409.status(), StatusCode::CONFLICT);
+
+        // cancel 已 fulfill 的 c1 -> 409 CONFLICT
+        let resp_cancel_409 = cancel_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-5".into())),
+            AxumPath(c1.clone()),
+        )
+        .await;
+        assert_eq!(resp_cancel_409.status(), StatusCode::CONFLICT);
+
+        // 3. 创建 commitment c2，先 cancel -> 200 OK
+        let c2 = state
+            .store
+            .lock()
+            .unwrap()
+            .commitment_create(&scope, &mem_id, "reminder", None)
+            .unwrap();
+
+        let resp_cancel_ok = cancel_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-6".into())),
+            AxumPath(c2.clone()),
+        )
+        .await;
+        assert_eq!(resp_cancel_ok.status(), StatusCode::OK);
+
+        // 再次 cancel c2 -> 409 CONFLICT
+        let resp_cancel_409_2 = cancel_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-7".into())),
+            AxumPath(c2.clone()),
+        )
+        .await;
+        assert_eq!(resp_cancel_409_2.status(), StatusCode::CONFLICT);
+
+        // fulfill 已 cancel 的 c2 -> 409 CONFLICT
+        let resp_fulfill_409_2 = fulfill_commitment(
+            State(state.clone()),
+            Extension(scope.clone()),
+            Extension(RequestId("req-8".into())),
+            AxumPath(c2.clone()),
+        )
+        .await;
+        assert_eq!(resp_fulfill_409_2.status(), StatusCode::CONFLICT);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn recall_log_list_limit_clamping() {
+        let mut store =
+            Store::open_in_memory(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations"))
+                .unwrap();
+        // 写入 5 条召回日志
+        for i in 0..5 {
+            store
+                .recall_log_write(&format!("query-{i}"), "[]", None, None, None, None)
+                .unwrap();
+        }
+
+        let state = AppState {
+            store: Arc::new(Mutex::new(store)),
+            embedding: None,
+            rerank: None,
+            semantic_min_similarity: super::DEFAULT_SEMANTIC_MIN_SIMILARITY,
+            recency_mode: "linear",
+            domains_enabled: false,
+            schedule: memory_domain::schedule::ScheduleConfig::default(),
+        };
+
+        // limit = 0 -> clamped to 1
+        let resp = list_recall_log(
+            State(state.clone()),
+            Extension(RequestId("req-limit-0".into())),
+            axum::extract::Query(RecallLogQuery {
+                limit: Some(0),
+                query_like: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["count"], 1);
+
+        // limit = 1000000 -> clamped to 200 (returns all 5)
+        let resp = list_recall_log(
+            State(state.clone()),
+            Extension(RequestId("req-limit-big".into())),
+            axum::extract::Query(RecallLogQuery {
+                limit: Some(1_000_000),
+                query_like: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["count"], 5);
     }
 }
