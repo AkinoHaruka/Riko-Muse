@@ -21,6 +21,7 @@ import { EventPipeline, isCapturableSessionHeader, type GapChecker, type Logger 
 import { Spool } from "./spool.js";
 import { registerAlignment } from "./alignment.js";
 import { registerApprovalInterception } from "./approval.js";
+import { registerRetryPolicy } from "./retry.js";
 import { registerTwinSoul } from "./soul.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
@@ -261,6 +262,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   registerAlignment(ctx);
   // Sensitive tool approval interception (H11).
   registerApprovalInterception(ctx);
+  // Custom retry policy for model request failures (H12).
+  registerRetryPolicy(ctx);
   // ctx.effect：卸载时由宿主回收；dispose 返回 Promise，由 Cordis 等待真实收尾。
   (ctx as { effect: (register: () => (() => void) | Promise<void>) => void }).effect(() => () => {
     void plugin.dispose().catch((e: unknown) => {
