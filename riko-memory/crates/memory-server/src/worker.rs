@@ -817,6 +817,65 @@ mod tests {
         assert_eq!(body2["max_tokens"], 1024);
     }
 
+    #[test]
+    fn client_constructs_with_proxy_env_vars() {
+        // BUG-1 回归测试：代理环境变量存在时客户端应能正常构建。
+        // reqwest 0.12 默认 auto_sys_proxy=true，自动读取 HTTP_PROXY/HTTPS_PROXY/
+        // ALL_PROXY（大小写均可）；NO_PROXY/no_proxy 自动尊重。
+        // 保存并恢复原始值，避免影响并行运行的其他测试。
+        let keys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        std::env::set_var("HTTP_PROXY", "http://proxy.example.com:8080");
+        std::env::set_var("HTTPS_PROXY", "http://proxy.example.com:8080");
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.1");
+
+        let cfg = ModelConfig {
+            endpoint: "https://api.example.com/v1/chat/completions".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            timeout: Duration::from_secs(30),
+            max_tokens: 1024,
+            extra_body: None,
+        };
+        // 构建不应因代理配置而失败。
+        let result = OpenAiCompatibleClient::new(cfg);
+        assert!(result.is_ok(), "client should build with proxy env vars set");
+
+        // 恢复环境。
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+
+    #[test]
+    fn client_constructs_with_invalid_proxy_url_ignored() {
+        // 非法代理 URL 不应导致客户端构建失败（系统代理检测忽略无法解析的值）。
+        let saved = std::env::var("HTTP_PROXY").ok();
+        std::env::set_var("HTTP_PROXY", "://not-a-valid-url");
+
+        let cfg = ModelConfig {
+            endpoint: "https://api.example.com/v1/chat/completions".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            timeout: Duration::from_secs(30),
+            max_tokens: 1024,
+            extra_body: None,
+        };
+        let result = OpenAiCompatibleClient::new(cfg);
+        assert!(result.is_ok(), "client should build even with invalid proxy URL");
+
+        match saved {
+            Some(val) => std::env::set_var("HTTP_PROXY", val),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+    }
+
     #[tokio::test]
     async fn prompt_dispatch_uses_job_version_and_fails_unknown() {
         // doc2/05 §3：worker 按作业行 prompt_version 选提示词——老版本作业用老提示词，
@@ -1248,6 +1307,9 @@ impl OpenAiCompatibleClient {
         let http = reqwest::Client::builder()
             .connect_timeout(cfg.timeout)
             .timeout(cfg.timeout)
+            // BUG-1 说明：reqwest 0.12 的 ClientBuilder 默认 auto_sys_proxy=true，
+            // 会自动从环境变量读取代理配置（HTTP_PROXY/HTTPS_PROXY/ALL_PROXY，
+            // 大小写均可；NO_PROXY/no_proxy 自动尊重）。无需显式 .proxy() 调用。
             .build()
             .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
         Ok(Self { cfg, http })
