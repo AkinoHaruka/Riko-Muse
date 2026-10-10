@@ -19,7 +19,8 @@
     "dist",
     "riko-preset.patch.yml",
     "README.md",
-    "soul.md"
+    "soul.md",
+    "alignment.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

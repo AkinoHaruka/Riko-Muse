@@ -19,6 +19,7 @@ import { MemoryClient } from "./client.js";
 import { loadConfig, type AdapterConfig } from "./config.js";
 import { EventPipeline, isCapturableSessionHeader, type GapChecker, type Logger } from "./events.js";
 import { Spool } from "./spool.js";
+import { registerAlignment } from "./alignment.js";
 import { registerTwinSoul } from "./soul.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
@@ -254,6 +255,9 @@ class AgentMemoryPlugin {
 export function apply(ctx: Context, config: Config = {}): void {
   const plugin = new AgentMemoryPlugin(ctx, config);
   registerTwinSoul(ctx);
+  // Register before plugin.start() installs recall, so this outer hook adds
+  // alignment after the downstream memory hook has prepared its decision.
+  registerAlignment(ctx);
   // ctx.effect：卸载时由宿主回收；dispose 返回 Promise，由 Cordis 等待真实收尾。
   (ctx as { effect: (register: () => (() => void) | Promise<void>) => void }).effect(() => () => {
     void plugin.dispose().catch((e: unknown) => {
