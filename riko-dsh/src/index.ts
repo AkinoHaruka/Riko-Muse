@@ -21,6 +21,7 @@ import { EventPipeline, isCapturableSessionHeader, type GapChecker, type Logger 
 import { Spool } from "./spool.js";
 import { registerAlignment } from "./alignment.js";
 import { registerApprovalInterception } from "./approval.js";
+import { registerCompactionTuning } from "./compaction.js";
 import { registerRetryPolicy } from "./retry.js";
 import { registerTwinSoul } from "./soul.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
@@ -264,6 +265,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   registerApprovalInterception(ctx);
   // Custom retry policy for model request failures (H12).
   registerRetryPolicy(ctx);
+  // Compaction micro-tuning stub (H9-micro): measure first, then tune.
+  registerCompactionTuning(ctx);
   // ctx.effect：卸载时由宿主回收；dispose 返回 Promise，由 Cordis 等待真实收尾。
   (ctx as { effect: (register: () => (() => void) | Promise<void>) => void }).effect(() => () => {
     void plugin.dispose().catch((e: unknown) => {
