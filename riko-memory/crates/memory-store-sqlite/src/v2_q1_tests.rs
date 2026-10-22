@@ -350,29 +350,28 @@ fn same_corpus_comparison_reports_claim_and_entry_lanes() {
         .any(|h| h.match_reason == "grams" || h.match_reason == "rrf" || h.match_reason == "fts"));
 }
 
-// ---- 6. 向量对象已扩到 entry（只入队，不调用模型）----
+// ---- 6. P4：entry 仅词法补充道；0019 表 CHECK 保留兼容，入队拒绝 ----
 
 #[test]
-fn entry_vectors_can_be_enqueued_without_a_model_call() {
-    // doc7/10 §0：本卡只做绑定与入队；真实语义质量未验证。
+fn entry_vector_binding_is_disabled() {
     let (mut store, scope) = setup("entry-vector");
     ingest(&mut store, &scope, "s1", 0, "用户在读 Rust 源码");
     store.entries_refresh(&scope, &dom()).unwrap();
     let hit = store.entries_search(&scope, &dom(), "Rust", 10).unwrap();
     let entry_id = hit.hits[0].entry_id.clone();
-    let job = store
-        .semantic_enqueue(&scope, "entry", &entry_id, "m1")
-        .unwrap();
-    assert!(job.is_some(), "entry 只入队，不触发任何模型调用");
-    let kind: String = store
+    assert!(matches!(
+        store.semantic_object_fingerprint(&scope, "entry", &entry_id),
+        Err(StoreError::StateConflict)
+    ));
+    let count: i64 = store
         .conn()
         .query_row(
-            "SELECT object_kind FROM semantic_jobs WHERE tenant_id=?1 AND user_id=?2 AND object_id=?3",
+            "SELECT COUNT(*) FROM semantic_jobs WHERE tenant_id=?1 AND user_id=?2 AND object_id=?3",
             rusqlite::params![scope.tenant_id, scope.user_id, entry_id],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(kind, "entry");
+    assert_eq!(count, 0);
     // 非法 object_kind 仍然被拒。
     assert!(matches!(
         store.semantic_enqueue(&scope, "bogus", &entry_id, "m1"),
