@@ -12,7 +12,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { Session, SessionEvent, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
 import { DreamRunner } from "./dream-runner.js";
 import { currentDreamChildBinding } from "./dream-scope.js";
-import { buildDreamReadTools } from "./dream-tools.js";
+import { installDreamChildTools } from "./dream-tools.js";
 import type { PreStepPayload } from "./recall.js";
 import { makeBundleHook, makePreStepHook, makeSoulAssembleHook } from "./recall.js";
 import { MemoryClient } from "./client.js";
@@ -134,8 +134,8 @@ class AgentMemoryPlugin {
     }
 
     // AsyncLocalStorage tags only the exact child created by DreamRunner.
-    // Install read-only tools in that child agent scope before its first prompt;
-    // ordinary tools remain filtered by SubagentStartRequest.toolFilter.
+    // Clear inherited global tools before registering phase read tools in the
+    // child scope. agent/created is awaited before the first prompt.
     (this.ctx as { on: (name: string, cb: unknown) => unknown }).on(
       "agent/created",
       async (payload: { agent: { id: string; session?: { header?: { origin?: string; parentSession?: unknown } }; ctx: unknown } }) => {
@@ -144,13 +144,7 @@ class AgentMemoryPlugin {
         if (!binding || String(child.session?.header?.origin) !== "subagent"
           || child.session?.header?.parentSession === undefined
           || binding.parentAgentId === String(child.id)) return;
-        const scoped = child.ctx as { tools?: { register(definition: unknown): () => void } };
-        if (!scoped.tools || typeof scoped.tools.register !== "function") {
-          throw new Error("riko-dsh: DSH Dream child 没有 scoped tools.register；拒绝以全局工具替代");
-        }
-        for (const tool of buildDreamReadTools(this.client, binding, String(child.id))) {
-          scoped.tools.register(tool);
-        }
+        installDreamChildTools(child.ctx, this.client, binding, String(child.id));
       },
     );
 

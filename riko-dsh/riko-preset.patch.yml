@@ -1,5 +1,5 @@
 # Riko Memory bundle: insert a separate Riko Agent preset based on DSH Minimal.
-# Minimal remains unchanged; source composition checked against DSH 0.2.0-rc.1 at 4878cdabd87d4041bdaff61d04c966883b9fd07a.
+# Minimal remains unchanged; source composition checked against DSH 0.2.1-rc.2 at 687f282e8625c6b8d11ff58211a90524be2e4317.
 - insert:
     - id: preset-riko
       name: '@deepseek-ai/dsh-agent-preset'

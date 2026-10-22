@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { JsonSchemaNode, ObjectJsonSchema } from "@deepseek-ai/dsh-tools";
-import type { SubagentRun, SubagentStartRequest } from "@deepseek-ai/dsh-subagent";
+import type { SubagentActivation, SubagentActivationSpec } from "@deepseek-ai/dsh-subagent";
 import type { MemoryClient } from "./client.js";
 import type { Logger } from "./events.js";
 import { withDreamChildBinding } from "./dream-scope.js";
@@ -320,16 +320,15 @@ export class DreamRunner {
       }
     };
     const leaseTimer = setInterval(() => { void renew(); }, 15_000);
-    let child: SubagentRun | undefined;
+    let child: SubagentActivation | undefined;
+    const stopActivation = () => { if (child) void child.dispose().catch(() => undefined); };
+    signal.addEventListener("abort", stopActivation, { once: true });
     try {
       if (!this.validParent(agent)) return;
-      const request: SubagentStartRequest = {
-        label: `riko-dsh:${work.phase}`,
+      const request: SubagentActivationSpec["request"] = {
         prompt: [{ type: "text", text: textPrompt(work) }],
         parent: agent,
-        signal,
         maxDepth: 1,
-        toolFilter: { allow: [] },
         outputSchema: work.phase === "consolidate" && work.generator_version === "consolidate_v2"
           ? consolidateV2Schema
           : schemas[work.phase],
@@ -343,8 +342,8 @@ export class DreamRunner {
         readToolsEnabled: work.extract_version === "dream_extract_v2"
           || work.adjudication_version === "adjudicate_v2"
           || work.generator_version === "consolidate_v2",
-      }, () => this.ctx.subagents.start("spawn", request));
-      this.childAgentIds.add(String(child.id));
+      }, () => this.ctx.subagents.startActivation({ provider: "spawn", label: `riko-dsh:${work.phase}`, signal, delivery: "caller", request }));
+      this.childAgentIds.add(String(child.childId));
       const result = await child.result;
       if (leaseLost || signal.aborted) {
         if (leaseLost && !parentSignal.aborted) {
@@ -357,6 +356,9 @@ export class DreamRunner {
         return;
       }
       const output = JSON.stringify(result.structured);
+      while (leaseBusy && !signal.aborted) await sleep(20, signal);
+      await renew();
+      if (leaseLost || signal.aborted) return;
       const submit = await this.submit(work, output, signal);
       if (submit.failure !== "ok" || submit.status < 200 || submit.status >= 300) {
         if (submit.status !== 409) await this.reportFailure(work, "SUBMIT_FAILED", signal);
@@ -367,8 +369,9 @@ export class DreamRunner {
       this.diagnostic("subagent_failed", `受限 Dream 子 Agent 执行失败 phase=${work.phase} job=${work.dream_job_id}`);
     } finally {
       clearInterval(leaseTimer);
+      signal.removeEventListener("abort", stopActivation);
       if (child) {
-        this.childAgentIds.delete(String(child.id));
+        this.childAgentIds.delete(String(child.childId));
         try { await child.dispose(); } catch { /* failed child cleanup is diagnostic-only */ }
       }
     }

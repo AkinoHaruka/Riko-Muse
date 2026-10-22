@@ -112,3 +112,21 @@ export function buildDreamReadTools(
       : new Set(["dream_read_manifest", "dream_read_evidence", "dream_search_memories", "dream_get_memory", "dream_search_pages", "dream_get_page"]);
   return tools.filter((tool) => allowed.has(tool.name));
 }
+
+/** Run during the awaited agent/created notification, before the first child prompt. */
+export function installDreamChildTools(
+  childCtx: unknown,
+  client: MemoryClient,
+  binding: DreamChildBinding,
+  childAgentId: string,
+): void {
+  const scoped = childCtx as { tools?: {
+    restrict(filter: { allow: string[] }): () => void;
+    register(definition: ToolDefinition): () => void;
+  } };
+  if (!scoped.tools || typeof scoped.tools.restrict !== "function" || typeof scoped.tools.register !== "function") {
+    throw new Error("riko-dsh: DSH Dream child 缺少 scoped tools.restrict/register；拒绝运行未隔离 child");
+  }
+  scoped.tools.restrict({ allow: [] });
+  for (const tool of buildDreamReadTools(client, binding, childAgentId)) scoped.tools.register(tool);
+}
