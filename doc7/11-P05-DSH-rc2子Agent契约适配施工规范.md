@@ -49,3 +49,7 @@ Dream child 必须在 DSH 子 Agent 的独立 scope 中运行。普通全局工�
 Dream job **不依赖冷恢复补交结果**。runner 在 activation 存活期继续每 15 秒续租；租约丢失即中止；提交前再次确认 generation/lease；`finally` dispose。activation 死亡或进程中断时，job 失败并由服务端租约/重试机制回队列，不在恢复出的 child 里续跑。新 descriptor 不快照限制（`manager.ts:394-401`），冷恢复的旧字段重放（`:1348-1376`）不能用作新 job 的隔离依据。
 
 验收门槛：rc.2 同基线的类型检查、构建及至少原有 47 例适配器测试全绿；新增契约测试证明首 prompt 前限制、实际工具 schema/执行、两个并发 child 隔离、activation 死亡回队列及 dispose。真实 DSH + 真实模型验收按 §4 执行，并在交接记录中逐项区分档位。若现场证明 `agent/created` 晚于首 prompt，立即停止实施，记录证据，不替换隔离方案。
+
+### 5.1 rc.2 运行时补充：pre-step 监听 scope（P0.6）
+
+真实 headless DSH 运行中，适配器全局注册的 `agent/pre-step` 未收到事件：L0 `session/event` 已摄入、Soul 静态 section 已显示，但 Dream runner 没有新 heartbeat，bundle hook 亦无调用。上游 `packages/core/agent/src/runtime-types.ts:320` 将该事件标为 scope-filtered；`packages/core/agent/src/dispatch.ts:107-149` 以 agent carrier 分发；`packages/core/agent-loop/src/agent.ts:129,274` 在该 carrier 上执行 waterfall。因此 runner 启动与 bundle/legacy compose 的 pre-step 监听必须在 `agent/created` 时注册到该 Agent 的 `ctx`；对 Dream child/fork 不启动 runner，不注入上下文。新增测试及真实运行需证明 scoped listener 确实触发。此调整只修宿主事件接线，不改变 Rust 记忆语义。
