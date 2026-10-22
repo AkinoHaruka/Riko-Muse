@@ -1,0 +1,724 @@
+{
+  "model": "Qwen/Qwen3.5-4B",
+  "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+  "schema": 23,
+  "jobs": [
+    {
+      "session": "sc-P5H01",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H02",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H03",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H04",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H05",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H06",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H07",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H08",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H09",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H10",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H11",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5H12",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N01",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N02",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N03",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N04",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N05",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N06",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N07",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N08",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N09",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N10",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N11",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "sc-P5N12",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v5"
+    }
+  ],
+  "counts": {
+    "active": 17,
+    "reject": 5,
+    "held": 2
+  },
+  "held_reasons": {
+    "NOT_EXPLICIT": 4,
+    "CONTEXT_UNCERTAIN": 1,
+    "TEMPORAL": 1
+  },
+  "leaks": [
+    "P5H01",
+    "P5H04",
+    "P5H06",
+    "P5H07",
+    "P5H08",
+    "P5H09",
+    "P5H11"
+  ],
+  "false_positives": [],
+  "cases": {
+    "P5H01": {
+      "id": "P5H01",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "上周我去做了体检。",
+      "text": "那个结果不太好。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "上周我去做了体检。",
+          "claim": "用户在 2026 年 10 月 22 日做了体检。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "那个结果不太好。",
+          "claim": "用户在 2026 年 10 月 22 日做的体检结果不太好。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5H02": {
+      "id": "P5H02",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "医生看了我上次的检查。",
+      "text": "他说有一项指标偏高。",
+      "actual": "reject",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": []
+    },
+    "P5H03": {
+      "id": "P5H03",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我刚从诊室出来。",
+      "text": "医生说我的情况需要继续观察。",
+      "actual": "held",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我刚从诊室出来。",
+          "claim": "我刚从诊室出来。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        },
+        {
+          "kind": "episode",
+          "quote": "医生说我的情况需要继续观察。",
+          "claim": "医生说我的情况需要继续观察。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ]
+    },
+    "P5H04": {
+      "id": "P5H04",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我在等自己的化验结果。",
+      "text": "报告出来了，数值不正常。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在等自己的化验结果。",
+          "claim": "用户在 2026 年 10 月 22 日等待自己的化验结果。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "报告出来了，数值不正常。",
+          "claim": "用户在 2026 年 10 月 22 日得知自己的化验报告数值不正常。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5H05": {
+      "id": "P5H05",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "昨天复诊时医生看了我的片子。",
+      "text": "他说那个地方有问题。",
+      "actual": "reject",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": []
+    },
+    "P5H06": {
+      "id": "P5H06",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我刚做完年度体检。",
+      "text": "有一项结果让我担心。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我刚做完年度体检。",
+          "claim": "用户在 2026 年 10 月 22 日刚做完年度体检。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "有一项结果让我担心。",
+          "claim": "用户在 2026 年 10 月 22 日对年度体检的某项结果感到担心。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5H07": {
+      "id": "P5H07",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "上次我因身体不舒服去看医生。",
+      "text": "他说还需要进一步确认。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "上次我因身体不舒服去看医生。",
+          "claim": "用户在 2026 年 10 月 22 日因身体不舒服去看医生。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "他说还需要进一步确认。",
+          "claim": "他说还需要进一步确认。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ]
+    },
+    "P5H08": {
+      "id": "P5H08",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我的医生让我关注那项检测。",
+      "text": "这次数值又上去了。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "我的医生让我关注那项检测",
+          "claim": "用户听从医生的建议关注某项检测",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "这次数值又上去了",
+          "claim": "这次数值又上去了",
+          "status": "held",
+          "reason_code": "CONTEXT_UNCERTAIN"
+        }
+      ]
+    },
+    "P5H09": {
+      "id": "P5H09",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我去门诊问了自己的情况。",
+      "text": "医生说这个问题是长期的。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我去门诊问了自己的情况。",
+          "claim": "用户在 2026 年 10 月 22 日前往门诊询问了自己的情况。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "医生说这个问题是长期的。",
+          "claim": "医生说这个问题是长期的。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ]
+    },
+    "P5H10": {
+      "id": "P5H10",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我在读自己的检查单。",
+      "text": "其中一项比正常范围低。",
+      "actual": "reject",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": []
+    },
+    "P5H11": {
+      "id": "P5H11",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "我刚从医院拿到个人报告。",
+      "text": "结论比去年严重。",
+      "actual": "active",
+      "leak": true,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我刚从医院拿到个人报告。",
+          "claim": "用户在 2026 年 10 月 22 日刚拿到个人报告。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "结论比去年严重。",
+          "claim": "用户个人报告的结论比去年严重。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5H12": {
+      "id": "P5H12",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "context": "医生刚告诉我个人的身体检查结果。",
+      "text": "那个阴影需要再看。",
+      "actual": "reject",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": []
+    },
+    "P5N01": {
+      "id": "P5N01",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我每周练两次瑜伽。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我每周练两次瑜伽。",
+          "claim": "用户每周练习两次瑜伽。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N02": {
+      "id": "P5N02",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我喜欢晨跑时听播客。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢晨跑时听播客",
+          "claim": "我喜欢晨跑时听播客",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N03": {
+      "id": "P5N03",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我在开发健康记录应用。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在开发健康记录应用",
+          "claim": "用户正在开发健康记录应用",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N04": {
+      "id": "P5N04",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我为医院设计导航图标。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我为医院设计导航图标",
+          "claim": "用户为医院设计导航图标",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N05": {
+      "id": "P5N05",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "上次代码评审不顺利。",
+      "text": "那个结果不太好。",
+      "actual": "reject",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": []
+    },
+    "P5N06": {
+      "id": "P5N06",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "我参加了周末的篮球比赛。",
+      "text": "最后那场结果不太好。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我参加了周末的篮球比赛。",
+          "claim": "用户在 2026 年 10 月 22 日参加了周末的篮球比赛。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "episode",
+          "quote": "最后那场结果不太好。",
+          "claim": "用户在 2026 年 10 月 22 日参加的周末篮球比赛中，最后一场的结果不太好。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N07": {
+      "id": "P5N07",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "preference",
+      "context": "",
+      "text": "我喜欢步行探索城市。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢步行探索城市。",
+          "claim": "我喜欢步行探索城市。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N08": {
+      "id": "P5N08",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我在开发体检预约软件。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在开发体检预约软件",
+          "claim": "用户正在开发体检预约软件",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N09": {
+      "id": "P5N09",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我画了一张心脏形状的海报。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我画了一张心脏形状的海报。",
+          "claim": "用户在 2026 年 10 月 22 日画了一张心脏形状的海报。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N10": {
+      "id": "P5N10",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我最近在学习人体解剖插画。",
+      "actual": "held",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我最近在学习人体解剖插画",
+          "claim": "用户在 2026 年 10 月 22 日最近开始学习人体解剖插画",
+          "status": "held",
+          "reason_code": "TEMPORAL"
+        }
+      ]
+    },
+    "P5N11": {
+      "id": "P5N11",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我写了一篇关于医院建筑的文章。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我写了一篇关于医院建筑的文章。",
+          "claim": "用户在 2026 年 10 月 22 日写了一篇关于医院建筑的文章。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    },
+    "P5N12": {
+      "id": "P5N12",
+      "bucket": "body",
+      "expected": "active",
+      "kind": "fact",
+      "context": "",
+      "text": "我把健身房的训练日志做成了图表。",
+      "actual": "active",
+      "leak": false,
+      "sensitive_held": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我把健身房的训练日志做成了图表",
+          "claim": "用户在 2026 年 10 月 22 日将健身房的训练日志制作成了图表",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ]
+    }
+  }
+}
