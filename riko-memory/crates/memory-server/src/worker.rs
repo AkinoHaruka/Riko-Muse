@@ -827,7 +827,16 @@ mod tests {
         // reqwest 0.12 默认 auto_sys_proxy=true，自动读取 HTTP_PROXY/HTTPS_PROXY/
         // ALL_PROXY（大小写均可）；NO_PROXY/no_proxy 自动尊重。
         // 保存并恢复原始值，避免影响并行运行的其他测试。
-        let keys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+        let keys = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
         let saved: Vec<(String, Option<String>)> = keys
             .iter()
             .map(|k| (k.to_string(), std::env::var(k).ok()))
@@ -846,7 +855,10 @@ mod tests {
         };
         // 构建不应因代理配置而失败。
         let result = OpenAiCompatibleClient::new(cfg);
-        assert!(result.is_ok(), "client should build with proxy env vars set");
+        assert!(
+            result.is_ok(),
+            "client should build with proxy env vars set"
+        );
 
         // 恢复环境。
         for (k, v) in saved {
@@ -872,7 +884,10 @@ mod tests {
             extra_body: None,
         };
         let result = OpenAiCompatibleClient::new(cfg);
-        assert!(result.is_ok(), "client should build even with invalid proxy URL");
+        assert!(
+            result.is_ok(),
+            "client should build even with invalid proxy URL"
+        );
 
         match saved {
             Some(val) => std::env::set_var("HTTP_PROXY", val),
@@ -963,7 +978,7 @@ mod tests {
         assert_eq!(job.admission_version, memory_contract::ADMISSION_VERSION);
         // doc7/03：新作业默认版本同提交切换为 extract_v4/admit_v4（v1/v2/v3 冻结）。
         assert_eq!(job.prompt_version, "extract_v4");
-        assert_eq!(job.admission_version, "admit_v4");
+        assert_eq!(job.admission_version, "admit_v5");
         let sys2 = empty.clone();
         let mock2 = SysCapture {
             system: sys2.clone(),
@@ -1503,7 +1518,8 @@ async fn process_job_inner<M: ExtractModel>(
     let admission_version = match job.admission_version.as_str() {
         memory_contract::ADMISSION_VERSION_V1
         | memory_contract::ADMISSION_VERSION_V2
-        | memory_contract::ADMISSION_VERSION_V4 => job.admission_version.clone(),
+        | memory_contract::ADMISSION_VERSION_V4
+        | memory_contract::ADMISSION_VERSION_V5 => job.admission_version.clone(),
         other => {
             let mut guard = state.store.lock().unwrap();
             let code = "UNKNOWN_ADMISSION_VERSION";

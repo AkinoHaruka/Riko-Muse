@@ -49,7 +49,8 @@ pub const ADJUDICATION_VERSION_V2: &str = "adjudicate_v2";
 /// 受检文本为 rewrite 产出的 claim（缺省回落 quote，回落路径与 v2 同判）；
 /// v1/v2/v3 冻结不改。新作业默认值在同一提交随 extract_v4 切换为 admit_v4。
 pub const ADMISSION_VERSION_V4: &str = "admit_v4";
-pub const ADMISSION_VERSION: &str = "admit_v4";
+pub const ADMISSION_VERSION_V5: &str = "admit_v5";
+pub const ADMISSION_VERSION: &str = "admit_v5";
 
 // ---- v1 版本化默认限额（doc/10 D-08、doc/13 §3/§6；统一在此，不散落硬编码）----
 /// 自动上下文默认最多 5 条原子记忆。

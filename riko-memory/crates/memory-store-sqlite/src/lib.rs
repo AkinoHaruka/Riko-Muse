@@ -626,9 +626,9 @@ mod tests {
             "历史作业必须回填 admit_v1"
         );
         // doc7/03：D5-3 的 extract_v3/admit_v2 切换保持冻结；当前默认版本在其后
-        // 同提交切换为 extract_v4/admit_v4（Muse文档/13 rewrite 步骤）。
+        // 随 P5b 切换为 extract_v4/admit_v5。
         assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v4");
-        assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v4");
+        assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v5");
         let _ = token_file;
         let _ = fs::remove_dir_all(&dir);
     }
@@ -932,11 +932,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pv, "extract_v4");
-        assert_eq!(av, "admit_v4", "doc7/03 切换后新作业写 extract_v4/admit_v4");
+        assert_eq!(av, "admit_v5", "P5b 切换后新作业写 extract_v4/admit_v5");
         // doc7/03：D5-3 的 extract_v3/admit_v2 切换保持冻结；当前默认版本在其后
-        // 同提交切换为 extract_v4/admit_v4（Muse文档/13 rewrite 步骤）。
+        // 随 P5b 切换为 extract_v4/admit_v5。
         assert_eq!(memory_contract::EXTRACT_PROMPT_VERSION, "extract_v4");
-        assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v4");
+        assert_eq!(memory_contract::ADMISSION_VERSION, "admit_v5");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -450,6 +450,7 @@ pub fn admit_for(
         memory_contract::ADMISSION_VERSION_V1 => Some(admit_v1(c, events)),
         memory_contract::ADMISSION_VERSION_V2 => Some(admit_v2(c, events)),
         memory_contract::ADMISSION_VERSION_V4 => Some(admit_v4(c, events)),
+        memory_contract::ADMISSION_VERSION_V5 => Some(admit_v5(c, events)),
         _ => None,
     }
 }
@@ -518,6 +519,90 @@ pub fn admit_v4(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
     }
     // 8. 健康/过敏/诊断/病历等敏感个人信息。
     if sensitive_health(text) {
+        return Held("SENSITIVE");
+    }
+    // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
+    if has_third_person_marker(text) || claim_text.is_some() && rewritten_third_party_marker(text) {
+        return Held("THIRD_PARTY");
+    }
+    // 10. 未来节点、相对时间或明显短期状态（改写按 occurred_at 归位后应不再命中）。
+    if temporal_marker(text) {
+        return Held("TEMPORAL");
+    }
+    // 11. 显式陈述：quote 路径同 v2；claim 路径以"用户"主语句式为显式
+    //     （kind 由阶段 1 判定，v4 不对其重检）。
+    match claim_text {
+        Some(_) => {
+            if text.starts_with("用户") {
+                Active
+            } else {
+                match explicit_shape(text) {
+                    None => Held("NOT_EXPLICIT"),
+                    Some(shape) if shape.kind() == c.kind.as_str() => Active,
+                    Some(_) => Held("KIND_MISMATCH"),
+                }
+            }
+        }
+        None => match explicit_shape(&c.quote) {
+            None => Held("NOT_EXPLICIT"),
+            Some(shape) if shape.kind() == c.kind.as_str() => Active,
+            Some(_) => Held("KIND_MISMATCH"),
+        },
+    }
+}
+
+/// P5b independent deterministic admission policy; v4 remains frozen.
+pub fn admit_v5(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
+    use Admission::*;
+    // 1. 来源必须属于本窗口、role=user、source_kind=user（同 v2）。
+    let Some(ev) = events.iter().find(|e| e.id == c.source_event_id) else {
+        return Rejected("BAD_SOURCE");
+    };
+    if ev.role != "user" || ev.source_kind != "user" {
+        return Rejected("BAD_SOURCE");
+    }
+    // 2. quote 是同一来源正文的连续原文（逐字锚不因改写改变）。
+    if !ev.content.contains(&c.quote) {
+        return Rejected("QUOTE_MISMATCH");
+    }
+    // 3. 规范化为空或超过 512 Unicode 标量字符（检 quote，同 v2）。
+    if memory_domain::fold_whitespace(&c.quote).is_empty()
+        || c.quote.chars().count() > memory_contract::QUOTE_MAX_CHARS
+    {
+        return Rejected("INVALID_QUOTE");
+    }
+    let claim_text = c.claim.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let text = claim_text.unwrap_or(&c.quote);
+    // 4. 假设、转述、引用、一次性语境。
+    if context_uncertain(text) || text.contains("今天先") {
+        return Held("CONTEXT_UNCERTAIN");
+    }
+    // 5. 多命题/宽 quote：quote 路径同 v2；claim 路径用改写形态判定
+    //    （non_minimal_quote 是口语前缀的 quote 形状门，对改写句不适用）。
+    if claim_text.is_some() {
+        if rewritten_multi_claim(text) {
+            return Held("MULTI_CLAIM");
+        }
+    } else {
+        if non_minimal_quote(&c.quote) {
+            return Held("NON_MINIMAL_QUOTE");
+        }
+        if multi_claim(&c.quote) {
+            return Held("MULTI_CLAIM");
+        }
+    }
+    // 6. fact/preference 缺明确归属主体。
+    if matches!(c.kind.as_str(), "fact" | "preference")
+        && rewritten_unclear_subject(text, claim_text.is_some())
+    {
+        return Held("UNCLEAR_SUBJECT");
+    }
+    // 7. 凭据内容：任何路径不得 active。
+    if secret_like(text) {
+        return Held("SECRET");
+    }
+    // 8. 健康/过敏/诊断/病历等敏感个人信息。
+    if sensitive_health_v5(&c.quote) || claim_text.is_some_and(sensitive_health_v5) {
         return Held("SENSITIVE");
     }
     // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
@@ -833,6 +918,290 @@ fn sensitive_health(quote: &str) -> bool {
     .any(|w| quote.contains(w))
 }
 
+/// P5b finite health policy implementing doc7/17 §2 rule groups (Chinese & English)
+/// and false positive avoidance rules.
+fn sensitive_health_v5(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let t = lower.as_str();
+
+    // 1. 证件与银行卡（保持 v4 规则）
+    for w in ["身份证", "银行卡"] {
+        if t.contains(w) {
+            return true;
+        }
+    }
+    for w in ["identity card", "id card", "bank card", "credit card"] {
+        if contains_english_term(t, w) {
+            return true;
+        }
+    }
+
+    let personal_zh = ["我", "本人", "自己", "用户", "身体"]
+        .iter()
+        .any(|w| t.contains(w));
+    let personal_en = ["i ", "i'", "my ", "me ", "user ", "the user "]
+        .iter()
+        .any(|w| t.starts_with(w) || t.contains(&format!(" {w}")));
+
+    // 组 1：疾病名与患病陈述
+    // 常见明确疾病名可独立命中；结合个人归属与患病动词
+    // 避开产品「心脏」图标、书名里的疾病词
+    let explicit_diseases_zh = [
+        "心脏病",
+        "哮喘",
+        "糖尿病",
+        "高血压",
+        "癌症",
+        "肺炎",
+        "抑郁症",
+        "冠心病",
+        "阿尔茨海默",
+        "白血病",
+        "痛风",
+        "癫痫",
+        "肾衰竭",
+        "心肌梗死",
+        "肿瘤",
+    ];
+    for d in explicit_diseases_zh {
+        if t.contains(d) {
+            let is_media = ["书", "小说", "海报", "图标", "应用", "app"]
+                .iter()
+                .any(|w| t.contains(&format!("{d}{w}")))
+                || ["关于", "画了", "设计"]
+                    .iter()
+                    .any(|w| t.contains(&format!("{w}{d}")));
+            let has_personal_possession = ["患有", "得了", "确诊", &format!("有{d}")]
+                .iter()
+                .any(|p| t.contains(p));
+            if !is_media || has_personal_possession {
+                return true;
+            }
+        }
+    }
+
+    for v in ["患有", "得了", "被确诊", "患上"] {
+        if t.contains(v)
+            && ["病", "症", "癌", "炎", "障碍", "残疾", "阳性", "哮喘"]
+                .iter()
+                .any(|w| t.contains(w))
+        {
+            return true;
+        }
+    }
+
+    let explicit_diseases_en = [
+        "asthma",
+        "diabetes",
+        "hypertension",
+        "heart disease",
+        "cancer",
+        "pneumonia",
+        "depression",
+        "leukemia",
+        "epilepsy",
+    ];
+    for d in explicit_diseases_en {
+        if contains_english_term(t, d) {
+            let is_media = [
+                "book", "novel", "movie", "poster", "icon", "app", "software",
+            ]
+            .iter()
+            .any(|w| t.contains(&format!("{d} {w}")))
+                || t.contains(&format!("about {d}"))
+                || t.contains(&format!("regarding {d}"));
+            if is_media {
+                continue;
+            }
+            if t.contains("diagnosed with") {
+                return true;
+            }
+            if personal_en
+                && ["have", "had", "has", "with", "got", "suffer"]
+                    .iter()
+                    .any(|w| t.contains(w))
+            {
+                return true;
+            }
+        }
+    }
+
+    // 组 2：症状陈述
+    // 第一人称或用户归属 + 胸痛/呼吸困难/发烧/头晕/疼痛 等症状
+    // 避开「这个 bug 让我头疼」等常见技术比喻
+    let symptoms_zh = [
+        "胸痛",
+        "呼吸困难",
+        "发烧",
+        "高烧",
+        "头晕",
+        "身体疼痛",
+        "胃痛",
+        "偏头痛",
+        "胸闷",
+        "恶心想吐",
+    ];
+    if personal_zh && symptoms_zh.iter().any(|s| t.contains(s)) {
+        return true;
+    }
+    if personal_zh && (t.contains("头疼") || t.contains("头痛")) {
+        let is_metaphor = ["bug", "代码", "程序", "编译", "报错", "故障", "系统"]
+            .iter()
+            .any(|m| t.contains(m));
+        if !is_metaphor {
+            return true;
+        }
+    }
+
+    let symptoms_en = [
+        "chest pain",
+        "shortness of breath",
+        "fever",
+        "dizziness",
+        "stomach pain",
+        "body pain",
+        "migraine",
+    ];
+    if personal_en && symptoms_en.iter().any(|s| contains_english_term(t, s)) {
+        return true;
+    }
+    if personal_en && contains_english_term(t, "headache") {
+        let is_metaphor = ["bug", "code", "error", "system", "icon"]
+            .iter()
+            .any(|m| t.contains(m));
+        if !is_metaphor {
+            return true;
+        }
+    }
+
+    // 组 3：诊断、病史与治疗
+    // 诊断/确诊/病史/病历/治疗/服药/处方/手术 及 diagnosis/medical history/prescription/surgery
+    // 避开「故障诊断」「代码病史」之类技术或比喻用法
+    let is_tech_diag = ["故障诊断", "系统诊断", "网络诊断", "性能诊断", "硬件诊断"]
+        .iter()
+        .any(|m| t.contains(m));
+    let is_tech_hist = ["代码病史", "版本病史", "提交病史"]
+        .iter()
+        .any(|m| t.contains(m));
+    if t.contains("诊断") && !is_tech_diag {
+        return true;
+    }
+    if t.contains("病史") && !is_tech_hist {
+        return true;
+    }
+    for term in ["确诊", "病历", "处方", "手术", "过敏", "服药", "吃药"] {
+        if t.contains(term) {
+            return true;
+        }
+    }
+
+    if contains_english_term(t, "medical history") {
+        return true;
+    }
+    for term in [
+        "prescription",
+        "surgery",
+        "medication",
+        "allergy",
+        "allergic",
+    ] {
+        if contains_english_term(t, term) {
+            return true;
+        }
+    }
+    if contains_english_term(t, "diagnosis")
+        && !t.contains("fault diagnosis")
+        && !t.contains("bug diagnosis")
+        && !t.contains("system diagnosis")
+    {
+        return true;
+    }
+    for phrase in [
+        "take medicine",
+        "taking medicine",
+        "take medication",
+        "taking pills",
+    ] {
+        if t.contains(phrase) {
+            return true;
+        }
+    }
+
+    // 组 4：健康记录
+    // 健康记录/体检报告/检查结果/化验单/医疗记录 及 health record/medical record/lab result，归属于用户时命中
+    // 避开「我在开发健康记录应用」等产品名
+    let records_zh = [
+        "健康记录",
+        "体检报告",
+        "检查结果",
+        "化验单",
+        "医疗记录",
+        "体检单",
+    ];
+    for rec in records_zh {
+        if t.contains(rec) {
+            let is_product = ["应用", "软件", "app", "系统", "平台"]
+                .iter()
+                .any(|suffix| t.contains(&format!("{rec}{suffix}")))
+                || ["开发", "设计", "做一款", "做一个", "做"]
+                    .iter()
+                    .any(|prefix| t.contains(&format!("{prefix}{rec}")));
+            if !is_product {
+                return true;
+            }
+        }
+    }
+
+    let records_en = [
+        "health record",
+        "medical record",
+        "lab result",
+        "medical test result",
+    ];
+    for rec in records_en {
+        if contains_english_term(t, rec) {
+            let is_product = ["app", "application", "software", "system", "platform"]
+                .iter()
+                .any(|suffix| t.contains(&format!("{rec} {suffix}")))
+                || [
+                    "design",
+                    "designing",
+                    "develop",
+                    "developing",
+                    "build",
+                    "building",
+                ]
+                .iter()
+                .any(|prefix| {
+                    t.contains(&format!("{prefix} {rec}"))
+                        || t.contains(&format!("{prefix} a {rec}"))
+                });
+            if !is_product {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn contains_english_term(text: &str, term: &str) -> bool {
+    text.match_indices(term).any(|(start, _)| {
+        let end = start + term.len();
+        let left = start == 0
+            || !text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphabetic());
+        let right = end == text.len()
+            || !text[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic());
+        left && right
+    })
+}
+
 /// 凭据内容（doc5/03 §7）：继承 v1 sensitive() 的密码/token/API key/sk- 值形态，
 /// 命中即 held:SECRET——自动提取与 memory_remember 直写均不得 active（doc5/04 §2）。
 /// 与 v1 的差异只是不再包含健康/证件字面词（后者归 SENSITIVE）；不把值打印到日志。
@@ -1046,6 +1415,87 @@ pub fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admit_v5_health_rule_groups_and_rewrite_union() {
+        use super::*;
+        for (positive, negative) in [
+            ("我患有哮喘", "我画了心脏图标"),
+            ("I have asthma", "I have an asthma book"),
+            ("我有胸痛", "这个 bug 让我头疼"),
+            ("I have chest pain", "I have a headache icon"),
+            ("我有诊断病史", "我在做故障诊断和代码病史分析"),
+            ("I have a medical history", "I wrote a code history"),
+            ("我的健康记录里有心脏病", "我在开发健康记录应用"),
+            (
+                "My health record has a result",
+                "I design a health record app",
+            ),
+        ] {
+            assert!(sensitive_health_v5(positive), "missed: {positive}");
+            assert!(!sensitive_health_v5(negative), "false positive: {negative}");
+        }
+        for text in [
+            "我吃苹果",
+            "I eat apples",
+            "故障诊断",
+            "代码病史",
+            "这个 bug 让我头疼",
+        ] {
+            assert!(!sensitive_health_v5(text), "false positive: {text}");
+        }
+        for text in [
+            "我平时做软件开发，我有高血压",
+            "我是一名应用架构师，我有哮喘",
+            "我对花生过敏。",
+            "我有糖尿病诊断。",
+            "我的病历写着高血压。",
+            "我的健康记录里有心脏病。",
+            "我患有哮喘。",
+            "我对虾过敏。",
+        ] {
+            assert!(sensitive_health_v5(text), "should be sensitive: {text}");
+        }
+        for quote in ["我的健康记录里有心脏病。", "我患有哮喘。"] {
+            let event = WindowEvent {
+                id: "e1".into(),
+                role: "user".into(),
+                source_kind: "user".into(),
+                occurred_at: "2026-10-22T00:00:00Z".into(),
+                content: quote.into(),
+            };
+            let candidate = ModelCandidate {
+                source_event_id: "e1".into(),
+                quote: quote.into(),
+                kind: "fact".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: None,
+                claim: Some("用户有一项长期情况".into()),
+            };
+            assert_eq!(admit_v5(&candidate, &[event]), Admission::Held("SENSITIVE"));
+        }
+        // quote is clean, claim adds sensitive info -> union rule 8 also holds
+        {
+            let quote = "我平时喜欢散步。";
+            let event = WindowEvent {
+                id: "e2".into(),
+                role: "user".into(),
+                source_kind: "user".into(),
+                occurred_at: "2026-10-22T00:00:00Z".into(),
+                content: quote.into(),
+            };
+            let candidate = ModelCandidate {
+                source_event_id: "e2".into(),
+                quote: quote.into(),
+                kind: "fact".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: None,
+                claim: Some("用户患有高血压。".into()),
+            };
+            assert_eq!(admit_v5(&candidate, &[event]), Admission::Held("SENSITIVE"));
+        }
+    }
     use super::*;
 
     #[test]
