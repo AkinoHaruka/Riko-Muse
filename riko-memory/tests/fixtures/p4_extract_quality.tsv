@@ -1,0 +1,121 @@
+id	bucket	expected	kind	claim_points	text
+F01	fact	active	fact	杭州	我住在杭州。
+F02	fact	active	fact	苏州	我住在苏州工业园区。
+F03	fact	active	fact	后端	我在一家教育公司做后端开发。
+F04	fact	active	fact	Rust	我是 Rust 开发工程师。
+F05	fact	active	fact	小林	我叫小林。
+F06	fact	active	fact	自行车	我每天骑自行车通勤。
+F07	fact	active	fact	日语	我正在系统学习日语。
+F08	fact	active	fact	远程	我在远程团队工作。
+F09	fact	active	fact	素食	我长期吃素。
+F10	fact	active	fact	杭州	我出生在杭州。
+F11	fact	active	fact	开源	我维护一个开源项目。
+F12	fact	active	fact	Linux	我的主力电脑运行 Linux。
+P01	preference	active	preference	乌龙茶	我喜欢无糖乌龙茶。
+P02	preference	active	preference	咖啡	我不喜欢加糖咖啡。
+P03	preference	active	preference	短句	我偏好短句回答。
+P04	preference	active	preference	先结论	我更喜欢先听结论。
+P05	preference	active	preference	地铁	我出行通常选地铁。
+P06	preference	active	preference	深色	我喜欢深色主题。
+P07	preference	active	preference	纸质书	我更愿意读纸质书。
+P08	preference	active	preference	清淡	我做饭偏清淡口味。
+P09	preference	active	preference	图表	我喜欢先看图表再看解释。
+P10	preference	active	preference	异步	我偏好异步沟通。
+P11	preference	active	preference	英文	我读技术文档更习惯英文版。
+P12	preference	active	preference	步行	我周末喜欢步行探索城市。
+I01	instruction	active	instruction	中文	以后请用中文回答我。
+I02	instruction	active	instruction	结论	从现在起先给结论。
+I03	instruction	active	instruction	来源	以后引用资料时请给来源。
+I04	instruction	active	instruction	不剧透	记住：讨论小说时不要剧透。
+I05	instruction	active	instruction	单位	以后温度请用摄氏度。
+I06	instruction	active	instruction	列表	以后列步骤请使用编号列表。
+I07	instruction	active	instruction	确认	从现在起发送邮件前请让我确认。
+I08	instruction	active	instruction	术语	以后首次出现专业术语请解释。
+I09	instruction	active	instruction	简洁	请总是简洁地回答我的日程问题。
+I10	instruction	active	instruction	时区	记住：安排会议时使用北京时间。
+I11	instruction	active	instruction	代码	以后给代码示例请附运行命令。
+I12	instruction	active	instruction	原文	以后翻译诗歌请保留原文。
+E01	episode	active	episode	搬家	我在2024年搬到了杭州。
+E02	episode	active	episode	毕业	我在2021年从大学毕业。
+E03	episode	active	episode	旅行	我去年去成都旅行过。
+E04	episode	active	episode	发布	我在2025年发布了第一款应用。
+E05	episode	active	episode	马拉松	我在2023年跑完半程马拉松。
+E06	episode	active	episode	换工作	我上个月换了工作。
+E07	episode	active	episode	演讲	我在今年春天做过一次技术演讲。
+E08	episode	active	episode	考试	我在2022年通过了日语考试。
+E09	episode	active	episode	创业	我曾在2020年参与创业。
+E10	episode	active	episode	比赛	我在去年参加过机器人比赛。
+E11	episode	active	episode	出版	我在2024年出版过一本摄影集。
+E12	episode	active	episode	转行	我在2019年从设计转到了开发。
+M01	multi	active	fact	杭州;Rust	我住在杭州，也主要写 Rust。
+M02	multi	active	fact	苏州;骑车	我在苏州工作，每天骑车通勤。
+M03	multi	active	preference	茶;咖啡	我喜欢茶，但不喜欢咖啡。
+M04	multi	active	fact	Python;Rust	我过去用 Python，现在主要用 Rust。
+M05	multi	active	fact	上海;杭州	我出生在上海，后来搬到杭州。
+M06	multi	active	instruction	中文;来源	以后用中文回答，并在引用数据时给来源。
+M07	multi	active	preference	图表;文字	我喜欢图表，长篇文字我通常跳过。
+M08	multi	active	fact	产品;开发	我负责产品设计，也写前端代码。
+M09	multi	active	fact	猫;狗	我养了一只猫，还养了一只狗。
+M10	multi	active	preference	早晨;夜间	我早晨爱喝茶，晚上喜欢读书。
+M11	multi	active	fact	成都;北京	我在成都读书，在北京工作。
+M12	multi	active	instruction	编号;示例	以后解释算法请编号，并给一个示例。
+N01	neg_cond	active	preference	香菜	我不喜欢香菜。
+N02	neg_cond	active	fact	驾照	我没有驾照。
+N03	neg_cond	active	instruction	不调用	以后没有我许可不要调用外部服务。
+N04	neg_cond	active	preference	辣	我不吃辣。
+N05	neg_cond	reject	fact		如果我住在北京，通勤可能会很方便。
+N06	neg_cond	reject	preference		假如我喜欢咖啡，我会买咖啡机。
+N07	neg_cond	reject	fact		比如有人每天写 Rust，那不代表是我。
+N08	neg_cond	reject	instruction		这次回答先别列清单。
+N09	neg_cond	reject	fact		今天先把报告发给我。
+N10	neg_cond	disputed	fact	深圳	只要有合适岗位，我就会搬去深圳。
+N11	neg_cond	disputed	preference	远程	若能远程办公，我更愿意留在家里。
+N12	neg_cond	reject	fact		If I moved to London, I would take the train.
+C01	correction	active	fact	苏州	不对，我现在住在苏州，刚才说杭州是口误。
+C02	correction	active	preference	茶	我刚才说喜欢咖啡不准确，其实我喜欢茶。
+C03	correction	active	fact	Rust	纠正一下，我主要写 Rust，不是 Go。
+C04	correction	active	fact	周三	我说错了，工资在周三发，不是周五。
+C05	correction	active	instruction	简短	我刚才让你详细回答是口误，以后请简短回答。
+C06	correction	active	fact	杭州	前面提到上海不对，我现在住杭州。
+C07	correction	active	preference	深色	不是浅色，我喜欢深色界面。
+C08	correction	active	fact	2022	我的毕业年份是2022，不是2021。
+C09	correction	active	fact	后端	我不是前端工程师，我做后端开发。
+C10	correction	active	fact	猫	刚才说养狗不对，我养的是猫。
+C11	correction	disputed	fact		不是那样，我之前的意思完全不同。
+C12	correction	active	preference	步行	我不是偏好开车，我更喜欢步行。
+T01	third_party	held	fact		我爸住在南京。
+T02	third_party	held	fact		我妈喜欢辣菜。
+T03	third_party	held	fact		我姐姐在医院工作。
+T04	third_party	held	fact		我同事叫小周。
+T05	third_party	held	fact		我的朋友住在成都。
+T06	third_party	held	fact		我弟弟今年上大学。
+T07	third_party	held	preference		我丈夫不喜欢甜食。
+T08	third_party	held	fact		我女儿在学钢琴。
+T09	third_party	held	fact		我室友养了一只猫。
+T10	third_party	held	fact		我老板每周三出差。
+T11	third_party	held	fact		我邻居喜欢夜跑。
+T12	third_party	held	fact		我儿子在北京读书。
+S01	policy	held	fact		我的密码: demoSecret1234。
+S02	policy	held	fact		我的 password=TestPass9876。
+S03	policy	held	fact		我的 token: abcdefghijklmnop。
+S04	policy	held	fact		我的 api_key=demoKey123456789。
+S05	policy	held	fact		我对花生过敏。
+S06	policy	held	fact		我有糖尿病诊断。
+S07	policy	held	fact		我的病历写着高血压。
+S08	policy	held	fact		我的健康记录里有心脏病。
+S09	policy	held	fact		我患有哮喘。
+S10	policy	held	fact		我的密码：notARealPass55。
+S11	policy	held	fact		我的 access token: sampleTokenABC123。
+S12	policy	held	fact		我对虾过敏。
+L01	mixed_cjk	active	fact	杭州	I live in 杭州。
+L02	mixed_cjk	active	preference	Rust	我喜欢 Rust docs 的英文版。
+L03	mixed_cjk	active	instruction	中文	From now on 请用中文回答。
+L04	mixed_cjk	active	fact	backend	我是 backend engineer。
+L05	mixed_cjk	active	preference	dark mode	我喜欢 dark mode。
+L06	mixed_cjk	active	fact	上海	我住在上海；主要写 TypeScript。
+L07	mixed_cjk	active	fact	杭州	我在杭州工作、做数据工程。
+L08	mixed_cjk	active	preference	短句	我喜欢短句，尤其在手机上阅读时。
+L09	mixed_cjk	active	instruction	来源	以后：先列来源，再给结论。
+L10	mixed_cjk	active	fact	摄影	摄影，是我坚持了十年的爱好。
+L11	mixed_cjk	disputed	fact	广州	广州，我住过三年；现在在哪里没说。
+L12	mixed_cjk	disputed	preference		说到咖啡——偶尔吧，也谈不上喜欢。
