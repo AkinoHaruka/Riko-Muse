@@ -7122,7 +7122,7 @@ const RESIDENT_MAX_ITEMS_DEFAULT: usize = 24;
 const RESIDENT_MAX_ITEMS_MAX: usize = 100;
 const RESIDENT_MAX_CHARS_DEFAULT: usize = 3000;
 const RESIDENT_MAX_CHARS_MAX: usize = 12000;
-const RETRIEVED_MAX_ITEMS_DEFAULT: usize = 8;
+const RETRIEVED_MAX_ITEMS_DEFAULT: usize = 24;
 const RETRIEVED_MAX_ITEMS_MAX: usize = 100;
 const RETRIEVED_MAX_CHARS_DEFAULT: usize = 2400;
 const RETRIEVED_MAX_CHARS_MAX: usize = 24000;
@@ -7390,10 +7390,35 @@ async fn get_resident_suggestions(
 }
 
 /// V2-H1（doc7/09 §2）：bundle 统一预算与各分段上限（服务端常量，非模型自报）。
-const BUNDLE_TOTAL_CHARS: usize = 4000;
+const BUNDLE_TOTAL_CHARS: usize = 8000;
 const BUNDLE_COMPACT_CHARS: usize = 1200;
 const BUNDLE_ALIGNMENT_CHARS: usize = 600;
 const BUNDLE_RELATIONSHIP_ITEMS: usize = 8;
+
+fn retrieved_omission_reason(
+    item_count: usize,
+    item_limit: usize,
+    used_retrieved: usize,
+    entry_chars: usize,
+    retrieved_limit: usize,
+    used_prior_segments: usize,
+    total_limit: usize,
+) -> Option<&'static str> {
+    let cost = entry_chars.saturating_add(usize::from(item_count > 0));
+    if item_count >= item_limit {
+        Some("ITEM_LIMIT")
+    } else if used_retrieved > 0 && used_retrieved.saturating_add(cost) > retrieved_limit {
+        Some("CHAR_LIMIT")
+    } else if used_prior_segments
+        .saturating_add(used_retrieved)
+        .saturating_add(cost)
+        > total_limit
+    {
+        Some("TOTAL_CHAR_LIMIT")
+    } else {
+        None
+    }
+}
 
 async fn post_context_bundle(
     State(state): State<AppState>,
@@ -7639,7 +7664,9 @@ async fn post_context_bundle(
             // V2-H1：compact 已覆盖的原子来源不再进 retrieved（真去重）。
             .chain(compact_ids.iter().cloned())
             .collect();
-        let lane_k = q_items.max(memory_contract::ADJUDICATE_RECALL_TOP_K);
+        // P3：候选深度不能跟随输出条数，否则第 25 条起会无声消失，
+        // retrieved.complete 还可能误报 true。沿用检索通道既有 100 条上限。
+        let lane_k = memory_contract::SEARCH_PER_CHANNEL_LIMIT;
         // ---- 通道 1：词法记忆（FTS+grams 内部融合，单一词法通道排名）。----
         let search_res = {
             let guard = state.store.lock().unwrap();
@@ -7890,13 +7917,13 @@ async fn post_context_bundle(
                         m.evidence_refs.iter().map(|(e, _, _)| e.clone()).collect();
                     let entry = format!("- [memory: {}] {}", m.memory_id, m.claim);
                     let entry_chars = entry.chars().count();
-                    if retrieved_items.len() >= q_items
-                        || (used_chars_retrieved > 0
-                            && used_chars_retrieved + entry_chars + 1 > q_chars)
-                    {
+                    if let Some(reason) = retrieved_omission_reason(
+                        retrieved_items.len(), q_items, used_chars_retrieved, entry_chars,
+                        q_chars, used_total_chars, BUNDLE_TOTAL_CHARS,
+                    ) {
                         retrieved_omitted.push(serde_json::json!({
                             "memory_id": mid,
-                            "reason": if retrieved_items.len() >= q_items { "ITEM_LIMIT" } else { "CHAR_LIMIT" },
+                            "reason": reason,
                         }));
                         retrieved_truncated = true;
                         continue;
@@ -7949,12 +7976,12 @@ async fn post_context_bundle(
                         }
                     );
                     let entry_chars = entry.chars().count();
-                    if retrieved_items.len() >= q_items
-                        || (used_chars_retrieved > 0
-                            && used_chars_retrieved + entry_chars + 1 > q_chars)
-                    {
+                    if let Some(reason) = retrieved_omission_reason(
+                        retrieved_items.len(), q_items, used_chars_retrieved, entry_chars,
+                        q_chars, used_total_chars, BUNDLE_TOTAL_CHARS,
+                    ) {
                         retrieved_omitted
-                            .push(serde_json::json!({"page_id": pid, "reason": "ITEM_LIMIT"}));
+                            .push(serde_json::json!({"page_id": pid, "reason": reason}));
                         retrieved_truncated = true;
                         continue;
                     }
@@ -8054,12 +8081,23 @@ fn bundle_channel_key(kind: &str, id: &str) -> String {
 
 #[cfg(test)]
 mod bundle_channel_tests {
-    use super::bundle_channel_key;
+    use super::{bundle_channel_key, retrieved_omission_reason, BUNDLE_TOTAL_CHARS};
 
     #[test]
     fn memory_and_page_lanes_use_distinct_namespaced_keys() {
         assert_eq!(bundle_channel_key("m", "same-id"), "m:same-id");
         assert_eq!(bundle_channel_key("p", "same-id"), "p:same-id");
+    }
+
+    #[test]
+    fn retrieved_hard_budget_and_default_boundary() {
+        assert_eq!(BUNDLE_TOTAL_CHARS, 8000);
+        assert_eq!(retrieved_omission_reason(23, 24, 2000, 100, 2400, 1000, 8000), None);
+        assert_eq!(retrieved_omission_reason(24, 24, 0, 10, 2400, 0, 8000), Some("ITEM_LIMIT"));
+        assert_eq!(retrieved_omission_reason(1, 24, 2390, 20, 2400, 0, 8000), Some("CHAR_LIMIT"));
+        assert_eq!(retrieved_omission_reason(1, 100, 6000, 113, 24000, 1886, 8000), None);
+        assert_eq!(retrieved_omission_reason(1, 100, 6000, 114, 24000, 1886, 8000), Some("TOTAL_CHAR_LIMIT"));
+        assert_eq!(retrieved_omission_reason(0, 100, 0, 8001, 24000, 0, 8000), Some("TOTAL_CHAR_LIMIT"));
     }
 }
 
