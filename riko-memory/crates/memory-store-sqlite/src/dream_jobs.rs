@@ -40,6 +40,7 @@ pub struct DreamJobRow {
     pub error_code: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub domain_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -545,7 +546,7 @@ impl Store {
         let existing: Option<DreamJobRow> = tx
             .query_row(
                 "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
-                        lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at
+                        lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at, domain_id
                  FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND trigger_key=?3",
                 params![scope.tenant_id, scope.user_id, trigger_key],
                 map_dream_row,
@@ -710,7 +711,7 @@ impl Store {
             .query_row(
                 "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts,
                         run_after, lease_until, claim_generation, input_fingerprint, error_code,
-                        created_at, updated_at
+                        created_at, updated_at, domain_id
                  FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND trigger_key=?3",
                 params![scope.tenant_id, scope.user_id, trigger_key],
                 map_dream_row,
@@ -721,15 +722,17 @@ impl Store {
             return Ok(existing);
         }
 
-        let candidate: Option<(String, String, String)> = tx
+        let candidate: Option<(String, String, String, String)> = tx
             .query_row(
-                "SELECT kind, quote, policy_version FROM dream_candidates
-                 WHERE tenant_id=?1 AND user_id=?2 AND id=?3 AND status='held'",
+                "SELECT c.kind, c.quote, c.policy_version, dj.domain_id
+                 FROM dream_candidates c
+                 JOIN dream_jobs dj ON dj.tenant_id=c.tenant_id AND dj.user_id=c.user_id AND dj.id=c.dream_job_id
+                 WHERE c.tenant_id=?1 AND c.user_id=?2 AND c.id=?3 AND c.status='held'",
                 params![scope.tenant_id, scope.user_id, candidate_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((_kind, quote, policy_version)) = candidate else {
+        let Some((_kind, quote, policy_version, domain_id)) = candidate else {
             return Err(StoreError::JobNotFound);
         };
         let mut inputs = Vec::new();
@@ -827,8 +830,8 @@ impl Store {
             "INSERT INTO dream_jobs
                (id,tenant_id,user_id,trigger_kind,trigger_key,agent_id,host_id,session_id,
                 pipeline_version,extract_version,status,attempts,run_after,claim_generation,
-                input_fingerprint,created_at,updated_at,purpose)
-             VALUES (?1,?2,?3,'manual',?4,?5,?6,?7,?8,?9,'queued',0,?10,0,?11,?10,?10,'redecision')",
+                input_fingerprint,created_at,updated_at,purpose,domain_id)
+             VALUES (?1,?2,?3,'manual',?4,?5,?6,?7,?8,?9,'queued',0,?10,0,?11,?10,?10,'redecision',?12)",
             params![
                 job_id,
                 scope.tenant_id,
@@ -840,7 +843,8 @@ impl Store {
                 DREAM_PIPELINE_V1,
                 DREAM_EXTRACT_V2,
                 now,
-                fingerprint
+                fingerprint,
+                domain_id
             ],
         )?;
         for (order, (evidence_id, host, session, seq, hash)) in inputs.iter().enumerate() {
@@ -1575,7 +1579,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
-                        lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at
+                        lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at, domain_id
                  FROM dream_jobs WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, job_id],
                 map_dream_row,
@@ -1609,7 +1613,7 @@ impl Store {
     ) -> Result<Vec<DreamJobRow>, StoreError> {
         let mut stmt = self.conn().prepare(
             "SELECT id, purpose, trigger_kind, trigger_key, extract_version, status, attempts, run_after,
-                    lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at
+                    lease_until, claim_generation, input_fingerprint, error_code, created_at, updated_at, domain_id
              FROM dream_jobs
              WHERE tenant_id=?1 AND user_id=?2 AND (?3 IS NULL OR status=?3)
              ORDER BY created_at DESC, id DESC LIMIT ?4",
@@ -1774,6 +1778,7 @@ fn map_dream_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DreamJobRow> {
         error_code: r.get(11)?,
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
+        domain_id: r.get(14)?,
     })
 }
 

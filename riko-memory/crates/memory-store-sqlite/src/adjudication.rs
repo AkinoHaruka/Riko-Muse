@@ -682,6 +682,13 @@ impl Store {
         if stale_sources > 0 {
             return Err(StoreError::StaleInput);
         }
+        let domain_id: String = tx.query_row(
+            "SELECT d.domain_id FROM adjudication_jobs a JOIN dream_jobs d
+               ON d.tenant_id=a.tenant_id AND d.user_id=a.user_id AND d.id=a.dream_job_id
+             WHERE a.tenant_id=?1 AND a.user_id=?2 AND a.id=?3",
+            params![scope.tenant_id, scope.user_id, job_id],
+            |r| r.get(0),
+        )?;
         let mut l1_audits: Vec<(String, i64)> = Vec::new();
         let mut l2_deletes: Vec<(String, i64)> = Vec::new();
         for p in proposals {
@@ -813,12 +820,12 @@ impl Store {
                                 "INSERT INTO memories
                                    (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256,
                                     source_class, status, version, occurred_at, valid_from, valid_until,
-                                    origin_host_id, origin_agent_id, created_at, updated_at)
+                                    origin_host_id, origin_agent_id, created_at, updated_at, domain_id)
                                  VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,?8,
-                                         'dream','dream',?9,?9)",
+                                         'dream','dream',?9,?9,?10)",
                                 params![mid, scope.tenant_id, scope.user_id, kind.as_str(), claim,
                                         memory_domain::normalize_v1(&claim), hash,
-                                        p.valid_until, now],
+                                        p.valid_until, now, domain_id],
                             )?;
                             Self::attach_frozen_evidence_tx(&tx, scope, &mid, &spans)?;
                             tx.execute(
@@ -946,9 +953,9 @@ impl Store {
                         "INSERT INTO memories
                            (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256,
                             source_class, status, version, occurred_at, valid_from, valid_until,
-                            origin_host_id, origin_agent_id, created_at, updated_at)
+                            origin_host_id, origin_agent_id, created_at, updated_at, domain_id)
                          VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,?8,
-                                 'dream','dream',?9,?9)",
+                                 'dream','dream',?9,?9,?10)",
                         params![
                             new_id,
                             scope.tenant_id,
@@ -958,7 +965,8 @@ impl Store {
                             memory_domain::normalize_v1(&claim),
                             hash,
                             p.valid_until,
-                            now
+                            now,
+                            domain_id
                         ],
                     )?;
                     Self::attach_frozen_evidence_tx(&tx, scope, &new_id, &spans)?;

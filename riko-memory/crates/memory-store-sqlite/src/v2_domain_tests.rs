@@ -785,3 +785,269 @@ fn write_domain_is_always_readable_and_read_json_binds() {
         .unwrap();
     assert_eq!(main_ids, vec![m_main]);
 }
+
+#[test]
+fn dream_job_and_cli_domain_isolation() {
+    let (mut store, scope) = setup("dream-iso");
+    store
+        .domain_create_side(&scope, "side_a", "test A")
+        .unwrap();
+    store
+        .domain_create_side(&scope, "side_b", "test B")
+        .unwrap();
+
+    let dom_a = dom_side("side_a");
+    let dom_b = dom_side("side_b");
+    let dom_m = dom_main();
+
+    // 1. 同一事实分别写入主域与作业域：互不可见验证
+    let m_main = remember_in(
+        &mut store,
+        &scope,
+        &origin("s-main"),
+        1,
+        "用户喜欢喝乌龙茶",
+        MemoryKind::Fact,
+        &dom_m,
+    );
+    let m_side_a = remember_in(
+        &mut store,
+        &scope,
+        &origin("s-side-a"),
+        1,
+        "用户喜欢喝龙井茶",
+        MemoryKind::Fact,
+        &dom_a,
+    );
+    let m_side_b = remember_in(
+        &mut store,
+        &scope,
+        &origin("s-side-b"),
+        1,
+        "用户喜欢喝红茶",
+        MemoryKind::Fact,
+        &dom_b,
+    );
+
+    // 主域只读主域：看不到 side_a 和 side_b
+    assert!(store.get_memory(&scope, &m_main, &dom_m).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &m_side_a, &dom_m)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_memory(&scope, &m_side_b, &dom_m)
+        .unwrap()
+        .is_none());
+
+    // side_a 继承主域，但看不到 side_b
+    assert!(store.get_memory(&scope, &m_main, &dom_a).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &m_side_a, &dom_a)
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_memory(&scope, &m_side_b, &dom_a)
+        .unwrap()
+        .is_none());
+
+    // side_b 继承主域，但看不到 side_a
+    assert!(store.get_memory(&scope, &m_main, &dom_b).unwrap().is_some());
+    assert!(store
+        .get_memory(&scope, &m_side_a, &dom_b)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_memory(&scope, &m_side_b, &dom_b)
+        .unwrap()
+        .is_some());
+
+    // 2. Dream 作业域接线与读写隔离
+    let t = chrono::Utc::now();
+    let ev_a = match store
+        .record_evidence(
+            &scope,
+            &origin("dream-ev-a"),
+            10,
+            "user",
+            "user",
+            &t,
+            "用户说他每天早上跑步五公里",
+            &dom_a,
+        )
+        .unwrap()
+    {
+        crate::IngestOutcome::Recorded(id) | crate::IngestOutcome::AlreadyRecorded(id) => id,
+    };
+
+    // 触发 side_a 域的 Dream 作业
+    let dream_job = store
+        .dream_trigger(
+            &scope,
+            "manual",
+            "trig-side-a",
+            Some("a"),
+            Some("dsh"),
+            Some("dream-ev-a"),
+            &dom_a,
+        )
+        .unwrap()
+        .expect("dream job queued");
+
+    assert_eq!(dream_job.domain_id, "side_a");
+
+    // dream_claim_next 领取的作业 domain_id 为 side_a
+    let now = crate::now_rfc3339_pub().unwrap();
+    let claimed = store.dream_claim_next(&now, 300).unwrap();
+    assert!(claimed.is_some());
+    let (cscope, cjob) = claimed.unwrap();
+    assert_eq!(cscope, scope);
+    assert_eq!(cjob.id, dream_job.id);
+    assert_eq!(cjob.domain_id, "side_a");
+
+    // 提交 candidate
+    let quote = "用户说他每天早上跑步五公里";
+    let proposal = crate::dream_jobs::DreamProposal {
+        evidence_id: ev_a.clone(),
+        quote: quote.into(),
+        kind: "fact".into(),
+        claim: "用户每天早上跑步五公里".into(),
+        start_byte: 0,
+        end_byte: quote.len() as i64,
+        status: "candidate".into(),
+        reason_code: None,
+        occurred_at: None,
+    };
+    let (acc, rej) = store
+        .dream_submit_candidates(
+            &scope,
+            &cjob.id,
+            cjob.claim_generation,
+            crate::dream_jobs::DREAM_POLICY_V1,
+            &[proposal],
+        )
+        .unwrap();
+    assert_eq!(acc, 1);
+    assert_eq!(rej, 0);
+
+    // 冻结裁决作业
+    let cands = store.dream_accepted_candidates(&scope, &cjob.id).unwrap();
+    assert_eq!(cands.len(), 1);
+    let cand = &cands[0].0;
+    let cand_id = &cand.candidate_id;
+
+    let adj_input = crate::adjudication::AdjudicationCandidate {
+        candidate_id: cand_id.clone(),
+        kind: cand.kind.clone(),
+        claim: cand.claim.clone(),
+        quote: cand.quote.clone(),
+        status: cand.status.clone(),
+        evidence_id: cand.evidence_id.clone(),
+        start_byte: cand.start_byte,
+        end_byte: cand.end_byte,
+    };
+
+    let adj = store
+        .adjudication_create(
+            &scope,
+            &cjob.id,
+            memory_contract::ADMISSION_VERSION_V3,
+            crate::adjudication::ADJUDICATE_V1,
+            Some("test-emb"),
+            &[adj_input],
+            &[],
+        )
+        .unwrap()
+        .expect("adjudication job created");
+
+    // 领取裁决作业
+    let now2 = crate::now_rfc3339_pub().unwrap();
+    let (_, ajob) = store.adjudication_claim(&now2, 300).unwrap().unwrap();
+    assert_eq!(ajob.id, adj.id);
+
+    // 应用裁决新建记忆
+    let adj_prop = crate::adjudication::AdjudicationProposal {
+        candidate_id: cand_id.clone(),
+        durability: "durable".into(),
+        action: "create".into(),
+        reason_code: Some("test".into()),
+        target_memory_id: None,
+        expected_target_version: None,
+        model_confidence: Some(0.95),
+        valid_until: None,
+    };
+    let outcome = store
+        .adjudication_apply_and_complete(
+            &scope,
+            &ajob.id,
+            ajob.claim_generation,
+            cjob.claim_generation,
+            &[adj_prop],
+        )
+        .unwrap();
+    assert_eq!(outcome.rows.len(), 1);
+    let (ref applied_cid, ref app_status, ref applied_mid, _) = outcome.rows[0];
+    assert_eq!(applied_cid, cand_id);
+    assert_eq!(app_status, "applied");
+    let new_memory_id = applied_mid.as_ref().unwrap();
+
+    // 核心断言：记忆的 domain_id 是 side_a
+    let stored_domain: String = store
+        .conn()
+        .query_row(
+            "SELECT domain_id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+            rusqlite::params![scope.tenant_id, scope.user_id, new_memory_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_domain, "side_a",
+        "Dream 作业生成的记忆归属作业域 side_a"
+    );
+
+    // 核心断言：主域完全不可见 side_a 的 Dream 记忆
+    assert!(
+        store
+            .get_memory(&scope, new_memory_id, &dom_m)
+            .unwrap()
+            .is_none(),
+        "主域读不到 side_a Dream 记忆"
+    );
+    let (hits_m, _) = store
+        .search_memories(&scope, "跑步", 10, false, &dom_m)
+        .unwrap();
+    assert!(hits_m.is_empty(), "主域搜不到 side_a Dream 记忆");
+
+    // side_b 也完全不可见 side_a 的 Dream 记忆
+    assert!(
+        store
+            .get_memory(&scope, new_memory_id, &dom_b)
+            .unwrap()
+            .is_none(),
+        "side_b 读不到 side_a Dream 记忆"
+    );
+    let (hits_b, _) = store
+        .search_memories(&scope, "跑步", 10, false, &dom_b)
+        .unwrap();
+    assert!(hits_b.is_empty(), "side_b 搜不到 side_a Dream 记忆");
+
+    // side_a 自身可见
+    assert!(
+        store
+            .get_memory(&scope, new_memory_id, &dom_a)
+            .unwrap()
+            .is_some(),
+        "side_a 读得到自身 Dream 记忆"
+    );
+    let (hits_a, _) = store
+        .search_memories(&scope, "跑步", 10, false, &dom_a)
+        .unwrap();
+    assert_eq!(hits_a.len(), 1);
+    assert_eq!(&hits_a[0].memory_id, new_memory_id);
+
+    // 验证记忆所属域为 side_a
+    assert_eq!(
+        store.memory_domain_id(&scope, new_memory_id).unwrap(),
+        Some("side_a".to_string())
+    );
+}

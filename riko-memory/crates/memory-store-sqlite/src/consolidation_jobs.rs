@@ -27,6 +27,7 @@ pub struct ConsolidationJobRow {
     pub error_code: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub domain_id: String,
 }
 
 /// 固化输入项：(memory_id, memory_version, claim_sha256)。
@@ -362,7 +363,7 @@ impl Store {
             .query_row(
                 "SELECT id, document_kind, document_key, question_version, input_fingerprint,
                         generator_version, status, attempts, run_after, lease_until,
-                        claim_generation, error_code, created_at, updated_at
+                        claim_generation, error_code, created_at, updated_at, domain_id
                  FROM consolidation_jobs
                  WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                 params![scope.tenant_id, scope.user_id, job_id],
@@ -398,7 +399,7 @@ impl Store {
         let mut stmt = self.conn().prepare(
             "SELECT id, document_kind, document_key, question_version, input_fingerprint,
                     generator_version, status, attempts, run_after, lease_until,
-                    claim_generation, error_code, created_at, updated_at
+                    claim_generation, error_code, created_at, updated_at, domain_id
              FROM consolidation_jobs
              WHERE tenant_id=?1 AND user_id=?2 AND (?3 IS NULL OR status=?3)
              ORDER BY created_at DESC, id DESC LIMIT ?4",
@@ -523,6 +524,7 @@ fn map_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConsolidationJobRow> {
         error_code: r.get(11)?,
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
+        domain_id: r.get(14)?,
     })
 }
 

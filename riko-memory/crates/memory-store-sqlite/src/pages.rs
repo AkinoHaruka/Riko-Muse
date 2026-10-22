@@ -606,6 +606,22 @@ impl Store {
         Ok((page_id, new_version))
     }
 
+    /// 查询页面所属域。
+    pub fn page_domain_id(
+        &self,
+        scope: &ScopeKey,
+        page_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT domain_id FROM memory_pages WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, page_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// 读单页（doc6/05 §4 读时复核）：published 且全部来源当前 active/同版/
     /// 未过期才返回；任何不符立即不可见。
     pub fn get_page(

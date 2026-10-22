@@ -473,6 +473,22 @@ impl Store {
         Ok((s as i64, e as i64))
     }
 
+    /// 查询记忆所属域。
+    pub fn memory_domain_id(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT domain_id FROM memories WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                params![scope.tenant_id, scope.user_id, memory_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// GET /v1/memories/{id}。普通读只返回 active；非 active 视为不存在（doc/12 §5）。
     /// V2-S1：只在读域集内可见。
     pub fn get_memory(

@@ -165,6 +165,8 @@ enum Commands {
         quote: String,
         #[arg(long)]
         idempotency_key: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// D6-9：恢复一条退休记忆（须最新用户事件 quote 定位）
     Restore {
@@ -184,6 +186,8 @@ enum Commands {
         quote: String,
         #[arg(long)]
         idempotency_key: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// D6-9：purge 第一阶段 preview（只读业务记忆；写确认元数据）
     PurgePreview {
@@ -198,6 +202,8 @@ enum Commands {
         /// 幂等键（confirm 须带同键；重复 confirm 只取回无正文结果）
         #[arg(long)]
         idempotency_key: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// D6-9：purge 第二阶段 confirm（消费 token 并执行闭包）
     PurgeConfirm {
@@ -211,6 +217,8 @@ enum Commands {
         token: String,
         #[arg(long)]
         idempotency_key: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// D6-9：设置 retention 策略（可信 CLI；默认 0=关闭）
     RetentionPolicy {
@@ -249,6 +257,8 @@ enum Commands {
         tenant: String,
         #[arg(long)]
         user: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// SQLite 在线一致性备份（VACUUM INTO）
     Backup {
@@ -475,6 +485,8 @@ enum ResidentAction {
         tenant: String,
         #[arg(long)]
         user: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// 导出 pinned 清单 Markdown（D6-2 视图：仅 pinned 区；预算/召回归 D6-3 bundle）
     Export {
@@ -486,6 +498,8 @@ enum ResidentAction {
         user: String,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
 }
 
@@ -572,6 +586,8 @@ enum PagesAction {
         status: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// 显示单页（读时复核来源；失效页不显示正文）
     Show {
@@ -583,6 +599,8 @@ enum PagesAction {
         user: String,
         #[arg(long)]
         page_id: String,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// 归档页面（CAS；保留 revision，不再搜索/注入）
     Archive {
@@ -617,6 +635,8 @@ enum ConsolidateAction {
         /// 覆盖检索词；缺省 mental_model 用问题正文、topic_page 用 key
         #[arg(long)]
         query: Option<String>,
+        #[arg(long, default_value = "user_main")]
+        domain: String,
     },
     /// 列出整理作业（诊断）
     Status {
@@ -1696,6 +1716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             evidence_id,
             quote,
             idempotency_key,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -1703,6 +1724,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let origin = Origin {
                 host_id: "cli".into(),
                 agent_id: "admin".into(),
@@ -1713,11 +1735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .verify_user_quote_span(&scope, &origin, &evidence_id, &quote)
                 .map_err(|e| format!("quote 核验失败: {e}"))?;
             let claim_ok = store
-                .get_memory(
-                    &scope,
-                    &memory_id,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .get_memory(&scope, &memory_id, &dom)
                 .map_err(|e| e.to_string())?
                 .map(|m| find_quote_span(&m.claim, &quote).is_some())
                 .unwrap_or(false);
@@ -1736,12 +1754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 end_byte: end_byte as i64,
             };
             let retired = store
-                .retire_memory(
-                    &scope,
-                    &memory_id,
-                    &req,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .retire_memory(&scope, &memory_id, &req, &dom)
                 .map_err(|e| e.to_string())?;
             println!("retire 完成：memory_id={memory_id} retired={retired}");
             Ok(())
@@ -1755,6 +1768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             evidence_id,
             quote,
             idempotency_key,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -1762,6 +1776,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let origin = Origin {
                 host_id: "cli".into(),
                 agent_id: "admin".into(),
@@ -1781,12 +1796,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 end_byte: end_byte as i64,
             };
             let restored = store
-                .restore_memory(
-                    &scope,
-                    &memory_id,
-                    &req,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .restore_memory(&scope, &memory_id, &req, &dom)
                 .map_err(|e| e.to_string())?;
             println!("restore 完成：memory_id={memory_id} restored={restored}");
             Ok(())
@@ -1797,6 +1807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user,
             memory_id,
             idempotency_key,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -1804,13 +1815,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let (token, preview) = store
-                .purge_preview(
-                    &scope,
-                    &memory_id,
-                    &idempotency_key,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .purge_preview(&scope, &memory_id, &idempotency_key, &dom)
                 .map_err(|e| e.to_string())?;
             // 明文 token 只输出一次（确认后即弃；库中仅存哈希）。
             println!("preview token（一次性，15 分钟内有效）：{token}");
@@ -1826,6 +1833,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user,
             token,
             idempotency_key,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -1833,13 +1841,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let out = store
-                .purge_confirm(
-                    &scope,
-                    &token,
-                    &idempotency_key,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .purge_confirm(&scope, &token, &idempotency_key, &dom)
                 .map_err(|e| e.to_string())?;
             println!(
                 "purge confirm 完成：job_id={} deleted={}",
@@ -1898,6 +1902,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             tenant,
             user,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let mut store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -1905,18 +1910,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let scan = store
-                .rupture_scan(&scope, &memory_domain::DomainScope::user_main())
+                .rupture_scan(&scope, &dom)
                 .map_err(|e| e.to_string())?;
             println!(
                 "rupture 扫描完成：扫描事件 {} 条、新 rupture {} 条、新线程 {}",
                 scan.scanned_events, scan.inserted_ruptures, scan.opened_threads
             );
             let synthesis = store
-                .alignment_synthesis_refresh(
-                    &scope,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .alignment_synthesis_refresh(&scope, &dom)
                 .map_err(|e| e.to_string())?;
             println!(
                 "synthesis 版本 {}：窗口 {} → {}，纠正 {}/{}，无纠正率 {:.2}，待修复线程 {}",
@@ -2226,6 +2229,7 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             config,
             tenant,
             user,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -2233,13 +2237,10 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             let rows = store
-                .resident_pins_with_status(
-                    &scope,
-                    &now,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .resident_pins_with_status(&scope, &now, &dom)
                 .map_err(|e| e.to_string())?;
             if rows.is_empty() {
                 println!("（无 enabled pin）");
@@ -2262,6 +2263,7 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             tenant,
             user,
             out,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -2269,13 +2271,10 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             let rows = store
-                .resident_pins_with_status(
-                    &scope,
-                    &now,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .resident_pins_with_status(&scope, &now, &dom)
                 .map_err(|e| e.to_string())?;
             let mut md = String::from("# 长期记忆（resident pinned 视图）\n\n");
             md.push_str(&format!(
@@ -2287,11 +2286,7 @@ fn run_resident_action(action: ResidentAction) -> Result<(), String> {
             let rows_len = rows.len();
             for r in rows {
                 let claim = store
-                    .get_memory_claim(
-                        &scope,
-                        &r.memory_id,
-                        /*DOM*/ &memory_domain::DomainScope::user_main(),
-                    )
+                    .get_memory_claim(&scope, &r.memory_id, &dom)
                     .map_err(|e| e.to_string())?
                     .unwrap_or_else(|| "（正文不可读）".into());
                 let visibility = if r.visible {
@@ -2323,24 +2318,15 @@ fn select_consolidation_inputs(
     store: &Store,
     scope: &ScopeKey,
     query: &str,
+    dom: &memory_domain::DomainScope,
 ) -> Result<Vec<(String, i64, String)>, String> {
     let (hits, _) = store
-        .search_memories(
-            scope,
-            query,
-            20,
-            false,
-            /*DOM*/ &memory_domain::DomainScope::user_main(),
-        )
+        .search_memories(scope, query, 20, false, dom)
         .map_err(|e| e.to_string())?;
     let mut inputs: Vec<(String, i64, String)> = Vec::new();
     for hit in hits {
         let (v, s) = store
-            .memory_version_sha(
-                scope,
-                &hit.memory_id,
-                /*DOM*/ &memory_domain::DomainScope::user_main(),
-            )
+            .memory_version_sha(scope, &hit.memory_id, dom)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("记忆 {} 读取失败", hit.memory_id))?;
         inputs.push((hit.memory_id, v, s));
@@ -2479,6 +2465,7 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
             user,
             status,
             limit,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -2486,6 +2473,7 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             if !(1..=100).contains(&limit) {
                 return Err("limit 必须 1～100".into());
             }
@@ -2494,12 +2482,7 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
                 Some(s) => s.split(',').map(str::trim).collect(),
             };
             let rows = store
-                .page_list(
-                    &scope,
-                    &statuses,
-                    limit,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .page_list(&scope, &statuses, limit, &dom)
                 .map_err(|e| e.to_string())?;
             if rows.is_empty() {
                 println!("（无页面）");
@@ -2528,6 +2511,7 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
             tenant,
             user,
             page_id,
+            domain,
         } => {
             let cfg = Config::load(&config)?;
             let store = open_store_warned(&cfg.db_path, &cfg.migrations_dir)?;
@@ -2535,14 +2519,10 @@ fn run_pages_action(action: PagesAction) -> Result<(), String> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             let now = memory_store_sqlite::now_rfc3339_pub().map_err(|e| e.to_string())?;
             match store
-                .get_page(
-                    &scope,
-                    &page_id,
-                    &now,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
-                )
+                .get_page(&scope, &page_id, &now, &dom)
                 .map_err(|e| e.to_string())?
             {
                 None => Err(format!(
@@ -2594,6 +2574,7 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
             kind,
             key,
             query,
+            domain,
         } => {
             if !matches!(kind.as_str(), "mental_model" | "topic_page") {
                 return Err("kind 必须是 mental_model/topic_page".into());
@@ -2604,6 +2585,7 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
                 tenant_id: tenant,
                 user_id: user,
             };
+            let dom = cli_domain_scope(&store, &scope, &domain)?;
             // mental_model：问题必须已登记且 active（doc6/05 §2 空目录跳过画像）。
             let question_version = if kind == "mental_model" {
                 let q = store
@@ -2630,7 +2612,7 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
                     key.clone()
                 }
             });
-            let inputs = select_consolidation_inputs(&store, &scope, &search_query)?;
+            let inputs = select_consolidation_inputs(&store, &scope, &search_query, &dom)?;
             if kind == "topic_page" && inputs.len() < 2 {
                 return Err(format!(
                     "主题页至少需要 2 条 active 来源（当前 {} 条）；doc6/05 §2 不满足不生成",
@@ -2662,7 +2644,7 @@ fn run_consolidate_action(action: ConsolidateAction) -> Result<(), String> {
                     &fingerprint,
                     &inputs,
                     &now,
-                    /*DOM*/ &memory_domain::DomainScope::user_main(),
+                    &dom,
                 )
                 .map_err(|e| e.to_string())?;
             println!(
