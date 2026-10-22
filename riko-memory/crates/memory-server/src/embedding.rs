@@ -170,14 +170,32 @@ fn decode_embeddings_response(
         .iter()
         .filter(|item| matches!(item.index, EmbeddingIndex::Present(_)))
         .count();
-    if indexed_count != 0 && indexed_count != parsed.data.len() {
+
+    let is_all_indexed = indexed_count == parsed.data.len();
+    let is_none_indexed = indexed_count == 0;
+    // Google's OpenAI-compatible embeddings endpoint serializes proto3 JSON,
+    // where integer 0 is default and omitted from JSON. When batching items,
+    // item 0 omits the index while items 1..N have explicit indices.
+    let is_proto3_zero_omitted = indexed_count == parsed.data.len().saturating_sub(1)
+        && !parsed
+            .data
+            .iter()
+            .any(|item| matches!(item.index, EmbeddingIndex::Present(0)));
+
+    if !is_all_indexed && !is_none_indexed && !is_proto3_zero_omitted {
         return Err(EmbeddingError::BadJson);
     }
 
     let mut out: Vec<Option<Vec<f32>>> = vec![None; expected_count];
     for (position, item) in parsed.data.into_iter().enumerate() {
         let index = match item.index {
-            EmbeddingIndex::Missing => position,
+            EmbeddingIndex::Missing => {
+                if is_none_indexed {
+                    position
+                } else {
+                    0
+                }
+            }
             EmbeddingIndex::Present(index) => index,
         };
         if index >= expected_count || out[index].is_some() {
@@ -294,6 +312,17 @@ mod tests {
     #[test]
     fn accepts_google_compatible_embeddings_without_indexes_in_response_order() {
         let raw = br#"{"data":[{"object":"embedding","embedding":[0.1,0.2]},{"object":"embedding","embedding":[0.3,0.4]}]}"#;
+        assert_eq!(
+            decode_embeddings_response(raw, 2, 2).unwrap(),
+            vec![vec![0.1, 0.2], vec![0.3, 0.4]],
+        );
+    }
+
+    #[test]
+    fn accepts_google_proto3_default_zero_omitted_batch() {
+        // In Google's OpenAI-compatible endpoint, proto3 JSON suppresses default index 0,
+        // so item 0 lacks "index" while subsequent items have "index": 1, etc.
+        let raw = br#"{"data":[{"object":"embedding","embedding":[0.1,0.2]},{"object":"embedding","index":1,"embedding":[0.3,0.4]}]}"#;
         assert_eq!(
             decode_embeddings_response(raw, 2, 2).unwrap(),
             vec![vec![0.1, 0.2], vec![0.3, 0.4]],
