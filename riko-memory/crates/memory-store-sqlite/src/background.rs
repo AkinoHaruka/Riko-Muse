@@ -33,6 +33,17 @@ pub struct TaskRun {
     pub run_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskClaim {
+    pub task_kind: String,
+    pub signal_ref: String,
+    pub status: String,
+    pub attempts: i64,
+    pub lease_until: i64,
+    pub next_retry_at: i64,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RepairAction {
     pub id: String,
@@ -140,6 +151,121 @@ const ACTION_COLS: &str = "id, thread_id, action, expected_behavior, conditions,
      source_memory_id, generator_version, created_at, updated_at";
 
 impl Store {
+    /// A stable signal reference for a due batch. The ledger remains the source of truth
+    /// for consumed events; this reference only prevents concurrent execution.
+    pub fn task_signal_ref(
+        &self,
+        scope: &ScopeKey,
+        dom: &DomainScope,
+        kind: &str,
+    ) -> Result<String, StoreError> {
+        let today = &now_rfc3339()?[..10];
+        let marker: Option<String> = match kind {
+            "upkeep" | "quiet" => self.conn().query_row(
+                "SELECT MAX(e.id) FROM evidence_events e LEFT JOIN evidence_domain_map d
+                 ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
+                 WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+                   AND COALESCE(d.domain_id,'user_main')=?3
+                   AND NOT EXISTS (SELECT 1 FROM processing_ledger l WHERE l.tenant_id=e.tenant_id
+                     AND l.user_id=e.user_id AND l.domain_id=?3 AND l.task_kind=?4 AND l.signal_ref=e.id)",
+                params![scope.tenant_id,scope.user_id,dom.write,kind], |r| r.get(0))?,
+            "relationships" => self.conn().query_row(
+                "SELECT MAX(updated_at || ':' || id) FROM memories
+                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND status='active'",
+                params![scope.tenant_id,scope.user_id,dom.write], |r| r.get(0))?,
+            "nightly" => None,
+            _ => return Err(StoreError::StateConflict),
+        };
+        Ok(format!("{kind}:{today}:{}", marker.unwrap_or_default()))
+    }
+
+    /// Atomic SQLite claim. Stale leases may be retried up to three times.
+    pub fn task_claim(
+        &mut self,
+        scope: &ScopeKey,
+        dom: &DomainScope,
+        kind: &str,
+        signal: &str,
+        owner: &str,
+        lease_secs: i64,
+    ) -> Result<bool, StoreError> {
+        if !["upkeep", "relationships", "nightly", "quiet"].contains(&kind)
+            || signal.is_empty()
+            || owner.is_empty()
+        {
+            return Err(StoreError::StateConflict);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let n = self.conn_mut().execute(
+            "INSERT INTO task_claims (tenant_id,user_id,domain_id,task_kind,signal_ref,owner,status,attempts,lease_until,next_retry_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'running',1,?7,0,?8)
+             ON CONFLICT(tenant_id,user_id,domain_id,task_kind,signal_ref) DO UPDATE SET
+               owner=excluded.owner,status='running',attempts=task_claims.attempts+1,
+               lease_until=excluded.lease_until,updated_at=excluded.updated_at
+             WHERE task_claims.status IN ('retry','running') AND task_claims.attempts<3
+               AND task_claims.lease_until<=?9 AND task_claims.next_retry_at<=?9",
+            params![scope.tenant_id,scope.user_id,dom.write,kind,signal,owner,now+lease_secs.max(1),now_rfc3339()?,now])?;
+        Ok(n == 1)
+    }
+
+    pub fn task_finish(
+        &mut self,
+        scope: &ScopeKey,
+        dom: &DomainScope,
+        kind: &str,
+        signal: &str,
+        owner: &str,
+        success: bool,
+    ) -> Result<bool, StoreError> {
+        let now = chrono::Utc::now().timestamp();
+        let n = self.conn_mut().execute(
+            "UPDATE task_claims SET status=CASE WHEN ?6=1 THEN 'done' WHEN attempts>=3 THEN 'exhausted' ELSE 'retry' END,
+             owner=NULL, lease_until=0, next_retry_at=CASE WHEN ?6=1 THEN 0 ELSE ?7 + (1 << attempts) END,
+             updated_at=?8 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND task_kind=?4
+             AND signal_ref=?5 AND owner=?9 AND status='running' AND lease_until>=?7",
+            params![scope.tenant_id,scope.user_id,dom.write,kind,signal,if success {1} else {0},now,now_rfc3339()?,owner])?;
+        Ok(n == 1)
+    }
+
+    pub fn task_claims(
+        &self,
+        scope: &ScopeKey,
+        dom: &DomainScope,
+    ) -> Result<Vec<TaskClaim>, StoreError> {
+        let mut stmt=self.conn().prepare("SELECT task_kind,signal_ref,status,attempts,lease_until,next_retry_at,updated_at
+          FROM task_claims WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 ORDER BY updated_at DESC LIMIT 40")?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, dom.write], |r| {
+            Ok(TaskClaim {
+                task_kind: r.get(0)?,
+                signal_ref: r.get(1)?,
+                status: r.get(2)?,
+                attempts: r.get(3)?,
+                lease_until: r.get(4)?,
+                next_retry_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn task_consume_events(
+        &mut self,
+        scope: &ScopeKey,
+        dom: &DomainScope,
+        kind: &str,
+    ) -> Result<i64, StoreError> {
+        if !["upkeep", "quiet"].contains(&kind) {
+            return Err(StoreError::StateConflict);
+        }
+        let n=self.conn_mut().execute("INSERT OR IGNORE INTO processing_ledger
+          (tenant_id,user_id,domain_id,task_kind,signal_ref,generation,processed_at)
+          SELECT e.tenant_id,e.user_id,?3,?4,e.id,1,?5 FROM evidence_events e
+          LEFT JOIN evidence_domain_map d ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
+          WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+            AND COALESCE(d.domain_id,'user_main')=?3",
+          params![scope.tenant_id,scope.user_id,dom.write,kind,now_rfc3339()?])?;
+        Ok(n as i64)
+    }
     /// 记账一个已消化的信号（doc7/08 §1）。返回 true=本次新记，false=已经记过。
     pub fn ledger_record(
         &self,
@@ -337,8 +463,12 @@ impl Store {
                 let artifact_id: Option<String> = self.conn().query_row(
                     "SELECT generation_artifact_id FROM repair_actions WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
                     params![scope.tenant_id,scope.user_id,action.id], |r| r.get(0))?;
-                let Some(artifact_id) = artifact_id else { continue; };
-                if !self.generation_artifact_visible(scope, &artifact_id)? { continue; }
+                let Some(artifact_id) = artifact_id else {
+                    continue;
+                };
+                if !self.generation_artifact_visible(scope, &artifact_id)? {
+                    continue;
+                }
             }
             visible.push(action);
         }
@@ -514,13 +644,23 @@ impl Store {
         // 未消化信号：user 事件里没有出现在 upkeep 账本中的那些。
         let unprocessed: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM evidence_events e
+             LEFT JOIN evidence_domain_map d ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
              WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+               AND COALESCE(d.domain_id,'user_main')=?3
                AND NOT EXISTS (SELECT 1 FROM processing_ledger l
                    WHERE l.tenant_id=e.tenant_id AND l.user_id=e.user_id
-                     AND l.task_kind='upkeep' AND l.signal_ref=e.id)",
-            params![scope.tenant_id, scope.user_id],
+                     AND l.domain_id=?3 AND l.task_kind='upkeep' AND l.signal_ref=e.id)",
+            params![scope.tenant_id, scope.user_id,dom.write],
             |r| r.get(0),
         )?;
+        let quiet_unprocessed: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM evidence_events e
+             LEFT JOIN evidence_domain_map d ON d.tenant_id=e.tenant_id AND d.user_id=e.user_id AND d.evidence_id=e.id
+             WHERE e.tenant_id=?1 AND e.user_id=?2 AND e.role='user' AND e.source_kind='user'
+               AND COALESCE(d.domain_id,'user_main')=?3
+               AND NOT EXISTS (SELECT 1 FROM processing_ledger l WHERE l.tenant_id=e.tenant_id
+                 AND l.user_id=e.user_id AND l.domain_id=?3 AND l.task_kind='quiet' AND l.signal_ref=e.id)",
+            params![scope.tenant_id,scope.user_id,dom.write], |r| r.get(0))?;
 
         let last_activity: Option<String> = self
             .conn()
@@ -537,7 +677,7 @@ impl Store {
                 .conn()
                 .query_row(
                     "SELECT MAX(run_at) FROM task_runs
-                     WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND task_kind=?4",
+                     WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND task_kind=?4 AND outcome IN ('ok','empty')",
                     params![scope.tenant_id, scope.user_id, dom.write, task],
                     |r| r.get(0),
                 )
@@ -559,11 +699,11 @@ impl Store {
             |r| r.get(0),
         )?;
 
-        // relationships 的「变化」= 上次成功运行之后更新的实体数。
+        // relationships 的输入变化以 active memory 为准：首次实体表为空时也要能自动建图。
         let last_rel = last_run("relationships")?;
         let changed_entities: i64 = match last_rel {
             None => self.conn().query_row(
-                "SELECT COUNT(*) FROM relationship_entities
+                "SELECT COUNT(*) FROM memories
                  WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND status='active'",
                 params![scope.tenant_id, scope.user_id, dom.write],
                 |r| r.get(0),
@@ -573,7 +713,7 @@ impl Store {
                     .map(|d| d.to_rfc3339())
                     .unwrap_or_else(|| now.clone());
                 self.conn().query_row(
-                    "SELECT COUNT(*) FROM relationship_entities
+                    "SELECT COUNT(*) FROM memories
                      WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND status='active'
                        AND updated_at > ?4",
                     params![scope.tenant_id, scope.user_id, dom.write, since],
@@ -586,7 +726,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT MAX(run_at) FROM task_runs
-                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND task_kind='nightly'",
+                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3 AND task_kind='nightly' AND outcome IN ('ok','empty')",
                 params![scope.tenant_id, scope.user_id, dom.write],
                 |r| r.get(0),
             )
@@ -603,8 +743,13 @@ impl Store {
             .as_deref()
             .and_then(parse_epoch)
             .unwrap_or(now_epoch);
-        let quiet_due =
-            sched::quiet_due(cfg, now_epoch, last_activity_epoch, unprocessed, runs_today);
+        let quiet_due = sched::quiet_due(
+            cfg,
+            now_epoch,
+            last_activity_epoch,
+            quiet_unprocessed,
+            runs_today,
+        );
         let nightly_due = sched::nightly_due(cfg, today, last_nightly_date);
         // 先算好文案，避免把 `now` 的借用带进结构体字面量（那里要 move `now`）。
         let nightly_reason: &'static str = if !cfg.nightly_enabled {
@@ -654,7 +799,7 @@ impl Store {
                 due: quiet_due,
                 reason: if !cfg.quiet_enabled {
                     "disabled"
-                } else if unprocessed <= 0 {
+                } else if quiet_unprocessed <= 0 {
                     "no_new_signal"
                 } else if runs_today >= cfg.quiet_max_per_day {
                     "daily_limit_reached"
@@ -663,7 +808,7 @@ impl Store {
                 } else {
                     "due"
                 },
-                unprocessed,
+                unprocessed: quiet_unprocessed,
             },
         })
     }
@@ -730,10 +875,8 @@ impl Store {
                    JOIN memories m ON c.memory_id = m.id AND m.tenant_id = ?1 AND m.user_id = ?2
                    WHERE c.id = ?3";
         let mut stmt = self.conn().prepare(sql)?;
-        let mut rows = stmt.query_map(
-            params![scope.tenant_id, scope.user_id, id],
-            map_commitment,
-        )?;
+        let mut rows =
+            stmt.query_map(params![scope.tenant_id, scope.user_id, id], map_commitment)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),

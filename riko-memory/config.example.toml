@@ -38,6 +38,19 @@ enabled = true
 [generation]
 enabled = false
 
+# ---- P2 unattended task driver (serve内置；与对话是否在线无关) ----
+[schedule]
+driver_enabled = true
+driver_interval_secs = 900     # 冒烟可调为 1；生产保持默认或按负载调整
+# upkeep_enabled = true
+# relationships_enabled = true
+# quiet_enabled = true
+# nightly_enabled = true
+# upkeep_interval_secs = 3600
+# relationships_interval_secs = 3600
+# quiet_idle_secs = 1200
+# quiet_max_per_day = 3
+
 # ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500
 # spool_limit_mb = 100

@@ -130,6 +130,122 @@ fn task_runs_are_recorded_and_countable() {
     ));
 }
 
+#[test]
+fn p2_claim_consumes_due_signal_once() {
+    let (mut store, scope) = setup("p2-consume");
+    let id = evidence(&mut store, &scope, "s", 1, "我喜欢晴天。");
+    assert!(
+        store
+            .background_due(&scope, &dom(), &ScheduleConfig::default())
+            .unwrap()
+            .upkeep
+            .due
+    );
+    let signal = store.task_signal_ref(&scope, &dom(), "upkeep").unwrap();
+    assert!(store
+        .task_claim(&scope, &dom(), "upkeep", &signal, "first", 60)
+        .unwrap());
+    assert!(!store
+        .task_claim(&scope, &dom(), "upkeep", &signal, "second", 60)
+        .unwrap());
+    assert_eq!(
+        store.task_consume_events(&scope, &dom(), "upkeep").unwrap(),
+        1
+    );
+    assert_eq!(
+        store.task_consume_events(&scope, &dom(), "upkeep").unwrap(),
+        0
+    );
+    assert!(store.ledger_has(&scope, &dom(), "upkeep", &id).unwrap());
+    store
+        .task_run_record(&scope, &dom(), "upkeep", "ok", 1, "refresh_complete")
+        .unwrap();
+    assert!(store
+        .task_finish(&scope, &dom(), "upkeep", &signal, "first", true)
+        .unwrap());
+    assert!(!store
+        .task_claim(&scope, &dom(), "upkeep", &signal, "second", 60)
+        .unwrap());
+    assert!(
+        !store
+            .background_due(&scope, &dom(), &ScheduleConfig::default())
+            .unwrap()
+            .upkeep
+            .due
+    );
+}
+
+#[test]
+fn p2_failure_receipts_retry_three_times_then_exhaust() {
+    let (mut store, scope) = setup("p2-retry");
+    let signal = "nightly:today:";
+    for attempt in 1..=3 {
+        assert!(store
+            .task_claim(&scope, &dom(), "nightly", signal, "owner", 60)
+            .unwrap());
+        store
+            .task_run_record(&scope, &dom(), "nightly", "error", 0, "refresh_failed")
+            .unwrap();
+        assert!(store
+            .task_finish(&scope, &dom(), "nightly", signal, "owner", false)
+            .unwrap());
+        let claim = store.task_claims(&scope, &dom()).unwrap().remove(0);
+        assert_eq!(claim.attempts, attempt);
+        if attempt < 3 {
+            assert!(!store
+                .task_claim(&scope, &dom(), "nightly", signal, "early", 60)
+                .unwrap());
+            store
+                .conn()
+                .execute(
+                    "UPDATE task_claims SET next_retry_at=0 WHERE task_kind='nightly'",
+                    [],
+                )
+                .unwrap();
+        } else {
+            assert_eq!(claim.status, "exhausted");
+            assert!(!store
+                .task_claim(&scope, &dom(), "nightly", signal, "late", 60)
+                .unwrap());
+        }
+    }
+    assert_eq!(
+        store
+            .task_runs_since(&scope, &dom(), "nightly", "1970-01-01")
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn p2_quiet_daily_limit_counts_failed_runs() {
+    let (mut store, scope) = setup("p2-limit");
+    evidence(&mut store, &scope, "s", 1, "要记住这一点。");
+    // Idle duration zero makes the signal immediately eligible.
+    let cfg = ScheduleConfig {
+        quiet_idle_secs: 0,
+        quiet_max_per_day: 2,
+        ..ScheduleConfig::default()
+    };
+    assert!(
+        store
+            .background_due(&scope, &dom(), &cfg)
+            .unwrap()
+            .quiet
+            .due
+    );
+    store
+        .task_run_record(&scope, &dom(), "quiet", "error", 0, "failed")
+        .unwrap();
+    store
+        .task_run_record(&scope, &dom(), "quiet", "ok", 1, "done")
+        .unwrap();
+    let report = store.background_due(&scope, &dom(), &cfg).unwrap();
+    assert!(!report.quiet.due);
+    assert_eq!(report.quiet.reason, "daily_limit_reached");
+}
+
 // ---- 6：rupture_v2 分类端到端 ----
 
 #[test]

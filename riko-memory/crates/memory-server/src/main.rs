@@ -743,6 +743,8 @@ struct ScheduleSection {
     relationships_interval_secs: i64,
     quiet_idle_secs: i64,
     quiet_max_per_day: i64,
+    driver_enabled: bool,
+    driver_interval_secs: u64,
 }
 
 impl Default for ScheduleSection {
@@ -757,6 +759,8 @@ impl Default for ScheduleSection {
             relationships_interval_secs: d.relationships_interval_secs,
             quiet_idle_secs: d.quiet_idle_secs,
             quiet_max_per_day: d.quiet_max_per_day,
+            driver_enabled: true,
+            driver_interval_secs: 900,
         }
     }
 }
@@ -980,6 +984,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *state.generation_model.lock().unwrap() = Some(Arc::new(client));
                 }
             }
+            if cfg.schedule.driver_enabled {
+                let driver_state = state.clone();
+                let interval_secs = cfg.schedule.driver_interval_secs.max(1);
+                tokio::spawn(async move {
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                    loop {
+                        tick.tick().await;
+                        if let Err(error) = drive_due_tasks(&driver_state).await {
+                            eprintln!("[memoryd] task driver 扫描失败: {error}");
+                        }
+                    }
+                });
+            }
             worker::spawn_worker(state.clone(), model_cfg);
             // Dream 模型调用只能来自 DSH 常驻 runner；memoryd 仅运行语义索引作业。
             dream_worker::spawn_dream_pipeline(state.clone(), None, embedding_client, false);
@@ -1167,6 +1185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/entries/search", post(entries_search))
                 .route("/v1/entries/{entry_id}", get(get_entry))
                 .route("/v1/tasks/due", get(tasks_due))
+                .route("/v1/tasks/status", get(tasks_status))
                 .route("/v1/tasks/run", post(tasks_run))
                 .route("/v1/generation/run", post(generation_run))
                 .route("/v1/generation/artifacts", get(generation_artifacts))
@@ -4113,6 +4132,276 @@ struct AuthorizeRequest {
 struct RepairActionsQuery {
     #[serde(default)]
     thread_id: Option<String>,
+}
+
+/// P2: the serve process is the executor. Due decisions still come from Store;
+/// SQLite claims arbitrate between independent serve processes.
+async fn drive_due_tasks(state: &AppState) -> Result<(), String> {
+    let scopes = state
+        .store
+        .lock()
+        .map_err(|e| e.to_string())?
+        .all_scopes()
+        .map_err(|e| e.to_string())?;
+    for scope in scopes {
+        let domains = state
+            .store
+            .lock()
+            .map_err(|e| e.to_string())?
+            .domain_list(&scope)
+            .map_err(|e| e.to_string())?;
+        for row in domains.into_iter().filter(|r| r.status == "active") {
+            let dom = memory_domain::DomainScope::resolve(
+                &row.domain_id,
+                row.domain_id != memory_domain::USER_MAIN_DOMAIN,
+                &[],
+                &row.domain_id,
+            );
+            let due = state
+                .store
+                .lock()
+                .map_err(|e| e.to_string())?
+                .background_due(&scope, &dom, &state.schedule)
+                .map_err(|e| e.to_string())?;
+            for (kind, is_due) in [
+                ("upkeep", due.upkeep.due),
+                ("relationships", due.relationships.due),
+                ("nightly", due.nightly.due),
+                ("quiet", due.quiet.due),
+            ] {
+                if is_due {
+                    if let Err(error) = drive_one_task(state, &scope, &dom, kind).await {
+                        eprintln!(
+                            "[memoryd] task driver {}/{}/{} 失败: {error}",
+                            scope.tenant_id, scope.user_id, kind
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn drive_one_task(
+    state: &AppState,
+    scope: &ScopeKey,
+    dom: &memory_domain::DomainScope,
+    kind: &str,
+) -> Result<(), String> {
+    let owner = Uuid::now_v7().to_string();
+    let signal = {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let signal = store
+            .task_signal_ref(scope, dom, kind)
+            .map_err(|e| e.to_string())?;
+        if !store
+            .task_claim(scope, dom, kind, &signal, &owner, 3600)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        signal
+    };
+    // Recheck after claiming: a second process may have completed the same work.
+    let still_due = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let d = store
+            .background_due(scope, dom, &state.schedule)
+            .map_err(|e| e.to_string())?;
+        match kind {
+            "upkeep" => d.upkeep.due,
+            "relationships" => d.relationships.due,
+            "nightly" => d.nightly.due,
+            "quiet" => d.quiet.due,
+            _ => false,
+        }
+    };
+    if !still_due {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .task_run_record(scope, dom, kind, "skipped", 0, "no_longer_due")
+            .map_err(|e| e.to_string())?;
+        if !store.task_finish(scope, dom, kind, &signal, &owner, true)
+            .map_err(|e| e.to_string())? {
+            return Err("task_lease_lost".to_string());
+        }
+        return Ok(());
+    }
+    let result: Result<(String, i64, String, bool), String> = match kind {
+        "upkeep" => {
+            let mut store = state.store.lock().map_err(|e| e.to_string())?;
+            (|| {
+                let entries = store
+                    .entries_refresh(scope, dom)
+                    .map_err(|e| e.to_string())?;
+                let derived = store
+                    .derived_refresh(scope, dom)
+                    .map_err(|e| e.to_string())?;
+                let consumed = store
+                    .task_consume_events(scope, dom, "upkeep")
+                    .map_err(|e| e.to_string())?;
+                Ok((
+                    "ok".to_string(),
+                    consumed,
+                    format!(
+                        "entries_batch={} derived_batch={}",
+                        entries.batch_version, derived.batch_version
+                    ),
+                    false,
+                ))
+            })()
+        }
+        "relationships" => {
+            let mut store = state.store.lock().map_err(|e| e.to_string())?;
+            (|| {
+                let rel = store
+                    .relationship_refresh(scope, dom)
+                    .map_err(|e| e.to_string())?;
+                let derived = store
+                    .derived_refresh(scope, dom)
+                    .map_err(|e| e.to_string())?;
+                Ok((
+                    "ok".to_string(),
+                    rel.items as i64,
+                    format!(
+                        "relationships_batch={} derived_batch={}",
+                        rel.batch_version, derived.batch_version
+                    ),
+                    false,
+                ))
+            })()
+        }
+        "nightly" | "quiet" if state.generation_enabled => {
+            let response = generation_run(
+                State(state.clone()),
+                Extension(scope.clone()),
+                Extension(RequestId(Uuid::now_v7().to_string())),
+                Extension(DomainCtx {
+                    enabled: state.domains_enabled,
+                    selected: dom.write.clone(),
+                }),
+                Ok(Json(GenerationRunRequest {
+                    kind: kind.to_string(),
+                    thread_id: None,
+                })),
+            )
+            .await;
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|e| e.to_string())?;
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            match body.get("status").and_then(|v| v.as_str()) {
+                Some("generated") => {
+                    Ok(("ok".to_string(), 1, "model_generation".to_string(), true))
+                }
+                Some("already_generated") => Ok(("empty".to_string(),0,"already_generated".to_string(),false)),
+                Some("empty_or_not_due") => Ok((
+                    "empty".to_string(),
+                    0,
+                    "generation_empty".to_string(),
+                    false,
+                )),
+                Some("fallback") => Err(format!(
+                    "generation_fallback:{}",
+                    body.get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                )),
+                _ => Err(format!(
+                    "generation_status:{}",
+                    body.get("status").unwrap_or(&serde_json::Value::Null)
+                )),
+            }
+        }
+        "nightly" | "quiet" => {
+            let mut store = state.store.lock().map_err(|e| e.to_string())?;
+            store
+                .alignment_synthesis_refresh(scope, dom)
+                .map_err(|e| e.to_string())?;
+            Ok((
+                "empty".to_string(),
+                0,
+                "generation_disabled; template_refreshed".to_string(),
+                false,
+            ))
+        }
+        _ => Err("unknown_task".to_string()),
+    };
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    match result {
+        Ok((outcome, count, detail, already_recorded)) => {
+            if kind == "quiet" {
+                store
+                    .task_consume_events(scope, dom, "quiet")
+                    .map_err(|e| e.to_string())?;
+            }
+            if !already_recorded {
+                store
+                    .task_run_record(scope, dom, kind, &outcome, count, &detail)
+                    .map_err(|e| e.to_string())?;
+            }
+            if !store.task_finish(scope, dom, kind, &signal, &owner, true)
+                .map_err(|e| e.to_string())? {
+                return Err("task_lease_lost".to_string());
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // P1 fallback already records its own failed model call.
+            if !error.starts_with("generation_fallback:") {
+                store.task_run_record(scope, dom, kind, "error", 0, &format!("driver:{error}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if !store.task_finish(scope, dom, kind, &signal, &owner, false)
+                .map_err(|e| e.to_string())? {
+                return Err("task_lease_lost".to_string());
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn tasks_status(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let store = match state.store.lock() {
+        Ok(s) => s,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "存储不可用",
+            )
+        }
+    };
+    let claims = match store.task_claims(&scope, &dom) {
+        Ok(v) => v,
+        Err(e) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                &e.to_string(),
+            )
+        }
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let mut runs = Vec::new();
+    for kind in ["upkeep", "relationships", "nightly", "quiet"] {
+        if let Ok(mut rows) = store.task_runs_since(&scope, &dom, kind, &since) {
+            runs.append(&mut rows);
+        }
+    }
+    runs.sort_by(|a, b| b.run_at.cmp(&a.run_at));
+    runs.truncate(40);
+    Json(serde_json::json!({"request_id":req_id.0,"domain_id":dom.write,"claims":claims,"runs":runs})).into_response()
 }
 
 async fn tasks_due(
