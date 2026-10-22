@@ -67,6 +67,7 @@
 | [41 P5 政策门修复停止与重议](41-P5政策门修复停止与重议记录.md) | doc7/17 决议后的 v5 原型真实模型 pilot：SiliconFlow 语义挑战出现 active 泄漏，Gemini 非敏感案例被 fail closed 误持有；按停止条件回退未提交代码，等待重议。 |
 | [42 P5b 规则门 admit_v5 实施与回归](42-P5b-规则门admit_v5实施与回归交付记录.md) | admit_v5 规则门四组实施、quote∪claim 并集判定、单元测试、P4 120 语料双真实模型回归（S08/S09 泄漏清零、非敏感误杀 0）与 24 条语义挑战集真实评测（如实建档已知未覆盖）。 |
 | [43 B2 reason_text 生成](43-B2-reason_text生成交付记录.md) | 迁移 0024（schema 24）、确定性 reason_text 模板生成与关键引用切片、admit_v5 落库与 v4/历史版本严格 NULL 隔离、GET /v1/candidates、GET /v1/memories/{id}/explain、GET /v1/memories/{id} 及 CLI 暴露。 |
+| [44 B3 Dream 作业域接线交付记录](44-B3-Dream作业域接线交付记录.md) | Dream 作业域 13 处 DOM 接线至 `DomainScope::for_job`、CLI 10 个子命令支持 `--domain` 消除 14 处主域写死、`v2_domain_tests` 新增作业域隔离测试，Rust 199 passed / TS 50 passed。 |
 
 ## 30 秒状态
 
