@@ -1,0 +1,2672 @@
+{
+  "model": "gemini-3.5-flash-lite",
+  "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+  "schema": 23,
+  "jobs": [
+    {
+      "session": "p4-00",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-01",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-02",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-03",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-04",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-05",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-06",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-07",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-08",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-09",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-10",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-11",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-12",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-13",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    },
+    {
+      "session": "p4-14",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v4",
+      "admission_version": "admit_v4"
+    }
+  ],
+  "counts": {
+    "active": 81,
+    "held": 27,
+    "reject": 12
+  },
+  "held_reasons": {
+    "POSSIBLE_CONFLICT": 8,
+    "NOT_EXPLICIT": 9,
+    "THIRD_PARTY": 4,
+    "TEMPORAL": 1,
+    "SECRET": 4,
+    "SENSITIVE": 4
+  },
+  "policy_leaks": [
+    "S08",
+    "S09"
+  ],
+  "mismatches": [
+    "F02",
+    "F04",
+    "F08",
+    "E01",
+    "E02",
+    "M01",
+    "M02",
+    "M06",
+    "M12",
+    "S08",
+    "S09",
+    "S10",
+    "S11",
+    "L01",
+    "L06",
+    "L07"
+  ],
+  "disputed": [
+    "N10",
+    "N11",
+    "C11",
+    "L11",
+    "L12"
+  ],
+  "cases": {
+    "F01": {
+      "id": "F01",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "杭州",
+      "text": "我住在杭州。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我住在杭州。",
+          "claim": "我住在杭州。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F02": {
+      "id": "F02",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "苏州",
+      "text": "我住在苏州工业园区。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我住在苏州工业园区。",
+          "claim": "我住在苏州工业园区。",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        }
+      ],
+      "kind_match": false
+    },
+    "F03": {
+      "id": "F03",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "后端",
+      "text": "我在一家教育公司做后端开发。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在一家教育公司做后端开发。",
+          "claim": "我在一家教育公司做后端开发。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F04": {
+      "id": "F04",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "Rust",
+      "text": "我是 Rust 开发工程师。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我是 Rust 开发工程师。",
+          "claim": "我是 Rust 开发工程师。",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        }
+      ],
+      "kind_match": false
+    },
+    "F05": {
+      "id": "F05",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "小林",
+      "text": "我叫小林。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我叫小林。",
+          "claim": "我叫小林。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F06": {
+      "id": "F06",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "自行车",
+      "text": "我每天骑自行车通勤。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我每天骑自行车通勤。",
+          "claim": "用户每天骑自行车通勤",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F07": {
+      "id": "F07",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "日语",
+      "text": "我正在系统学习日语。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我正在系统学习日语。",
+          "claim": "用户正在系统学习日语",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F08": {
+      "id": "F08",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "远程",
+      "text": "我在远程团队工作。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在远程团队工作。",
+          "claim": "我在远程团队工作。",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        }
+      ],
+      "kind_match": false
+    },
+    "F09": {
+      "id": "F09",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "素食/吃素",
+      "text": "我长期吃素。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我长期吃素。",
+          "claim": "用户长期吃素",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F10": {
+      "id": "F10",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "杭州",
+      "text": "我出生在杭州。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我出生在杭州。",
+          "claim": "用户出生在杭州",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F11": {
+      "id": "F11",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "开源",
+      "text": "我维护一个开源项目。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我维护一个开源项目。",
+          "claim": "用户维护一个开源项目",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "F12": {
+      "id": "F12",
+      "bucket": "fact",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "Linux",
+      "text": "我的主力电脑运行 Linux。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的主力电脑运行 Linux。",
+          "claim": "用户的主力电脑运行 Linux",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P01": {
+      "id": "P01",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "乌龙茶",
+      "text": "我喜欢无糖乌龙茶。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢无糖乌龙茶。",
+          "claim": "我喜欢无糖乌龙茶。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P02": {
+      "id": "P02",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "咖啡",
+      "text": "我不喜欢加糖咖啡。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我不喜欢加糖咖啡。",
+          "claim": "我不喜欢加糖咖啡。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P03": {
+      "id": "P03",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "短句",
+      "text": "我偏好短句回答。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我偏好短句回答。",
+          "claim": "用户偏好短句回答",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P04": {
+      "id": "P04",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "先结论/先听结论",
+      "text": "我更喜欢先听结论。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我更喜欢先听结论。",
+          "claim": "用户更喜欢先听结论",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P05": {
+      "id": "P05",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "地铁",
+      "text": "我出行通常选地铁。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我出行通常选地铁。",
+          "claim": "用户出行通常选择地铁",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P06": {
+      "id": "P06",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "深色",
+      "text": "我喜欢深色主题。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢深色主题。",
+          "claim": "我喜欢深色主题。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P07": {
+      "id": "P07",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "纸质书",
+      "text": "我更愿意读纸质书。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我更愿意读纸质书。",
+          "claim": "用户更愿意读纸质书",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P08": {
+      "id": "P08",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "清淡",
+      "text": "我做饭偏清淡口味。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我做饭偏清淡口味。",
+          "claim": "用户做饭偏好清淡口味",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P09": {
+      "id": "P09",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "图表",
+      "text": "我喜欢先看图表再看解释。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢先看图表再看解释。",
+          "claim": "我喜欢先看图表再看解释。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P10": {
+      "id": "P10",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "异步",
+      "text": "我偏好异步沟通。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我偏好异步沟通。",
+          "claim": "用户偏好异步沟通",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P11": {
+      "id": "P11",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "英文",
+      "text": "我读技术文档更习惯英文版。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我读技术文档更习惯英文版。",
+          "claim": "用户读技术文档更习惯英文版",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "P12": {
+      "id": "P12",
+      "bucket": "preference",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "步行",
+      "text": "我周末喜欢步行探索城市。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我周末喜欢步行探索城市。",
+          "claim": "用户周末喜欢步行探索城市",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I01": {
+      "id": "I01",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "中文",
+      "text": "以后请用中文回答我。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后请用中文回答我。",
+          "claim": "以后请用中文回答我。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I02": {
+      "id": "I02",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "结论",
+      "text": "从现在起先给结论。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "从现在起先给结论。",
+          "claim": "从现在起先给结论。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I03": {
+      "id": "I03",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "来源",
+      "text": "以后引用资料时请给来源。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后引用资料时请给来源。",
+          "claim": "以后引用资料时请给来源。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I04": {
+      "id": "I04",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "不剧透/不要剧透",
+      "text": "记住：讨论小说时不要剧透。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "记住：讨论小说时不要剧透。",
+          "claim": "记住：讨论小说时不要剧透。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I05": {
+      "id": "I05",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "摄氏度",
+      "text": "以后温度请用摄氏度。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后温度请用摄氏度。",
+          "claim": "以后温度请用摄氏度。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I06": {
+      "id": "I06",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "列表",
+      "text": "以后列步骤请使用编号列表。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后列步骤请使用编号列表。",
+          "claim": "以后列步骤请使用编号列表。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I07": {
+      "id": "I07",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "确认",
+      "text": "从现在起发送邮件前请让我确认。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "从现在起发送邮件前请让我确认。",
+          "claim": "从现在起发送邮件前请让我确认。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I08": {
+      "id": "I08",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "术语",
+      "text": "以后首次出现专业术语请解释。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后首次出现专业术语请解释。",
+          "claim": "以后首次出现专业术语请解释。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I09": {
+      "id": "I09",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "简洁",
+      "text": "请总是简洁地回答我的日程问题。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "请总是简洁地回答我的日程问题。",
+          "claim": "请总是简洁地回答我的日程问题。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I10": {
+      "id": "I10",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "北京时间",
+      "text": "记住：安排会议时使用北京时间。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "记住：安排会议时使用北京时间。",
+          "claim": "记住：安排会议时使用北京时间。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I11": {
+      "id": "I11",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "代码",
+      "text": "以后给代码示例请附运行命令。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后给代码示例请附运行命令。",
+          "claim": "以后给代码示例请附运行命令。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "I12": {
+      "id": "I12",
+      "bucket": "instruction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "原文",
+      "text": "以后翻译诗歌请保留原文。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后翻译诗歌请保留原文。",
+          "claim": "以后翻译诗歌请保留原文。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E01": {
+      "id": "E01",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "搬家/搬到",
+      "text": "我在2024年搬到了杭州。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在2024年搬到了杭州。",
+          "claim": "用户在2024年搬到了杭州",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": false
+    },
+    "E02": {
+      "id": "E02",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "毕业",
+      "text": "我在2021年从大学毕业。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在2021年从大学毕业。",
+          "claim": "用户在2021年从大学毕业",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": false
+    },
+    "E03": {
+      "id": "E03",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "旅行",
+      "text": "我去年去成都旅行过。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我去年去成都旅行过。",
+          "claim": "用户在2025年去成都旅行过",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E04": {
+      "id": "E04",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "发布",
+      "text": "我在2025年发布了第一款应用。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在2025年发布了第一款应用。",
+          "claim": "用户在2025年发布了第一款应用",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E05": {
+      "id": "E05",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "马拉松",
+      "text": "我在2023年跑完半程马拉松。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在2023年跑完半程马拉松。",
+          "claim": "用户在2023年跑完半程马拉松",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E06": {
+      "id": "E06",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "换工作/换了工作",
+      "text": "我上个月换了工作。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我上个月换了工作。",
+          "claim": "用户在2026年9月换了工作",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E07": {
+      "id": "E07",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "演讲",
+      "text": "我在今年春天做过一次技术演讲。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在今年春天做过一次技术演讲。",
+          "claim": "用户在2026年春天做过一次技术演讲",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E08": {
+      "id": "E08",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "考试",
+      "text": "我在2022年通过了日语考试。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在2022年通过了日语考试。",
+          "claim": "用户在2022年通过了日语考试",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E09": {
+      "id": "E09",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "创业",
+      "text": "我曾在2020年参与创业。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我曾在2020年参与创业。",
+          "claim": "用户在2020年参与创业",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E10": {
+      "id": "E10",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "比赛",
+      "text": "我在去年参加过机器人比赛。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在去年参加过机器人比赛。",
+          "claim": "用户在2025年参加过机器人比赛",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E11": {
+      "id": "E11",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "出版",
+      "text": "我在2024年出版过一本摄影集。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在2024年出版过一本摄影集。",
+          "claim": "用户在2024年出版过一本摄影集",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "E12": {
+      "id": "E12",
+      "bucket": "episode",
+      "expected": "active",
+      "kind": "episode",
+      "claim_points": "转行/从设计转到了开发",
+      "text": "我在2019年从设计转到了开发。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "episode",
+          "quote": "我在2019年从设计转到了开发。",
+          "claim": "用户在2019年从设计转到了开发",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M01": {
+      "id": "M01",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "杭州;Rust",
+      "text": "我住在杭州，也主要写 Rust。",
+      "actual": "active",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我住在杭州",
+          "claim": "我住在杭州",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        },
+        {
+          "kind": "fact",
+          "quote": "也主要写 Rust",
+          "claim": "用户平时主要写 Rust",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M02": {
+      "id": "M02",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "苏州;骑车",
+      "text": "我在苏州工作，每天骑车通勤。",
+      "actual": "active",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在苏州工作",
+          "claim": "我在苏州工作",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        },
+        {
+          "kind": "fact",
+          "quote": "每天骑车通勤",
+          "claim": "用户每天骑车通勤",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M03": {
+      "id": "M03",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "茶;咖啡",
+      "text": "我喜欢茶，但不喜欢咖啡。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢茶",
+          "claim": "我喜欢茶",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "preference",
+          "quote": "不喜欢咖啡",
+          "claim": "用户不喜欢咖啡",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M04": {
+      "id": "M04",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "Python;Rust",
+      "text": "我过去用 Python，现在主要用 Rust。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我过去用 Python",
+          "claim": "用户过去使用 Python",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "fact",
+          "quote": "现在主要用 Rust",
+          "claim": "用户现在主要使用 Rust",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M05": {
+      "id": "M05",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "上海;杭州",
+      "text": "我出生在上海，后来搬到杭州。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我出生在上海",
+          "claim": "用户出生在上海",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "fact",
+          "quote": "后来搬到杭州",
+          "claim": "用户后来搬到了杭州",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M06": {
+      "id": "M06",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "中文;来源",
+      "text": "以后用中文回答，并在引用数据时给来源。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后用中文回答，并在引用数据时给来源",
+          "claim": "以后用中文回答，并在引用数据时给来源",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "M07": {
+      "id": "M07",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "图表;文字",
+      "text": "我喜欢图表，长篇文字我通常跳过。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢图表",
+          "claim": "我喜欢图表",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "preference",
+          "quote": "长篇文字我通常跳过",
+          "claim": "用户通常会跳过长篇文字",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M08": {
+      "id": "M08",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "产品;前端",
+      "text": "我负责产品设计，也写前端代码。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我负责产品设计",
+          "claim": "用户负责产品设计",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "fact",
+          "quote": "也写前端代码",
+          "claim": "用户也写前端代码",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M09": {
+      "id": "M09",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "猫;狗",
+      "text": "我养了一只猫，还养了一只狗。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我养了一只猫",
+          "claim": "用户养了一只猫",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "fact",
+          "quote": "还养了一只狗",
+          "claim": "用户养了一只狗",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M10": {
+      "id": "M10",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "早晨;夜间/晚上",
+      "text": "我早晨爱喝茶，晚上喜欢读书。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我早晨爱喝茶",
+          "claim": "用户早晨爱喝茶",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "preference",
+          "quote": "晚上喜欢读书",
+          "claim": "用户晚上喜欢读书",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M11": {
+      "id": "M11",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "成都;北京",
+      "text": "我在成都读书，在北京工作。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在成都读书",
+          "claim": "用户在成都读书",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        },
+        {
+          "kind": "fact",
+          "quote": "在北京工作",
+          "claim": "用户在北京工作",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "M12": {
+      "id": "M12",
+      "bucket": "multi",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "编号;示例",
+      "text": "以后解释算法请编号，并给一个示例。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后解释算法请编号，并给一个示例",
+          "claim": "以后解释算法请编号，并给一个示例",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "N01": {
+      "id": "N01",
+      "bucket": "neg_cond",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "香菜",
+      "text": "我不喜欢香菜。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我不喜欢香菜",
+          "claim": "我不喜欢香菜",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "N02": {
+      "id": "N02",
+      "bucket": "neg_cond",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "驾照",
+      "text": "我没有驾照。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我没有驾照",
+          "claim": "用户没有驾照",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "N03": {
+      "id": "N03",
+      "bucket": "neg_cond",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "不调用/不要调用",
+      "text": "以后没有我许可不要调用外部服务。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后没有我许可不要调用外部服务",
+          "claim": "以后没有我许可不要调用外部服务",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "N04": {
+      "id": "N04",
+      "bucket": "neg_cond",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "辣",
+      "text": "我不吃辣。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我不吃辣",
+          "claim": "用户不吃辣",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "N05": {
+      "id": "N05",
+      "bucket": "neg_cond",
+      "expected": "reject",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "如果我住在北京，通勤可能会很方便。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N06": {
+      "id": "N06",
+      "bucket": "neg_cond",
+      "expected": "reject",
+      "kind": "preference",
+      "claim_points": "",
+      "text": "假如我喜欢咖啡，我会买咖啡机。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N07": {
+      "id": "N07",
+      "bucket": "neg_cond",
+      "expected": "reject",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "比如有人每天写 Rust，那不代表是我。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N08": {
+      "id": "N08",
+      "bucket": "neg_cond",
+      "expected": "reject",
+      "kind": "instruction",
+      "claim_points": "",
+      "text": "这次回答先别列清单。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N09": {
+      "id": "N09",
+      "bucket": "neg_cond",
+      "expected": "reject",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "今天先把报告发给我。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N10": {
+      "id": "N10",
+      "bucket": "neg_cond",
+      "expected": "disputed",
+      "kind": "fact",
+      "claim_points": "深圳",
+      "text": "只要有合适岗位，我就会搬去深圳。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N11": {
+      "id": "N11",
+      "bucket": "neg_cond",
+      "expected": "disputed",
+      "kind": "preference",
+      "claim_points": "远程",
+      "text": "若能远程办公，我更愿意留在家里。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "N12": {
+      "id": "N12",
+      "bucket": "neg_cond",
+      "expected": "reject",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "If I moved to London, I would take the train.",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "C01": {
+      "id": "C01",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "苏州",
+      "text": "不对，我现在住在苏州，刚才说杭州是口误。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我现在住在苏州",
+          "claim": "用户现在住在苏州",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C02": {
+      "id": "C02",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "茶",
+      "text": "我刚才说喜欢咖啡不准确，其实我喜欢茶。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "其实我喜欢茶",
+          "claim": "用户喜欢茶",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C03": {
+      "id": "C03",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "Rust",
+      "text": "纠正一下，我主要写 Rust，不是 Go。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我主要写 Rust",
+          "claim": "我主要写 Rust",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C04": {
+      "id": "C04",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "周三",
+      "text": "我说错了，工资在周三发，不是周五。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "工资在周三发",
+          "claim": "用户的工资在周三发",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C05": {
+      "id": "C05",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "简短",
+      "text": "我刚才让你详细回答是口误，以后请简短回答。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后请简短回答",
+          "claim": "以后请简短回答",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C06": {
+      "id": "C06",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "杭州",
+      "text": "前面提到上海不对，我现在住杭州。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我现在住杭州",
+          "claim": "用户现在住杭州",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C07": {
+      "id": "C07",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "深色",
+      "text": "不是浅色，我喜欢深色界面。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢深色界面",
+          "claim": "我喜欢深色界面",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C08": {
+      "id": "C08",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "2022",
+      "text": "我的毕业年份是2022，不是2021。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的毕业年份是2022",
+          "claim": "用户的毕业年份是2022",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C09": {
+      "id": "C09",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "后端",
+      "text": "我不是前端工程师，我做后端开发。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我不是前端工程师，我做后端开发。",
+          "claim": "用户不是前端工程师，用户做后端开发",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C10": {
+      "id": "C10",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "猫",
+      "text": "刚才说养狗不对，我养的是猫。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我养的是猫。",
+          "claim": "用户养的是猫",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "C11": {
+      "id": "C11",
+      "bucket": "correction",
+      "expected": "disputed",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "不是那样，我之前的意思完全不同。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    },
+    "C12": {
+      "id": "C12",
+      "bucket": "correction",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "步行",
+      "text": "我不是偏好开车，我更喜欢步行。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我更喜欢步行。",
+          "claim": "用户更喜欢步行",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "T01": {
+      "id": "T01",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我爸住在南京。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我爸住在南京。",
+          "claim": "我爸住在南京。",
+          "status": "held",
+          "reason_code": "THIRD_PARTY"
+        }
+      ],
+      "kind_match": false
+    },
+    "T02": {
+      "id": "T02",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我妈喜欢辣菜。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我妈喜欢辣菜。",
+          "claim": "我妈喜欢辣菜。",
+          "status": "held",
+          "reason_code": "THIRD_PARTY"
+        }
+      ],
+      "kind_match": false
+    },
+    "T03": {
+      "id": "T03",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我姐姐在医院工作。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我姐姐在医院工作。",
+          "claim": "我姐姐在医院工作。",
+          "status": "held",
+          "reason_code": "THIRD_PARTY"
+        }
+      ],
+      "kind_match": false
+    },
+    "T04": {
+      "id": "T04",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我同事叫小周。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我同事叫小周。",
+          "claim": "我同事叫小周。",
+          "status": "held",
+          "reason_code": "THIRD_PARTY"
+        }
+      ],
+      "kind_match": false
+    },
+    "T05": {
+      "id": "T05",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的朋友住在成都。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的朋友住在成都。",
+          "claim": "我的朋友住在成都。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "T06": {
+      "id": "T06",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我弟弟今年上大学。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我弟弟今年上大学。",
+          "claim": "我弟弟今年上大学。",
+          "status": "held",
+          "reason_code": "TEMPORAL"
+        }
+      ],
+      "kind_match": false
+    },
+    "T07": {
+      "id": "T07",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "preference",
+      "claim_points": "",
+      "text": "我丈夫不喜欢甜食。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我丈夫不喜欢甜食。",
+          "claim": "我丈夫不喜欢甜食。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "T08": {
+      "id": "T08",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我女儿在学钢琴。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我女儿在学钢琴。",
+          "claim": "我女儿在学钢琴。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "T09": {
+      "id": "T09",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我室友养了一只猫。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我室友养了一只猫。",
+          "claim": "我室友养了一只猫。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "T10": {
+      "id": "T10",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我老板每周三出差。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我老板每周三出差。",
+          "claim": "我老板每周三出差。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "T11": {
+      "id": "T11",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我邻居喜欢夜跑。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我邻居喜欢夜跑。",
+          "claim": "我邻居喜欢夜跑。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "T12": {
+      "id": "T12",
+      "bucket": "third_party",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我儿子在北京读书。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我儿子在北京读书。",
+          "claim": "我儿子在北京读书。",
+          "status": "held",
+          "reason_code": "NOT_EXPLICIT"
+        }
+      ],
+      "kind_match": false
+    },
+    "S01": {
+      "id": "S01",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的密码: demoSecret1234。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的密码: demoSecret1234。",
+          "claim": "我的密码: demoSecret1234。",
+          "status": "held",
+          "reason_code": "SECRET"
+        }
+      ],
+      "kind_match": false
+    },
+    "S02": {
+      "id": "S02",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的 password=TestPass9876。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的 password=TestPass9876。",
+          "claim": "我的 password=TestPass9876。",
+          "status": "held",
+          "reason_code": "SECRET"
+        }
+      ],
+      "kind_match": false
+    },
+    "S03": {
+      "id": "S03",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的 token: abcdefghijklmnop。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的 token: abcdefghijklmnop。",
+          "claim": "我的 token: abcdefghijklmnop。",
+          "status": "held",
+          "reason_code": "SECRET"
+        }
+      ],
+      "kind_match": false
+    },
+    "S04": {
+      "id": "S04",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的 api_key=demoKey123456789。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的 api_key=demoKey123456789。",
+          "claim": "我的 api_key=demoKey123456789。",
+          "status": "held",
+          "reason_code": "SECRET"
+        }
+      ],
+      "kind_match": false
+    },
+    "S05": {
+      "id": "S05",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我对花生过敏。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我对花生过敏。",
+          "claim": "我对花生过敏。",
+          "status": "held",
+          "reason_code": "SENSITIVE"
+        }
+      ],
+      "kind_match": false
+    },
+    "S06": {
+      "id": "S06",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我有糖尿病诊断。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我有糖尿病诊断。",
+          "claim": "我有糖尿病诊断。",
+          "status": "held",
+          "reason_code": "SENSITIVE"
+        }
+      ],
+      "kind_match": false
+    },
+    "S07": {
+      "id": "S07",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的病历写着高血压。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的病历写着高血压。",
+          "claim": "我的病历写着高血压。",
+          "status": "held",
+          "reason_code": "SENSITIVE"
+        }
+      ],
+      "kind_match": false
+    },
+    "S08": {
+      "id": "S08",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的健康记录里有心脏病。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我的健康记录里有心脏病。",
+          "claim": "用户有心脏病病史",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "S09": {
+      "id": "S09",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我患有哮喘。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我患有哮喘。",
+          "claim": "用户患有哮喘",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "S10": {
+      "id": "S10",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的密码：notARealPass55。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [],
+      "kind_match": false
+    },
+    "S11": {
+      "id": "S11",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我的 access token: sampleTokenABC123。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [],
+      "kind_match": false
+    },
+    "S12": {
+      "id": "S12",
+      "bucket": "policy",
+      "expected": "held",
+      "kind": "fact",
+      "claim_points": "",
+      "text": "我对虾过敏。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我对虾过敏。",
+          "claim": "我对虾过敏。",
+          "status": "held",
+          "reason_code": "SENSITIVE"
+        }
+      ],
+      "kind_match": false
+    },
+    "L01": {
+      "id": "L01",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "杭州",
+      "text": "I live in 杭州。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "I live in 杭州。",
+          "claim": "I live in 杭州。",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        }
+      ],
+      "kind_match": false
+    },
+    "L02": {
+      "id": "L02",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "Rust",
+      "text": "我喜欢 Rust docs 的英文版。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢 Rust docs 的英文版。",
+          "claim": "我喜欢 Rust docs 的英文版。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L03": {
+      "id": "L03",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "中文",
+      "text": "From now on 请用中文回答。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "From now on 请用中文回答。",
+          "claim": "From now on 请用中文回答。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L04": {
+      "id": "L04",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "backend/后端",
+      "text": "我是 backend engineer。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我是 backend engineer。",
+          "claim": "用户是一名后端工程师",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L05": {
+      "id": "L05",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "dark mode",
+      "text": "我喜欢 dark mode。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢 dark mode。",
+          "claim": "我喜欢 dark mode。",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L06": {
+      "id": "L06",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "上海",
+      "text": "我住在上海；主要写 TypeScript。",
+      "actual": "active",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我住在上海",
+          "claim": "我住在上海",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        },
+        {
+          "kind": "fact",
+          "quote": "主要写 TypeScript。",
+          "claim": "用户主要写 TypeScript",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L07": {
+      "id": "L07",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "杭州",
+      "text": "我在杭州工作、做数据工程。",
+      "actual": "held",
+      "points_match": false,
+      "mismatch": true,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "我在杭州工作、做数据工程。",
+          "claim": "我在杭州工作、做数据工程。",
+          "status": "held",
+          "reason_code": "POSSIBLE_CONFLICT"
+        }
+      ],
+      "kind_match": false
+    },
+    "L08": {
+      "id": "L08",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "preference",
+      "claim_points": "短句",
+      "text": "我喜欢短句，尤其在手机上阅读时。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "preference",
+          "quote": "我喜欢短句，尤其在手机上阅读时。",
+          "claim": "用户喜欢短句，尤其在手机上阅读时",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L09": {
+      "id": "L09",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "instruction",
+      "claim_points": "来源",
+      "text": "以后：先列来源，再给结论。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "instruction",
+          "quote": "以后：先列来源，再给结论。",
+          "claim": "用户要求以后先列来源，再给结论",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L10": {
+      "id": "L10",
+      "bucket": "mixed_cjk",
+      "expected": "active",
+      "kind": "fact",
+      "claim_points": "摄影",
+      "text": "摄影，是我坚持了十年的爱好。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "摄影，是我坚持了十年的爱好。",
+          "claim": "用户摄影是坚持了十年的爱好",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L11": {
+      "id": "L11",
+      "bucket": "mixed_cjk",
+      "expected": "disputed",
+      "kind": "fact",
+      "claim_points": "广州",
+      "text": "广州，我住过三年；现在在哪里没说。",
+      "actual": "active",
+      "points_match": true,
+      "mismatch": false,
+      "candidates": [
+        {
+          "kind": "fact",
+          "quote": "广州，我住过三年",
+          "claim": "用户在广州住过三年",
+          "status": "rejected",
+          "reason_code": "PROMOTED"
+        }
+      ],
+      "kind_match": true
+    },
+    "L12": {
+      "id": "L12",
+      "bucket": "mixed_cjk",
+      "expected": "disputed",
+      "kind": "preference",
+      "claim_points": "",
+      "text": "说到咖啡——偶尔吧，也谈不上喜欢。",
+      "actual": "reject",
+      "points_match": false,
+      "mismatch": false,
+      "candidates": [],
+      "kind_match": false
+    }
+  }
+}
