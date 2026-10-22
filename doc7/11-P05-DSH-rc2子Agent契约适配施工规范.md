@@ -39,3 +39,13 @@ Dream child 必须在 DSH 子 Agent 的独立 scope 中运行。普通全局工�
 先更新此规范并实施经证实的隔离方案，然后分开提交代码与交付记录。基线切到 rc.2 时，`package.json` 的 DSH/Cordis peer 与本地 `file:` 链接、lockfile 和 preset 文件头必须同一基线。`tsc --noEmit`、构建、`npm test` 在 rc.2 下通过；契约测试要覆盖 child 实际可见/可执行工具、首 prompt、并发与恢复，以及失败时 claim/lease/dispose。
 
 真实验收只在临时新库运行：官方 DSH riko preset 与真实模型多轮事实、偏好、指令、纠正；核候选、active、supersede、四段注入、system Soul、真实 Dream child spawn 及工具隔离；新会话问仅靠记忆能回答的问题。端点凭据只从用户指定的本机配置读取，不进仓库；按代码、构建、适配器测试、真实 DSH 闭环、经 DSH 的真实模型、部署分档记录。未达项写具体根因。
+
+## 5. P0.6 路径 2 实施决定（2026-10-22）
+
+用户已选择 §3 路径 2。Dream child 在 `agent/created` 事件中，先在 `agent.ctx.tools` 调用 `restrict({allow:[]})` 清空继承的全局工具，再在同一 child scope 注册当前 phase 的 Dream read tools。只对带有效 Dream scope 绑定的 child 执行；若 restrict 或注册失败，创建失败，不能继续运行未隔离 child。限制的 disposer 随 agent scope 清理。
+
+现场上游 `packages/core/tools/src/index.ts:697-705,1098-1131` 说明限制只作用于全局工具，scoped 注册保留。`packages/core/agent/src/index.ts:100-111,539-556` 说明 setup 在创建事件前完成，`agent/created` 串行 awaited；`packages/subagent/subagent/src/manager.ts:437-471` 在 materialize 后才提交首条消息。因此上述监听完成在首 prompt 前。必须用实际 child 的 schema 和执行路径复验，不能只凭源码推论。
+
+Dream job **不依赖冷恢复补交结果**。runner 在 activation 存活期继续每 15 秒续租；租约丢失即中止；提交前再次确认 generation/lease；`finally` dispose。activation 死亡或进程中断时，job 失败并由服务端租约/重试机制回队列，不在恢复出的 child 里续跑。新 descriptor 不快照限制（`manager.ts:394-401`），冷恢复的旧字段重放（`:1348-1376`）不能用作新 job 的隔离依据。
+
+验收门槛：rc.2 同基线的类型检查、构建及至少原有 47 例适配器测试全绿；新增契约测试证明首 prompt 前限制、实际工具 schema/执行、两个并发 child 隔离、activation 死亡回队列及 dispose。真实 DSH + 真实模型验收按 §4 执行，并在交接记录中逐项区分档位。若现场证明 `agent/created` 晚于首 prompt，立即停止实施，记录证据，不替换隔离方案。
