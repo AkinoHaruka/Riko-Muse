@@ -9,6 +9,7 @@
  */
 import { readFileSync } from "node:fs";
 import type { Context } from "@deepseek-ai/cordis";
+import type { PreStepDecision } from "@deepseek-ai/dsh-agent";
 import type { Session, SessionEvent, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
 import { DreamRunner } from "./dream-runner.js";
 import { currentDreamChildBinding } from "./dream-scope.js";
@@ -99,16 +100,18 @@ class AgentMemoryPlugin {
 
   async start(): Promise<void> {
     const gapChecker = this.resolveGapChecker();
-    await this.pipeline.start(gapChecker);
+    const pipelineReady = this.pipeline.start(gapChecker);
+    const capabilityReady = this.cfg.contextBundleEnabled
+      ? this.negotiateContextBundle() : Promise.resolve();
 
-    // DSH 自身持久 Agent 的 pre-step 是 runner 可见的父 Agent seam。
-    // runner 只从一个仍登记的父 Agent 启动，子 Agent 工具集为空。
-    this.ctx.on("agent/pre-step" as never, ((payload: PreStepPayload, next: () => Promise<never>) => {
-      this.dreamRunner.start(payload.agent);
-      return next();
-    }) as never);
-
-    if (this.cfg.contextBundleEnabled) await this.negotiateContextBundle();
+    // Register creation listeners synchronously. The headless host may create
+    // its first Agent while asynchronous pipeline/capability setup is pending.
+    if (this.cfg.contextBundleEnabled) this.registerSoulAssemble();
+    const bundleHook = makeBundleHook(this.client, this.logger, this.cfg.agentName);
+    const legacyHook = makePreStepHook(this.client, this.logger, this.cfg.composeTimeoutMs);
+    this.registerScopedPreStep((payload, next) => this.cfg.contextBundleEnabled
+      ? bundleHook(payload, next)
+      : this.cfg.injectionEnabled ? legacyHook(payload, next) : next());
 
     if (this.cfg.captureEnabled) {
       // session/event 是提交后的同步受保护通知；回调只做有界入队（doc2/03 §2）。
@@ -118,18 +121,6 @@ class AgentMemoryPlugin {
         // 官方持久 session 的来源分类，fork 同样排除以免重复摄入继承事件。
         if (!isCapturableSessionHeader(session.header)) return;
         this.pipeline.observeSessionEvent(String(session.id), event);
-      }) as never);
-    }
-
-    if (this.cfg.contextBundleEnabled) {
-      // D6 v6 注入（doc6/06 §3）：Soul 走 assemble waterfall；resident/retrieved
-      // 走 pre-step 前插。同一步不再调用旧 compose（不双调）。
-      this.registerSoulAssemble();
-      this.registerBundlePreStep();
-    } else if (this.cfg.injectionEnabled) {
-      const hook = makePreStepHook(this.client, this.logger, this.cfg.composeTimeoutMs);
-      this.ctx.on("agent/pre-step" as never, (async (payload: PreStepPayload, next: () => Promise<never>) => {
-        return hook(payload, next);
       }) as never);
     }
 
@@ -166,6 +157,8 @@ class AgentMemoryPlugin {
       `riko-dsh: 已加载 capture=${this.cfg.captureEnabled} injection=${this.cfg.injectionEnabled} `
       + `tools=${this.cfg.toolsEnabled} contextBundle=${this.cfg.contextBundleEnabled}`,
     );
+    await pipelineReady;
+    await capabilityReady;
   }
 
   /**
@@ -213,12 +206,21 @@ class AgentMemoryPlugin {
     );
   }
 
-  /** 注册 agent/pre-step：bundle 的 resident/retrieved 前插（doc6/06 §3）。 */
-  private registerBundlePreStep(): void {
-    const hook = makeBundleHook(this.client, this.logger, this.cfg.agentName);
-    this.ctx.on("agent/pre-step" as never, (async (payload: PreStepPayload, next: () => Promise<never>) => {
-      return hook(payload, next);
-    }) as never);
+  /** Register on each top-level Agent's scope before its first prompt. */
+  private registerScopedPreStep(
+    hook?: (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>,
+  ): void {
+    (this.ctx as { on: (name: string, cb: unknown) => unknown }).on(
+      "agent/created",
+      async (created: { agent: { ctx: unknown; session?: { header?: { origin?: unknown; parentSession?: unknown } } } }) => {
+        if (!isCapturableSessionHeader(created.agent.session?.header)) return;
+        const agentCtx = created.agent.ctx as { on: (name: string, cb: unknown) => unknown };
+        agentCtx.on("agent/pre-step", (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => {
+          this.dreamRunner.start(payload.agent);
+          return hook ? hook(payload, next) : next();
+        });
+      },
+    );
   }
 
   /** 官方异步定点读取：已知 session 的缺口对账用（doc2/03 §2 恢复边界）。 */

@@ -257,12 +257,14 @@ export class DreamRunner {
         agent_id: String(agent.id),
         capabilities: ["chat", "dream_v1", "adjudicate_v1", "consolidate_v1", "dream_scoped_read_v1"],
       }, signal);
+      if (process.env.P06_TRACE) console.error("p06 heartbeat", heartbeat.status, heartbeat.failure);
       if (heartbeat.failure !== "ok" || heartbeat.status < 200 || heartbeat.status >= 300) {
         this.diagnostic("memoryd_unavailable", "Dream runner heartbeat 未确认；作业仍由 memoryd 持久保存");
         await sleep(5_000, signal);
         continue;
       }
       const response = await this.client.dreamRunnerClaim({ runner_id: this.runnerId }, signal);
+      if (process.env.P06_TRACE) console.error("p06 claim", response.status, response.failure, (response.body as { status?: string } | undefined)?.status);
       if (response.failure !== "ok" || response.status < 200 || response.status >= 300) {
         this.diagnostic("claim_failed", "Dream claim 未确认；runner 将重试");
         await sleep(5_000, signal);

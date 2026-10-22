@@ -6,6 +6,7 @@ import SystemPrompt from "../../../deepseek-harness/packages/core/system-prompt/
 import ToolRuntime from "../../../deepseek-harness/packages/core/tools/lib/index.js";
 import { installDreamChildTools } from "../dist/dream-tools.js";
 import { DreamRunner } from "../dist/dream-runner.js";
+import { isCapturableSessionHeader } from "../dist/events.js";
 
 const binding = (phase, jobId) => ({
   runnerId: "runner", jobId, generation: 1, phase,
@@ -87,3 +88,57 @@ test("Dream child schema and execution are isolated per concurrent child before 
   assert.deepEqual(names("consolidate-child").length, 6);
   await second.dispose();
 });
+
+test("scoped pre-step registers only on capturable sessions and invokes runner start", async () => {
+  const listeners = [];
+  const fakeCtx = {
+    on: (name, cb) => {
+      if (name === "agent/created") listeners.push(cb);
+    },
+  };
+  const runnerStarts = [];
+  const fakeRunner = { start: (agent) => runnerStarts.push(agent.id) };
+  let hookCalls = 0;
+  const hook = async (payload, next) => { hookCalls += 1; return next(); };
+
+  // Helper matching AgentMemoryPlugin.registerScopedPreStep
+  const registerScopedPreStep = (ctx, runner, hk) => {
+    ctx.on("agent/created", async (created) => {
+      if (!isCapturableSessionHeader(created.agent.session?.header)) return;
+      const agentCtx = created.agent.ctx;
+      agentCtx.on("agent/pre-step", (payload, next) => {
+        runner.start(payload.agent);
+        return hk ? hk(payload, next) : next();
+      });
+    });
+  };
+
+  registerScopedPreStep(fakeCtx, fakeRunner, hook);
+  assert.equal(listeners.length, 1);
+
+  // 1) Child subagent -> skipped
+  const childAgentCtx = { on: () => { assert.fail("child should not receive pre-step listener"); } };
+  await listeners[0]({
+    agent: { id: "child-1", session: { header: { origin: "subagent", parentSession: "parent-1" } }, ctx: childAgentCtx },
+  });
+
+  // 2) Top-level chat -> registered and fired
+  const topAgentListeners = new Map();
+  const topAgentCtx = {
+    on: (name, cb) => { topAgentListeners.set(name, cb); },
+  };
+  await listeners[0]({
+    agent: { id: "top-1", session: { header: { origin: "chat" } }, ctx: topAgentCtx },
+  });
+  assert.equal(topAgentListeners.has("agent/pre-step"), true);
+
+  const preStepFn = topAgentListeners.get("agent/pre-step");
+  let nextCalled = false;
+  const decision = await preStepFn({ agent: { id: "top-1" } }, async () => { nextCalled = true; return { kind: "enter" }; });
+  assert.deepEqual(decision, { kind: "enter" });
+  assert.equal(nextCalled, true);
+  assert.equal(runnerStarts.length, 1);
+  assert.equal(runnerStarts[0], "top-1");
+  assert.equal(hookCalls, 1);
+});
+
