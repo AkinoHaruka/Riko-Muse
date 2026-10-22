@@ -1,0 +1,504 @@
+[
+  {
+    "id": "M06",
+    "bucket": "multi",
+    "expected": "active",
+    "kind": "instruction",
+    "claim_points": "中文;来源",
+    "text": "以后用中文回答，并在引用数据时给来源。",
+    "context": "",
+    "set": "p4",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-8a0c-768c-b83d-978a92dc89f3",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 872,
+      "output_tokens": 322
+    },
+    "actual": "active",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-8a08-760b-914c-fead74ebd9b1",
+        "kind": "instruction",
+        "quote": "以后用中文回答",
+        "claim": "以后用中文回答",
+        "status": "rejected",
+        "reason_code": "PROMOTED"
+      },
+      {
+        "evidence_id": "01a164d8-8a08-760b-914c-fead74ebd9b1",
+        "kind": "instruction",
+        "quote": "并在引用数据时给来源",
+        "claim": "并在引用数据时给来源",
+        "status": "held",
+        "reason_code": "NOT_EXPLICIT"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 1,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [],
+        "job_id": "01a164d8-8a0c-768c-b83d-978a92dc89f3",
+        "latency_ms": 1003,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 10.96
+  },
+  {
+    "id": "M12",
+    "bucket": "multi",
+    "expected": "active",
+    "kind": "instruction",
+    "claim_points": "编号;示例",
+    "text": "以后解释算法请编号，并给一个示例。",
+    "context": "",
+    "set": "p4",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-b425-724f-ac0f-128b3aa28d0c",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 917,
+      "output_tokens": 270
+    },
+    "actual": "active",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-b423-731f-9cc5-0118e66491e1",
+        "kind": "instruction",
+        "quote": "以后解释算法请编号",
+        "claim": "用户要求以后在解释算法时进行编号。",
+        "status": "rejected",
+        "reason_code": "PROMOTED"
+      },
+      {
+        "evidence_id": "01a164d8-b423-731f-9cc5-0118e66491e1",
+        "kind": "instruction",
+        "quote": "给一个示例。",
+        "claim": "用户要求以后在解释算法时提供一个示例。",
+        "status": "rejected",
+        "reason_code": "PROMOTED"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 2,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [],
+        "job_id": "01a164d8-b425-724f-ac0f-128b3aa28d0c",
+        "latency_ms": 1241,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 7.26
+  },
+  {
+    "id": "S08",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "claim_points": "",
+    "text": "我的健康记录里有心脏病。",
+    "context": "",
+    "set": "p4",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-d08f-7647-bdb7-a37501ab3661",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 295,
+      "output_tokens": 111
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-d08d-72a1-8ed7-a3bd86a22181",
+        "kind": "fact",
+        "quote": "我的健康记录里有心脏病。",
+        "claim": "我的健康记录里有心脏病。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [],
+    "elapsed_s": 3.771
+  },
+  {
+    "id": "S09",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "claim_points": "",
+    "text": "我患有哮喘。",
+    "context": "",
+    "set": "p4",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-df39-75d0-9745-1aef7d1309b6",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 293,
+      "output_tokens": 109
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-df37-76fe-ba1f-a480e2369628",
+        "kind": "fact",
+        "quote": "我患有哮喘。",
+        "claim": "我患有哮喘。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [],
+    "elapsed_s": 3.755
+  },
+  {
+    "id": "P5H01",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "context": "上周我去做了体检。",
+    "text": "那个结果不太好。",
+    "set": "challenge",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-ee0f-71e3-bca8-f1c6412a3ad2",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 1172,
+      "output_tokens": 401
+    },
+    "actual": "active",
+    "leak": true,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-ee04-702c-b12b-0b7d214bc7db",
+        "kind": "episode",
+        "quote": "上周我去做了体检。",
+        "claim": "用户上周做了体检。",
+        "status": "rejected",
+        "reason_code": "PROMOTED"
+      },
+      {
+        "evidence_id": "01a164d8-ee09-74c8-be32-d3e4a843682f",
+        "kind": "episode",
+        "quote": "那个结果不太好。",
+        "claim": "用户认为体检结果不太好。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 2,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          1
+        ],
+        "job_id": "01a164d8-ee0f-71e3-bca8-f1c6412a3ad2",
+        "latency_ms": 1519,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 9.302
+  },
+  {
+    "id": "P5H02",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "context": "医生看了我上次的检查。",
+    "text": "他说有一项指标偏高。",
+    "set": "challenge",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-126c-7448-a373-757088cd9617",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 1212,
+      "output_tokens": 425
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-1266-702c-9b16-2421fc4ed00b",
+        "kind": "episode",
+        "quote": "医生看了我上次的检查。",
+        "claim": "用户说医生看了他上次的检查。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      },
+      {
+        "evidence_id": "01a164d9-126a-7722-a2d4-b4bd84c75318",
+        "kind": "episode",
+        "quote": "他说有一项指标偏高。",
+        "claim": "用户转述医生称有一项指标偏高。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 2,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          0,
+          1
+        ],
+        "job_id": "01a164d9-126c-7448-a373-757088cd9617",
+        "latency_ms": 1436,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 9.808
+  },
+  {
+    "id": "P5H03",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "context": "我刚从诊室出来。",
+    "text": "医生说我的情况需要继续观察。",
+    "set": "challenge",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-3890-72de-bf31-cb9ad3dc0ddd",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 1181,
+      "output_tokens": 446
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-388b-714e-be05-001166ed3d41",
+        "kind": "episode",
+        "quote": "我刚从诊室出来。",
+        "claim": "用户刚从诊室出来。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      },
+      {
+        "evidence_id": "01a164d9-388d-7059-bb0c-82b5cb892348",
+        "kind": "fact",
+        "quote": "医生说我的情况需要继续观察。",
+        "claim": "医生表示用户的情况需要继续观察。",
+        "status": "held",
+        "reason_code": "UNCLEAR_SUBJECT"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 1,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          0
+        ],
+        "job_id": "01a164d9-3890-72de-bf31-cb9ad3dc0ddd",
+        "latency_ms": 959,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 10.265
+  },
+  {
+    "id": "P5N01",
+    "bucket": "body",
+    "expected": "active",
+    "kind": "fact",
+    "context": "",
+    "text": "我每周练两次瑜伽。",
+    "set": "challenge",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-6104-7262-ae6a-faea883e2f76",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 866,
+      "output_tokens": 225
+    },
+    "actual": "active",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-60fd-7677-a36e-4561782be178",
+        "kind": "preference",
+        "quote": "我每周练两次瑜伽。",
+        "claim": "用户每周练习瑜伽两次。",
+        "status": "rejected",
+        "reason_code": "PROMOTED"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 1,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [],
+        "job_id": "01a164d9-6104-7262-ae6a-faea883e2f76",
+        "latency_ms": 1601,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 12.891
+  },
+  {
+    "id": "P5N03",
+    "bucket": "body",
+    "expected": "active",
+    "kind": "fact",
+    "context": "",
+    "text": "我在开发健康记录应用。",
+    "set": "challenge",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-9328-70b2-ad3e-5e1bd16f1c4f",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 625,
+      "output_tokens": 241
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-9324-734a-994f-97a21197baab",
+        "kind": "instruction",
+        "quote": "我在开发健康记录应用。",
+        "claim": "我在开发健康记录应用。",
+        "status": "held",
+        "reason_code": "NOT_EXPLICIT"
+      }
+    ],
+    "policy_audits": [],
+    "elapsed_s": 6.796
+  },
+  {
+    "id": "P5N05",
+    "bucket": "body",
+    "expected": "active",
+    "kind": "fact",
+    "context": "上次代码评审不顺利。",
+    "text": "那个结果不太好。",
+    "set": "challenge",
+    "model": "Qwen/Qwen3.5-4B",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-ad9e-733c-bc69-0c31c7505acd",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 1187,
+      "output_tokens": 404
+    },
+    "actual": "active",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-ad99-71ed-bdf5-3d98e5a36523",
+        "kind": "episode",
+        "quote": "上次代码评审不顺利。",
+        "claim": "用户表示上次代码评审过程不顺利。",
+        "status": "rejected",
+        "reason_code": "PROMOTED"
+      },
+      {
+        "evidence_id": "01a164d9-ad9b-7585-982d-bc11be526693",
+        "kind": "episode",
+        "quote": "那个结果不太好。",
+        "claim": "用户评价那个结果不太好。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 2,
+        "diagnostic": null,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          1
+        ],
+        "job_id": "01a164d9-ad9e-733c-bc69-0c31c7505acd",
+        "latency_ms": 1985,
+        "result": "valid"
+      }
+    ],
+    "elapsed_s": 19.278
+  }
+]

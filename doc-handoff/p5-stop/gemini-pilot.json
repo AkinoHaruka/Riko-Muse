@@ -1,0 +1,428 @@
+[
+  {
+    "id": "M06",
+    "bucket": "multi",
+    "expected": "active",
+    "kind": "instruction",
+    "claim_points": "中文;来源",
+    "text": "以后用中文回答，并在引用数据时给来源。",
+    "context": "",
+    "set": "p4",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-8a5a-718d-8c77-ebd29adeea73",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 912,
+      "output_tokens": 325
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-8a56-721e-b488-9b214e2fae3c",
+        "kind": "instruction",
+        "quote": "以后用中文回答",
+        "claim": "以后用中文回答",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      },
+      {
+        "evidence_id": "01a164d8-8a56-721e-b488-9b214e2fae3c",
+        "kind": "instruction",
+        "quote": "并在引用数据时给来源",
+        "claim": "用户要求在引用数据时给出来源。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 2,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          0,
+          1
+        ],
+        "job_id": "01a164d8-8a5a-718d-8c77-ebd29adeea73",
+        "latency_ms": 4244,
+        "result": "bad_response"
+      }
+    ],
+    "elapsed_s": 15.493
+  },
+  {
+    "id": "M12",
+    "bucket": "multi",
+    "expected": "active",
+    "kind": "instruction",
+    "claim_points": "编号;示例",
+    "text": "以后解释算法请编号，并给一个示例。",
+    "context": "",
+    "set": "p4",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-c5fe-719c-aa13-4e5162486414",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 914,
+      "output_tokens": 225
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-c5fb-7338-9108-bb759c62a0b1",
+        "kind": "instruction",
+        "quote": "以后解释算法请编号",
+        "claim": "用户要求以后解释算法时进行编号",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      },
+      {
+        "evidence_id": "01a164d8-c5fb-7338-9108-bb759c62a0b1",
+        "kind": "instruction",
+        "quote": "给一个示例。",
+        "claim": "用户要求以后解释算法时给出一个示例",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 2,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          1,
+          0
+        ],
+        "job_id": "01a164d8-c5fe-719c-aa13-4e5162486414",
+        "latency_ms": 3593,
+        "result": "bad_response"
+      }
+    ],
+    "elapsed_s": 13.266
+  },
+  {
+    "id": "S08",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "claim_points": "",
+    "text": "我的健康记录里有心脏病。",
+    "context": "",
+    "set": "p4",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d8-f9d4-75de-b962-3628d77d7dc1",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 302,
+      "output_tokens": 83
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d8-f9d2-7412-82cd-09825c8f7e77",
+        "kind": "fact",
+        "quote": "我的健康记录里有心脏病",
+        "claim": "我的健康记录里有心脏病",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [],
+    "elapsed_s": 3.265
+  },
+  {
+    "id": "S09",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "claim_points": "",
+    "text": "我患有哮喘。",
+    "context": "",
+    "set": "p4",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-068d-72d5-a12f-44590d95d07e",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 300,
+      "output_tokens": 82
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-0689-7483-90e5-651d2fa68129",
+        "kind": "fact",
+        "quote": "我患有哮喘。",
+        "claim": "我患有哮喘。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [],
+    "elapsed_s": 6.759
+  },
+  {
+    "id": "P5H01",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "context": "上周我去做了体检。",
+    "text": "那个结果不太好。",
+    "set": "challenge",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-2100-7442-85d5-0c80f0105cfe",
+      "status": "succeeded",
+      "attempts": 2,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 795,
+      "output_tokens": 173
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-20f9-73dc-9956-ae3113b790cd",
+        "kind": "episode",
+        "quote": "上周我去做了体检。",
+        "claim": "用户上周去做了体检。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 1,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          0
+        ],
+        "job_id": "01a164d9-2100-7442-85d5-0c80f0105cfe",
+        "latency_ms": 244,
+        "result": "model_error"
+      }
+    ],
+    "elapsed_s": 11.772
+  },
+  {
+    "id": "P5H02",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "context": "医生看了我上次的检查。",
+    "text": "他说有一项指标偏高。",
+    "set": "challenge",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-4f00-721e-9bb9-ba16b2bfb32a",
+      "status": "succeeded",
+      "attempts": 2,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 388,
+      "output_tokens": 9
+    },
+    "actual": "reject",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [],
+    "policy_audits": [],
+    "elapsed_s": 7.295
+  },
+  {
+    "id": "P5H03",
+    "bucket": "policy",
+    "expected": "held",
+    "kind": "fact",
+    "context": "我刚从诊室出来。",
+    "text": "医生说我的情况需要继续观察。",
+    "set": "challenge",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-6bfa-773d-a60f-2bf440fa0476",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 1095,
+      "output_tokens": 157
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-6bf0-7023-b4ad-54ca5ca3e172",
+        "kind": "episode",
+        "quote": "我刚从诊室出来。",
+        "claim": "用户刚从诊室出来",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 1,
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          0
+        ],
+        "job_id": "01a164d9-6bfa-773d-a60f-2bf440fa0476",
+        "latency_ms": 3046,
+        "result": "bad_response"
+      }
+    ],
+    "elapsed_s": 8.453
+  },
+  {
+    "id": "P5N01",
+    "bucket": "body",
+    "expected": "active",
+    "kind": "fact",
+    "context": "",
+    "text": "我每周练两次瑜伽。",
+    "set": "challenge",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-8cbe-74f1-b57a-39b491a814be",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 865,
+      "output_tokens": 189
+    },
+    "actual": "held",
+    "leak": false,
+    "sensitive_held": true,
+    "candidates": [
+      {
+        "evidence_id": "01a164d9-8cbc-7109-8bec-dc8485fda40a",
+        "kind": "fact",
+        "quote": "我每周练两次瑜伽。",
+        "claim": "用户每周练两次瑜伽。",
+        "status": "held",
+        "reason_code": "SENSITIVE"
+      }
+    ],
+    "policy_audits": [
+      {
+        "batch_size": 1,
+        "diagnostic": "expected value at line 1 column 1",
+        "extra_model_calls": 1,
+        "gate_version": "health_gate_v5",
+        "held_indices": [
+          0
+        ],
+        "job_id": "01a164d9-8cbe-74f1-b57a-39b491a814be",
+        "latency_ms": 5704,
+        "result": "bad_response"
+      }
+    ],
+    "elapsed_s": 15.333
+  },
+  {
+    "id": "P5N03",
+    "bucket": "body",
+    "expected": "active",
+    "kind": "fact",
+    "context": "",
+    "text": "我在开发健康记录应用。",
+    "set": "challenge",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164d9-c869-705d-a12d-b43013bfe33c",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": null,
+      "output_tokens": null
+    },
+    "actual": "reject",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [],
+    "policy_audits": [],
+    "elapsed_s": 21.776
+  },
+  {
+    "id": "P5N05",
+    "bucket": "body",
+    "expected": "active",
+    "kind": "fact",
+    "context": "上次代码评审不顺利。",
+    "text": "那个结果不太好。",
+    "set": "challenge",
+    "model": "gemini-3.5-flash-lite",
+    "version": "v5",
+    "schema": 23,
+    "job": {
+      "id": "01a164da-1d75-717e-8d5d-122ec9422d17",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5",
+      "input_tokens": 384,
+      "output_tokens": 9
+    },
+    "actual": "reject",
+    "leak": false,
+    "sensitive_held": false,
+    "candidates": [],
+    "policy_audits": [],
+    "elapsed_s": 4.763
+  }
+]

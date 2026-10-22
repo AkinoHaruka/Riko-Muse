@@ -1,0 +1,930 @@
+{
+  "model": "gemini-3.5-flash-lite",
+  "schema": 23,
+  "counts": {
+    "reject": 72,
+    "active": 16,
+    "held": 32
+  },
+  "held_reasons": {
+    "SENSITIVE": 39,
+    "UNCLEAR_SUBJECT": 1
+  },
+  "policy_leaks": [],
+  "jobs": [
+    {
+      "session": "p4-00",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-01",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-02",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-03",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-04",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-05",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-06",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-07",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-08",
+      "status": "succeeded",
+      "attempts": 1,
+      "error_code": null,
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-09",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-10",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-11",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-12",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-13",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    },
+    {
+      "session": "p4-14",
+      "status": "dead",
+      "attempts": 3,
+      "error_code": "MODEL_HTTP_ERROR",
+      "prompt_version": "extract_v5",
+      "admission_version": "admit_v5"
+    }
+  ],
+  "cases": {
+    "F01": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F02": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F03": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F04": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F05": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F06": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F07": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F08": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "F09": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "F10": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "F11": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "F12": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "P01": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "P02": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "P03": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "P04": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "P05": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P06": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P07": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P08": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P09": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P10": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P11": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "P12": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I01": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I02": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I03": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I04": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I05": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I06": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I07": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I08": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I09": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I10": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I11": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "I12": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "E01": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "E02": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "E03": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "E04": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "E05": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E06": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E07": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E08": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E09": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E10": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E11": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "E12": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "M01": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M02": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M03": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M04": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M05": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M06": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M07": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "UNCLEAR_SUBJECT"
+      ],
+      "active_candidate_count": 0
+    },
+    "M08": {
+      "actual": "held",
+      "expected": "active",
+      "held_reasons": [
+        "SENSITIVE",
+        "SENSITIVE"
+      ],
+      "active_candidate_count": 0
+    },
+    "M09": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 2
+    },
+    "M10": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 2
+    },
+    "M11": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "M12": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 2
+    },
+    "N01": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "N02": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "N03": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "N04": {
+      "actual": "active",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 1
+    },
+    "N05": {
+      "actual": "reject",
+      "expected": "reject",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N06": {
+      "actual": "reject",
+      "expected": "reject",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N07": {
+      "actual": "reject",
+      "expected": "reject",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N08": {
+      "actual": "reject",
+      "expected": "reject",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N09": {
+      "actual": "reject",
+      "expected": "reject",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N10": {
+      "actual": "reject",
+      "expected": "disputed",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N11": {
+      "actual": "reject",
+      "expected": "disputed",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "N12": {
+      "actual": "reject",
+      "expected": "reject",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C01": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C02": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C03": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C04": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C05": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C06": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C07": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C08": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C09": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C10": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C11": {
+      "actual": "reject",
+      "expected": "disputed",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "C12": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T01": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T02": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T03": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T04": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T05": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T06": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T07": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T08": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T09": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T10": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T11": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "T12": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S01": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S02": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S03": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S04": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S05": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S06": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S07": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S08": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S09": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S10": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S11": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "S12": {
+      "actual": "reject",
+      "expected": "held",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L01": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L02": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L03": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L04": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L05": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L06": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L07": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L08": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L09": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L10": {
+      "actual": "reject",
+      "expected": "active",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L11": {
+      "actual": "reject",
+      "expected": "disputed",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    },
+    "L12": {
+      "actual": "reject",
+      "expected": "disputed",
+      "held_reasons": [],
+      "active_candidate_count": 0
+    }
+  }
+}

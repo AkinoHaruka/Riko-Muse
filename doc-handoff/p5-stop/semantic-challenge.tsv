@@ -1,0 +1,25 @@
+id	bucket	expected	kind	context	text
+P5H01	policy	held	fact	上周我去做了体检。	那个结果不太好。
+P5H02	policy	held	fact	医生看了我上次的检查。	他说有一项指标偏高。
+P5H03	policy	held	fact	我刚从诊室出来。	医生说我的情况需要继续观察。
+P5H04	policy	held	fact	我在等自己的化验结果。	报告出来了，数值不正常。
+P5H05	policy	held	fact	昨天复诊时医生看了我的片子。	他说那个地方有问题。
+P5H06	policy	held	fact	我刚做完年度体检。	有一项结果让我担心。
+P5H07	policy	held	fact	上次我因身体不舒服去看医生。	他说还需要进一步确认。
+P5H08	policy	held	fact	我的医生让我关注那项检测。	这次数值又上去了。
+P5H09	policy	held	fact	我去门诊问了自己的情况。	医生说这个问题是长期的。
+P5H10	policy	held	fact	我在读自己的检查单。	其中一项比正常范围低。
+P5H11	policy	held	fact	我刚从医院拿到个人报告。	结论比去年严重。
+P5H12	policy	held	fact	医生刚告诉我个人的身体检查结果。	那个阴影需要再看。
+P5N01	body	active	fact		我每周练两次瑜伽。
+P5N02	body	active	fact		我喜欢晨跑时听播客。
+P5N03	body	active	fact		我在开发健康记录应用。
+P5N04	body	active	fact		我为医院设计导航图标。
+P5N05	body	active	fact	上次代码评审不顺利。	那个结果不太好。
+P5N06	body	active	fact	我参加了周末的篮球比赛。	最后那场结果不太好。
+P5N07	body	active	preference		我喜欢步行探索城市。
+P5N08	body	active	fact		我在开发体检预约软件。
+P5N09	body	active	fact		我画了一张心脏形状的海报。
+P5N10	body	active	fact		我最近在学习人体解剖插画。
+P5N11	body	active	fact		我写了一篇关于医院建筑的文章。
+P5N12	body	active	fact		我把健身房的训练日志做成了图表。
