@@ -33,6 +33,7 @@ pub struct MemoryRow {
     pub origin_agent_id: String,
     pub updated_at: String,
     pub evidence_refs: Vec<(String, Option<i64>, Option<i64>)>,
+    pub reason_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -487,7 +488,7 @@ impl Store {
                 // 把行改成 expired 之后才不可见。
                 &format!(
                     "SELECT m.kind, m.claim, m.status, m.version, m.occurred_at, m.valid_until,
-                            m.origin_agent_id, m.updated_at
+                            m.origin_agent_id, m.updated_at, m.reason_text
                      FROM memories m
                      WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.id=?3
                        AND ({})",
@@ -510,11 +511,22 @@ impl Store {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, String>(6)?,
                         r.get::<_, String>(7)?,
+                        r.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((kind, claim, status, version, occurred_at, valid_until, agent, updated_at)) = row
+        let Some((
+            kind,
+            claim,
+            status,
+            version,
+            occurred_at,
+            valid_until,
+            agent,
+            updated_at,
+            reason_text,
+        )) = row
         else {
             return Ok(None);
         };
@@ -541,6 +553,7 @@ impl Store {
             origin_agent_id: agent,
             updated_at,
             evidence_refs: self.evidence_refs_of(scope, memory_id)?,
+            reason_text,
         }))
     }
 

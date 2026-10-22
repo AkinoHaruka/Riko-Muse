@@ -85,6 +85,8 @@ pub struct MemoryExplain {
     pub subject_source: &'static str,
     /// 保存原因码（\`memory_candidates.reason_code\`）；缺就返回 None，不编造理由。
     pub reason_code: Option<String>,
+    /// 保存理由文本（\`reason_text\`）；缺就返回 None，不编造理由。
+    pub reason_text: Option<String>,
     pub relations: ExplainRelations,
     pub stable_ref: String,
     /// 本行是否通过统一可见性判定（\`include_history=true\` 时可能为 false 但仍返回）。
@@ -167,7 +169,7 @@ impl Store {
         let sql = format!(
             "SELECT m.kind, m.claim, m.status, m.version, m.domain_id, m.source_class,
                     m.occurred_at, m.valid_from, m.valid_until, m.created_at, m.updated_at,
-                    CASE WHEN ({}) THEN 1 ELSE 0 END
+                    CASE WHEN ({}) THEN 1 ELSE 0 END, m.reason_text
              FROM memories m
              WHERE m.tenant_id=? AND m.user_id=? AND m.id=?
                AND m.domain_id IN (SELECT value FROM json_each(?))",
@@ -187,6 +189,7 @@ impl Store {
             String,
             String,
             i64,
+            Option<String>,
         )> = self
             .conn()
             .query_row(
@@ -213,6 +216,7 @@ impl Store {
                         r.get(9)?,
                         r.get(10)?,
                         r.get(11)?,
+                        r.get(12)?,
                     ))
                 },
             )
@@ -230,6 +234,7 @@ impl Store {
             created_at,
             updated_at,
             visible_flag,
+            mem_reason_text,
         )) = row
         else {
             return Ok(None);
@@ -247,7 +252,8 @@ impl Store {
         let speaker = evidence
             .first()
             .and_then(|e| speaker_of(&e.role, &e.source_kind));
-        let reason_code = self.memory_reason_code(scope, memory_id, &claim)?;
+        let (reason_code, candidate_reason_text) = self.memory_reason(scope, memory_id, &claim)?;
+        let reason_text = mem_reason_text.or(candidate_reason_text);
         let relations = self.explain_relations(scope, memory_id)?;
         Ok(Some(MemoryExplain {
             memory_id: memory_id.to_string(),
@@ -267,6 +273,7 @@ impl Store {
             subject: None,
             subject_source: "unknown",
             reason_code,
+            reason_text,
             relations,
             stable_ref: memory_stable_ref(
                 &scope.tenant_id,
@@ -327,18 +334,18 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// 保存原因码：\`memory_candidates\` 里同一 claim 的候选（无则 None）。
+    /// 保存原因码与理由文本：`memory_candidates` 里同一 claim 的候选（无则 None）。
     /// 理由文本与来源证据是两件事，缺就返回 None，不编造。
-    fn memory_reason_code(
+    fn memory_reason(
         &self,
         scope: &ScopeKey,
         memory_id: &str,
         claim: &str,
-    ) -> Result<Option<String>, StoreError> {
-        let reason: Option<Option<String>> = self
+    ) -> Result<(Option<String>, Option<String>), StoreError> {
+        let row: Option<(Option<String>, Option<String>)> = self
             .conn()
             .query_row(
-                "SELECT c.reason_code FROM memory_evidence me
+                "SELECT c.reason_code, c.reason_text FROM memory_evidence me
                  JOIN memory_candidates c
                    ON c.tenant_id=me.tenant_id AND c.user_id=me.user_id
                   AND c.primary_evidence_id=me.evidence_id
@@ -346,10 +353,10 @@ impl Store {
                    AND c.claim=?4
                  ORDER BY c.created_at LIMIT 1",
                 rusqlite::params![scope.tenant_id, scope.user_id, memory_id, claim],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        Ok(reason.flatten())
+        Ok(row.unwrap_or((None, None)))
     }
 
     fn explain_relations(

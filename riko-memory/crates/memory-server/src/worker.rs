@@ -1769,11 +1769,19 @@ async fn process_job_inner<M: ExtractModel>(
                     }
                     let mut last_err: Option<String> = None;
                     for c in &ex.candidates {
-                        // 按作业行版本分派准入（v4 的 admit 对已回填 claim 的候选用
+                        // 按作业行版本分派准入（v4/v5 的 admit 对已回填 claim 的候选用
                         // 改写文本受检；版本已在上方验证，分派必有实现）。
-                        let admission = memory_extract::admit_for(&admission_version, c, &events)
-                            .unwrap_or(Admission::Held("NOT_EXPLICIT"));
-                        match guard.save_candidate(&scope, job, &origin, c, admission) {
+                        let (admission, reason_text) =
+                            memory_extract::admit_for_with_reason(&admission_version, c, &events)
+                                .unwrap_or((Admission::Held("NOT_EXPLICIT"), None));
+                        match guard.save_candidate_with_reason(
+                            &scope,
+                            job,
+                            &origin,
+                            c,
+                            admission,
+                            reason_text,
+                        ) {
                             Ok(outcome) => {
                                 eprintln!(
                                     "[worker] candidate job={} outcome={:?} prompt={} admission={}",

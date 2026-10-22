@@ -73,6 +73,7 @@ fn candidate_list_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<Ca
             created_at: r.get(3)?,
             primary_evidence_id: r.get(4)?,
             quote_len: quote.chars().count(),
+            reason_text: r.get(6)?,
         })
     }
 }
@@ -244,7 +245,7 @@ impl Store {
                 .ok_or(StoreError::JobNotFound)?,
         };
         let mut sql = String::from(
-            "SELECT id, kind, reason_code, created_at, primary_evidence_id, quote
+            "SELECT id, kind, reason_code, created_at, primary_evidence_id, quote, reason_text
              FROM memory_candidates
              WHERE tenant_id=?1 AND user_id=?2 AND status=?3",
         );
@@ -279,7 +280,7 @@ impl Store {
             .query_row(
                 "SELECT c.id, c.kind, c.status, c.reason_code, c.created_at,
                         c.primary_evidence_id, c.quote, c.quote_sha256,
-                        e.start_byte, e.end_byte
+                        e.start_byte, e.end_byte, c.reason_text
                  FROM memory_candidates c
                  LEFT JOIN candidate_evidence e
                    ON e.tenant_id=c.tenant_id AND e.user_id=c.user_id
@@ -298,6 +299,7 @@ impl Store {
                         quote_sha256: r.get(7)?,
                         evidence_start_byte: r.get(8)?,
                         evidence_end_byte: r.get(9)?,
+                        reason_text: r.get(10)?,
                     })
                 },
             )
@@ -355,6 +357,7 @@ pub struct CandidateListItem {
     pub primary_evidence_id: String,
     /// quote 的 Unicode 字符数。
     pub quote_len: usize,
+    pub reason_text: Option<String>,
 }
 
 /// 候选详情（含 quote 与证据定位；仅本机交互终端使用）。
@@ -364,6 +367,7 @@ pub struct CandidateDetail {
     pub kind: String,
     pub status: String,
     pub reason_code: Option<String>,
+    pub reason_text: Option<String>,
     pub created_at: String,
     pub primary_evidence_id: String,
     pub quote: String,

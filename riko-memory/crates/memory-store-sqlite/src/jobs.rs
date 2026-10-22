@@ -806,6 +806,30 @@ impl Store {
         c: &memory_extract::ModelCandidate,
         admission: Admission,
     ) -> Result<CandidateOutcome, StoreError> {
+        let reason_text = if job.admission_version == memory_contract::ADMISSION_VERSION_V5 {
+            Some(default_admission_reason_text(&admission, c))
+        } else {
+            None
+        };
+        self.save_candidate_with_reason(scope, job, origin, c, admission, reason_text)
+    }
+
+    /// 带裁决理由文本的候选持久化（B2 卡规范：确定性理由文本随候选/记忆行落库）。
+    pub fn save_candidate_with_reason(
+        &mut self,
+        scope: &ScopeKey,
+        job: &JobRow,
+        origin: &Origin,
+        c: &memory_extract::ModelCandidate,
+        admission: Admission,
+        reason_text: Option<String>,
+    ) -> Result<CandidateOutcome, StoreError> {
+        // 硬边界：新字段只在 v5 写入，v4 行为不变（非 v5 作业一律写入 NULL）。
+        let reason_text = if job.admission_version == memory_contract::ADMISSION_VERSION_V5 {
+            reason_text.or_else(|| Some(default_admission_reason_text(&admission, c)))
+        } else {
+            None
+        };
         // V2-S1：候选与派生记忆归属作业域；准入查库按写域过滤（doc7/04 §2.4/§3）。
         let dom = DomainScope::for_job(&job.domain_id);
         let quote = fold_whitespace(&c.quote);
@@ -885,8 +909,8 @@ impl Store {
         tx.execute(
             "INSERT INTO memory_candidates
              (id, tenant_id, user_id, job_id, primary_evidence_id, kind, quote, quote_sha256, claim,
-              source_class, status, reason_code, model_confidence, occurred_at, valid_until, created_at, domain_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+              source_class, status, reason_code, model_confidence, occurred_at, valid_until, created_at, domain_id, reason_text)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 candidate_id,
                 scope.tenant_id,
@@ -904,7 +928,8 @@ impl Store {
                 c.occurred_at,
                 c.valid_until,
                 now,
-                dom.write
+                dom.write,
+                reason_text,
             ],
         )?;
         tx.execute(
@@ -938,6 +963,13 @@ impl Store {
                      VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     params![Uuid::now_v7().to_string(), scope.tenant_id, scope.user_id, memory_id, c.source_event_id, start as i64, end as i64],
                 )?;
+                if job.admission_version == memory_contract::ADMISSION_VERSION_V5 {
+                    let r_text = "[存储规则:DUPLICATE_ACTIVE] 相同命题已存在 active 记忆";
+                    tx.execute(
+                        "UPDATE memory_candidates SET reason_text=?2 WHERE id=?1",
+                        params![candidate_id, r_text],
+                    )?;
+                }
                 outcome = CandidateOutcome::Rejected {
                     reason: "DUPLICATE_ACTIVE",
                 };
@@ -953,6 +985,13 @@ impl Store {
                     .optional()?
                     .unwrap_or(false);
                 if suppressed {
+                    if job.admission_version == memory_contract::ADMISSION_VERSION_V5 {
+                        let r_text = "[存储规则:SUPPRESSED_SOURCE] 来源证据已被抑制，不再激活";
+                        tx.execute(
+                            "UPDATE memory_candidates SET reason_text=?2 WHERE id=?1",
+                            params![candidate_id, r_text],
+                        )?;
+                    }
                     outcome = CandidateOutcome::Rejected {
                         reason: "SUPPRESSED_SOURCE",
                     };
@@ -961,10 +1000,16 @@ impl Store {
                     if let Some(conflict_id) =
                         Self::attribute_conflict(&tx, scope, kind, &claim_text, &dom)?
                     {
-                        let _ = conflict_id;
+                        let conflict_reason = if job.admission_version
+                            == memory_contract::ADMISSION_VERSION_V5
+                        {
+                            Some(format!("[存储规则:POSSIBLE_CONFLICT] 属性键与已有 active 记忆冲突（冲突记忆 ID: {}）", conflict_id))
+                        } else {
+                            None
+                        };
                         tx.execute(
-                            "UPDATE memory_candidates SET status='held', reason_code='POSSIBLE_CONFLICT' WHERE id=?1",
-                            params![candidate_id],
+                            "UPDATE memory_candidates SET status='held', reason_code='POSSIBLE_CONFLICT', reason_text=?2 WHERE id=?1",
+                            params![candidate_id, conflict_reason],
                         )?;
                         outcome = CandidateOutcome::Held {
                             reason: "POSSIBLE_CONFLICT",
@@ -972,16 +1017,26 @@ impl Store {
                     } else {
                         // 通过：建 active memory（与 remember 同一事务模式）。
                         let memory_id = Uuid::now_v7().to_string();
+                        let promoted_reason =
+                            if job.admission_version == memory_contract::ADMISSION_VERSION_V5 {
+                                Some(format!(
+                                "[准入激活:PROMOTED] 显式陈述准入通过并激活为记忆（claim: {:?}）",
+                                memory_extract::format_quote_excerpt(&claim_text)
+                            ))
+                            } else {
+                                None
+                            };
                         tx.execute(
                             "INSERT INTO memories
                              (id, tenant_id, user_id, kind, claim, normalized_claim, claim_sha256, source_class,
                               status, version, occurred_at, valid_from, valid_until, origin_host_id, origin_agent_id,
-                              created_at, updated_at, domain_id)
-                             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11,?12)",
+                              created_at, updated_at, domain_id, reason_text)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,'user_explicit','active',1,NULL,NULL,NULL,?8,?9,?10,?11,?12,?13)",
                             params![
                                 memory_id, scope.tenant_id, scope.user_id, kind.as_str(),
                                 claim_text, normalize_v1(&claim_text), claim_hash,
-                                origin.host_id, origin.agent_id, now, now, dom.write
+                                origin.host_id, origin.agent_id, now, now, dom.write,
+                                promoted_reason
                             ],
                         )?;
                         tx.execute(
@@ -1001,8 +1056,8 @@ impl Store {
                             ],
                         )?;
                         tx.execute(
-                            "UPDATE memory_candidates SET status='rejected', reason_code='PROMOTED' WHERE id=?1",
-                            params![candidate_id],
+                            "UPDATE memory_candidates SET status='rejected', reason_code='PROMOTED', reason_text=?2 WHERE id=?1",
+                            params![candidate_id, promoted_reason],
                         )?;
                         outcome = CandidateOutcome::Active { memory_id };
                     }
@@ -1051,6 +1106,28 @@ impl Store {
             }
         }
         Ok(None)
+    }
+}
+
+/// 默认确定性准入理由文本（B2 备用/兜底模板，非空不编造）。
+fn default_admission_reason_text(
+    admission: &Admission,
+    c: &memory_extract::ModelCandidate,
+) -> String {
+    let quote_excerpt = memory_extract::format_quote_excerpt(&c.quote);
+    match admission {
+        Admission::Active => format!(
+            "[准入:ACTIVE] 准入规则校验通过（quote: {:?}）",
+            quote_excerpt
+        ),
+        Admission::Held(r) => format!(
+            "[准入门:HELD:{}] 候选被准入规则拦截（quote: {:?}）",
+            r, quote_excerpt
+        ),
+        Admission::Rejected(r) => format!(
+            "[准入门:REJECTED:{}] 候选不符合准入条件（quote: {:?}）",
+            r, quote_excerpt
+        ),
     }
 }
 
@@ -2159,5 +2236,202 @@ mod tests {
             FlushOutcome::Created { status, .. } => assert_eq!(status, "queued"),
             other => panic!("应 Created，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_b2_reason_text_persisted_for_v5_and_null_for_v4() {
+        let mut store = setup("b2-reason-text");
+        let scope = scope_of(&store, "t", "u");
+        let dom = DomainScope::user_main();
+        let origin = Origin {
+            host_id: "dsh".into(),
+            agent_id: "agent-a".into(),
+            session_id: "s1".into(),
+        };
+
+        // 写入三条事件：S08、S09 与一条 active 陈述
+        ingest(&mut store, &scope, "s1", 1, "我的健康记录里有心脏病。");
+        ingest(&mut store, &scope, "s1", 2, "我患有哮喘。");
+        ingest(
+            &mut store,
+            &scope,
+            "s1",
+            3,
+            "我是后端开发，平时主要使用 Rust 写服务端。",
+        );
+
+        // Flush 生成 v5 作业并领取至 running
+        let job_id = match store.flush_window(&scope, "dsh", "s1", 3, &dom).unwrap() {
+            FlushOutcome::Created { job_id, .. } => job_id,
+            other => panic!("应生成作业: {other:?}"),
+        };
+        let now = now_rfc3339().unwrap();
+        let job = store
+            .claim_next_ordered_job(&plus_secs(&now, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, job_id);
+        assert_eq!(job.admission_version, "admit_v5");
+
+        let events = store.load_window_events(&scope, &job, 0).unwrap();
+        let ev1 = &events[0];
+        let ev2 = &events[1];
+        let ev3 = &events[2];
+
+        // 1. S08: Held("SENSITIVE")
+        let cand_s08 = memory_extract::ModelCandidate {
+            source_event_id: ev1.id.clone(),
+            quote: "我的健康记录里有心脏病。".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: Some(0.95),
+            claim: Some("用户有心脏病病史".into()),
+        };
+        let (adm_s08, reason_s08) = memory_extract::admit_v5_with_reason(&cand_s08, &events);
+        assert_eq!(adm_s08, memory_extract::Admission::Held("SENSITIVE"));
+        assert!(reason_s08.is_some());
+
+        let out_s08 = store
+            .save_candidate_with_reason(&scope, &job, &origin, &cand_s08, adm_s08, reason_s08)
+            .unwrap();
+        assert!(matches!(
+            out_s08,
+            CandidateOutcome::Held {
+                reason: "SENSITIVE"
+            }
+        ));
+
+        // 2. S09: Held("SENSITIVE")
+        let cand_s09 = memory_extract::ModelCandidate {
+            source_event_id: ev2.id.clone(),
+            quote: "我患有哮喘。".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: Some(0.95),
+            claim: Some("用户患有哮喘".into()),
+        };
+        let (adm_s09, reason_s09) = memory_extract::admit_v5_with_reason(&cand_s09, &events);
+        assert_eq!(adm_s09, memory_extract::Admission::Held("SENSITIVE"));
+        assert!(reason_s09.is_some());
+
+        let out_s09 = store
+            .save_candidate_with_reason(&scope, &job, &origin, &cand_s09, adm_s09, reason_s09)
+            .unwrap();
+        assert!(matches!(
+            out_s09,
+            CandidateOutcome::Held {
+                reason: "SENSITIVE"
+            }
+        ));
+
+        // 3. Active 样本
+        let cand_act = memory_extract::ModelCandidate {
+            source_event_id: ev3.id.clone(),
+            quote: "我是后端开发，平时主要使用 Rust 写服务端。".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: Some(0.99),
+            claim: Some("用户是后端开发，平时主要使用 Rust 写服务端。".into()),
+        };
+        let (adm_act, reason_act) = memory_extract::admit_v5_with_reason(&cand_act, &events);
+        assert_eq!(adm_act, memory_extract::Admission::Active);
+
+        let out_act = store
+            .save_candidate_with_reason(&scope, &job, &origin, &cand_act, adm_act, reason_act)
+            .unwrap();
+        let memory_id = match out_act {
+            CandidateOutcome::Active { memory_id } => memory_id,
+            other => panic!("应为 Active: {other:?}"),
+        };
+
+        // 4. 断言落库与查询：S08 / S09 理由文本
+        let held_list = store.list_candidates(&scope, "held", 10, None).unwrap();
+        assert_eq!(held_list.len(), 2);
+        for item in &held_list {
+            assert!(
+                item.reason_text.is_some(),
+                "list_candidates 必须返回 reason_text"
+            );
+            let detail = store.get_candidate(&scope, &item.id).unwrap().unwrap();
+            assert!(
+                detail.reason_text.is_some(),
+                "get_candidate 必须返回 reason_text"
+            );
+            let text = detail.reason_text.unwrap();
+            assert!(
+                text.contains("规则8") && text.contains("SENSITIVE"),
+                "held 理由文本必须提及规则8及SENSITIVE: {text}"
+            );
+        }
+
+        // 5. 断言 Active 记忆与 explain 包含 reason_text
+        let mem = store.get_memory(&scope, &memory_id, &dom).unwrap().unwrap();
+        assert!(mem.reason_text.is_some(), "get_memory 必须返回 reason_text");
+        let explain = store
+            .memory_explain(&scope, &memory_id, &dom, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(explain.reason_code.as_deref(), Some("PROMOTED"));
+        assert!(
+            explain.reason_text.is_some(),
+            "memory_explain 必须返回 reason_text"
+        );
+        let exp_text = explain.reason_text.unwrap();
+        assert!(
+            exp_text.contains("PROMOTED"),
+            "explain reason_text 必须提及PROMOTED: {exp_text}"
+        );
+
+        // 6. 硬边界验证：非 v5 作业（如 admit_v4）落库时 reason_text 必须保持为 None (NULL)
+        let v4_job_id = Uuid::now_v7().to_string();
+        let now = now_rfc3339().unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO extraction_jobs
+             (id, tenant_id, user_id, host_id, session_id, window_key, through_event_seq,
+              status, attempts, run_after, lease_until, error_code, claim_generation, created_at,
+              updated_at, prompt_version, admission_version, domain_id)
+             VALUES (?1, 't', 'u', 'dsh', 's_v4', 'w-v4', 1, 'queued', 0, ?2, NULL, NULL, 0, ?2, ?2,
+                     'extract_v4', 'admit_v4', 'user_main')",
+                params![v4_job_id, now],
+            )
+            .unwrap();
+        let v4_job = store
+            .claim_next_ordered_job(&plus_secs(&now, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(v4_job.id, v4_job_id);
+        assert_eq!(v4_job.admission_version, "admit_v4");
+
+        let out_v4 = store
+            .save_candidate_with_reason(
+                &scope,
+                &v4_job,
+                &origin,
+                &cand_s08,
+                memory_extract::Admission::Held("SENSITIVE"),
+                Some("伪造的v4理由".into()),
+            )
+            .unwrap();
+        assert!(matches!(out_v4, CandidateOutcome::Held { .. }));
+
+        // 检查 v4 写入的 candidate 行：reason_text 必须为 NULL
+        let v4_cand_id: String = store
+            .conn()
+            .query_row(
+                "SELECT id FROM memory_candidates WHERE job_id=?1",
+                params![v4_job.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v4_detail = store.get_candidate(&scope, &v4_cand_id).unwrap().unwrap();
+        assert!(
+            v4_detail.reason_text.is_none(),
+            "admit_v4 作业落库时 reason_text 必须为 NULL，历史行为不变"
+        );
     }
 }

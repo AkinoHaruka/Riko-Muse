@@ -439,6 +439,22 @@ pub fn admit_v2(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
     }
 }
 
+fn safe_truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        None => s,
+        Some((idx, _)) => &s[..idx],
+    }
+}
+
+pub fn format_quote_excerpt(s: &str) -> String {
+    let max = 64;
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", safe_truncate_chars(s, max))
+    }
+}
+
 /// 按作业行 admission_version 分派准入规则（doc5/03 §1）；未知版本返回 None，
 /// worker 对其确定性 dead（UNKNOWN_ADMISSION_VERSION），不退回"最新规则"。
 pub fn admit_for(
@@ -446,11 +462,20 @@ pub fn admit_for(
     c: &ModelCandidate,
     events: &[WindowEvent],
 ) -> Option<Admission> {
+    admit_for_with_reason(admission_version, c, events).map(|(adm, _)| adm)
+}
+
+/// 带裁决理由文本的版本化分派（B2 卡：admit_v4/v5 提供确定性理由文本）。
+pub fn admit_for_with_reason(
+    admission_version: &str,
+    c: &ModelCandidate,
+    events: &[WindowEvent],
+) -> Option<(Admission, Option<String>)> {
     match admission_version {
-        memory_contract::ADMISSION_VERSION_V1 => Some(admit_v1(c, events)),
-        memory_contract::ADMISSION_VERSION_V2 => Some(admit_v2(c, events)),
-        memory_contract::ADMISSION_VERSION_V4 => Some(admit_v4(c, events)),
-        memory_contract::ADMISSION_VERSION_V5 => Some(admit_v5(c, events)),
+        memory_contract::ADMISSION_VERSION_V1 => Some((admit_v1(c, events), None)),
+        memory_contract::ADMISSION_VERSION_V2 => Some((admit_v2(c, events), None)),
+        memory_contract::ADMISSION_VERSION_V4 => Some(admit_v4_with_reason(c, events)),
+        memory_contract::ADMISSION_VERSION_V5 => Some(admit_v5_with_reason(c, events)),
         _ => None,
     }
 }
@@ -459,178 +484,429 @@ pub fn admit_for(
 /// 受检文本换成 rewrite 产出的 claim）。规则 1–3 仍检 quote（来源/逐字 span/长度与
 /// 改写无关）；规则 4–11 的受检文本 = `claim`（存在且非空）否则回落 quote——**回落
 /// 路径与 admit_v2 逐字节同判**，v2 行为不静默漂移。
-///
-/// claim 路径的两处适配（仅针对"用户…"第三人称改写句式）：
-/// - 规则 5：多命题判定改为"句首再次出现用户主语（用户/用户的）"，`，`谓语并列不算
-///   （Muse D.5 例 1 的合并句式合法；quote 路径沿用原启发式）；
-/// - 规则 6/11：`用户`/`用户的` 开头即视为有显式主语/显式陈述（quote 路径沿用原
-///   形状表）。第三人称形式的第三人命题由 [`rewritten_third_party_marker`] 防御
-///   （rewrite prompt 已禁止改写第三人命题，此处为门上兜底）。
-/// 规则 7–10（SECRET/SENSITIVE/THIRD_PARTY/TEMPORAL）原样作用于改写文本：
-/// 内容政策门不因 rewrite 放水。
 pub fn admit_v4(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
+    admit_v4_with_reason(c, events).0
+}
+
+/// admit_v4 带理由文本版本（B2 卡规范）。
+pub fn admit_v4_with_reason(
+    c: &ModelCandidate,
+    events: &[WindowEvent],
+) -> (Admission, Option<String>) {
     use Admission::*;
     // 1. 来源必须属于本窗口、role=user、source_kind=user（同 v2）。
     let Some(ev) = events.iter().find(|e| e.id == c.source_event_id) else {
-        return Rejected("BAD_SOURCE");
+        return (
+            Rejected("BAD_SOURCE"),
+            Some(format!(
+                "[规则1:BAD_SOURCE] 来源事件不存在或不属于本窗口（event_id: {}）",
+                c.source_event_id
+            )),
+        );
     };
     if ev.role != "user" || ev.source_kind != "user" {
-        return Rejected("BAD_SOURCE");
+        return (
+            Rejected("BAD_SOURCE"),
+            Some(format!(
+                "[规则1:BAD_SOURCE] 来源事件非用户发言（role: {}, source_kind: {}）",
+                ev.role, ev.source_kind
+            )),
+        );
     }
     // 2. quote 是同一来源正文的连续原文（逐字锚不因改写改变）。
     if !ev.content.contains(&c.quote) {
-        return Rejected("QUOTE_MISMATCH");
+        return (
+            Rejected("QUOTE_MISMATCH"),
+            Some(format!(
+                "[规则2:QUOTE_MISMATCH] 候选引用未在来源事件中精确匹配（quote: {:?}）",
+                format_quote_excerpt(&c.quote)
+            )),
+        );
     }
     // 3. 规范化为空或超过 512 Unicode 标量字符（检 quote，同 v2）。
     if memory_domain::fold_whitespace(&c.quote).is_empty()
         || c.quote.chars().count() > memory_contract::QUOTE_MAX_CHARS
     {
-        return Rejected("INVALID_QUOTE");
+        return (
+            Rejected("INVALID_QUOTE"),
+            Some(format!(
+                "[规则3:INVALID_QUOTE] 候选引用为空或超过最大长度限制（长度: {} 字符）",
+                c.quote.chars().count()
+            )),
+        );
     }
     let claim_text = c.claim.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let text = claim_text.unwrap_or(&c.quote);
     // 4. 假设、转述、引用、一次性语境。
     if context_uncertain(text) || text.contains("今天先") {
-        return Held("CONTEXT_UNCERTAIN");
+        return (
+            Held("CONTEXT_UNCERTAIN"),
+            Some(format!(
+                "[规则4:CONTEXT_UNCERTAIN] 包含假设/转述/临时语境标记（quote: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 5. 多命题/宽 quote：quote 路径同 v2；claim 路径用改写形态判定
-    //    （non_minimal_quote 是口语前缀的 quote 形状门，对改写句不适用）。
     if claim_text.is_some() {
         if rewritten_multi_claim(text) {
-            return Held("MULTI_CLAIM");
+            return (
+                Held("MULTI_CLAIM"),
+                Some(format!(
+                    "[规则5:MULTI_CLAIM] 改写包含多个独立命题或多主语句式（claim: {:?}）",
+                    format_quote_excerpt(text)
+                )),
+            );
         }
     } else {
         if non_minimal_quote(&c.quote) {
-            return Held("NON_MINIMAL_QUOTE");
+            return (
+                Held("NON_MINIMAL_QUOTE"),
+                Some(format!(
+                    "[规则5:NON_MINIMAL_QUOTE] 包含口语前缀等非最小化引用（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            );
         }
         if multi_claim(&c.quote) {
-            return Held("MULTI_CLAIM");
+            return (
+                Held("MULTI_CLAIM"),
+                Some(format!(
+                    "[规则5:MULTI_CLAIM] 包含多个独立命题或并列句式（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            );
         }
     }
     // 6. fact/preference 缺明确归属主体。
     if matches!(c.kind.as_str(), "fact" | "preference")
         && rewritten_unclear_subject(text, claim_text.is_some())
     {
-        return Held("UNCLEAR_SUBJECT");
+        return (
+            Held("UNCLEAR_SUBJECT"),
+            Some(format!(
+                "[规则6:UNCLEAR_SUBJECT] 缺少明确归属主体（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 7. 凭据内容：任何路径不得 active。
     if secret_like(text) {
-        return Held("SECRET");
+        return (
+            Held("SECRET"),
+            Some(format!(
+                "[规则7:SECRET] 包含密码/凭据/机密类标记（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 8. 健康/过敏/诊断/病历等敏感个人信息。
     if sensitive_health(text) {
-        return Held("SENSITIVE");
+        return (
+            Held("SENSITIVE"),
+            Some(format!(
+                "[规则8:SENSITIVE] 命中健康敏感词（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
     if has_third_person_marker(text) || claim_text.is_some() && rewritten_third_party_marker(text) {
-        return Held("THIRD_PARTY");
+        return (
+            Held("THIRD_PARTY"),
+            Some(format!(
+                "[规则9:THIRD_PARTY] 涉及第三人或家庭成员信息（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 10. 未来节点、相对时间或明显短期状态（改写按 occurred_at 归位后应不再命中）。
     if temporal_marker(text) {
-        return Held("TEMPORAL");
+        return (
+            Held("TEMPORAL"),
+            Some(format!(
+                "[规则10:TEMPORAL] 包含未来节点或短期时间标记（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 11. 显式陈述：quote 路径同 v2；claim 路径以"用户"主语句式为显式
-    //     （kind 由阶段 1 判定，v4 不对其重检）。
     match claim_text {
         Some(_) => {
             if text.starts_with("用户") {
-                Active
+                (
+                    Active,
+                    Some(format!(
+                        "[规则11:ACTIVE] 以用户为主语且通过显式校验（claim: {:?}）",
+                        format_quote_excerpt(text)
+                    )),
+                )
             } else {
                 match explicit_shape(text) {
-                    None => Held("NOT_EXPLICIT"),
-                    Some(shape) if shape.kind() == c.kind.as_str() => Active,
-                    Some(_) => Held("KIND_MISMATCH"),
+                    None => (
+                        Held("NOT_EXPLICIT"),
+                        Some(format!(
+                            "[规则11:NOT_EXPLICIT] 未命中显式陈述句式（claim: {:?}）",
+                            format_quote_excerpt(text)
+                        )),
+                    ),
+                    Some(shape) if shape.kind() == c.kind.as_str() => (
+                        Active,
+                        Some(format!(
+                            "[规则11:ACTIVE] 命中显式陈述句式（claim: {:?}）",
+                            format_quote_excerpt(text)
+                        )),
+                    ),
+                    Some(shape) => (
+                        Held("KIND_MISMATCH"),
+                        Some(format!(
+                            "[规则11:KIND_MISMATCH] 候选类别 {:?} 与陈述句式类别 {:?} 不符（claim: {:?}）",
+                            c.kind,
+                            shape.kind(),
+                            format_quote_excerpt(text)
+                        )),
+                    ),
                 }
             }
         }
         None => match explicit_shape(&c.quote) {
-            None => Held("NOT_EXPLICIT"),
-            Some(shape) if shape.kind() == c.kind.as_str() => Active,
-            Some(_) => Held("KIND_MISMATCH"),
+            None => (
+                Held("NOT_EXPLICIT"),
+                Some(format!(
+                    "[规则11:NOT_EXPLICIT] 未命中显式陈述句式（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            ),
+            Some(shape) if shape.kind() == c.kind.as_str() => (
+                Active,
+                Some(format!(
+                    "[规则11:ACTIVE] 命中显式陈述句式（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            ),
+            Some(shape) => (
+                Held("KIND_MISMATCH"),
+                Some(format!(
+                    "[规则11:KIND_MISMATCH] 候选类别 {:?} 与陈述句式类别 {:?} 不符（quote: {:?}）",
+                    c.kind,
+                    shape.kind(),
+                    format_quote_excerpt(&c.quote)
+                )),
+            ),
         },
     }
 }
 
 /// P5b independent deterministic admission policy; v4 remains frozen.
 pub fn admit_v5(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
+    admit_v5_with_reason(c, events).0
+}
+
+/// admit_v5 带理由文本版本（B2 卡规范：确定性规则 + 关键证据 span）。
+pub fn admit_v5_with_reason(
+    c: &ModelCandidate,
+    events: &[WindowEvent],
+) -> (Admission, Option<String>) {
     use Admission::*;
     // 1. 来源必须属于本窗口、role=user、source_kind=user（同 v2）。
     let Some(ev) = events.iter().find(|e| e.id == c.source_event_id) else {
-        return Rejected("BAD_SOURCE");
+        return (
+            Rejected("BAD_SOURCE"),
+            Some(format!(
+                "[规则1:BAD_SOURCE] 来源事件不存在或不属于本窗口（event_id: {}）",
+                c.source_event_id
+            )),
+        );
     };
     if ev.role != "user" || ev.source_kind != "user" {
-        return Rejected("BAD_SOURCE");
+        return (
+            Rejected("BAD_SOURCE"),
+            Some(format!(
+                "[规则1:BAD_SOURCE] 来源事件非用户发言（role: {}, source_kind: {}）",
+                ev.role, ev.source_kind
+            )),
+        );
     }
     // 2. quote 是同一来源正文的连续原文（逐字锚不因改写改变）。
     if !ev.content.contains(&c.quote) {
-        return Rejected("QUOTE_MISMATCH");
+        return (
+            Rejected("QUOTE_MISMATCH"),
+            Some(format!(
+                "[规则2:QUOTE_MISMATCH] 候选引用未在来源事件中精确匹配（quote: {:?}）",
+                format_quote_excerpt(&c.quote)
+            )),
+        );
     }
     // 3. 规范化为空或超过 512 Unicode 标量字符（检 quote，同 v2）。
     if memory_domain::fold_whitespace(&c.quote).is_empty()
         || c.quote.chars().count() > memory_contract::QUOTE_MAX_CHARS
     {
-        return Rejected("INVALID_QUOTE");
+        return (
+            Rejected("INVALID_QUOTE"),
+            Some(format!(
+                "[规则3:INVALID_QUOTE] 候选引用为空或超过最大长度限制（长度: {} 字符）",
+                c.quote.chars().count()
+            )),
+        );
     }
     let claim_text = c.claim.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let text = claim_text.unwrap_or(&c.quote);
     // 4. 假设、转述、引用、一次性语境。
     if context_uncertain(text) || text.contains("今天先") {
-        return Held("CONTEXT_UNCERTAIN");
+        return (
+            Held("CONTEXT_UNCERTAIN"),
+            Some(format!(
+                "[规则4:CONTEXT_UNCERTAIN] 包含假设/转述/临时语境标记（quote: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 5. 多命题/宽 quote：quote 路径同 v2；claim 路径用改写形态判定
-    //    （non_minimal_quote 是口语前缀的 quote 形状门，对改写句不适用）。
     if claim_text.is_some() {
         if rewritten_multi_claim(text) {
-            return Held("MULTI_CLAIM");
+            return (
+                Held("MULTI_CLAIM"),
+                Some(format!(
+                    "[规则5:MULTI_CLAIM] 改写包含多个独立命题或多主语句式（claim: {:?}）",
+                    format_quote_excerpt(text)
+                )),
+            );
         }
     } else {
         if non_minimal_quote(&c.quote) {
-            return Held("NON_MINIMAL_QUOTE");
+            return (
+                Held("NON_MINIMAL_QUOTE"),
+                Some(format!(
+                    "[规则5:NON_MINIMAL_QUOTE] 包含口语前缀等非最小化引用（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            );
         }
         if multi_claim(&c.quote) {
-            return Held("MULTI_CLAIM");
+            return (
+                Held("MULTI_CLAIM"),
+                Some(format!(
+                    "[规则5:MULTI_CLAIM] 包含多个独立命题或并列句式（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            );
         }
     }
     // 6. fact/preference 缺明确归属主体。
     if matches!(c.kind.as_str(), "fact" | "preference")
         && rewritten_unclear_subject(text, claim_text.is_some())
     {
-        return Held("UNCLEAR_SUBJECT");
+        return (
+            Held("UNCLEAR_SUBJECT"),
+            Some(format!(
+                "[规则6:UNCLEAR_SUBJECT] 缺少明确归属主体（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 7. 凭据内容：任何路径不得 active。
     if secret_like(text) {
-        return Held("SECRET");
+        return (
+            Held("SECRET"),
+            Some(format!(
+                "[规则7:SECRET] 包含密码/凭据/机密类标记（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 8. 健康/过敏/诊断/病历等敏感个人信息。
     if sensitive_health_v5(&c.quote) || claim_text.is_some_and(sensitive_health_v5) {
-        return Held("SENSITIVE");
+        return (
+            Held("SENSITIVE"),
+            Some(format!(
+                "[规则8:SENSITIVE] 命中健康敏感词（quote: {:?}）",
+                format_quote_excerpt(&c.quote)
+            )),
+        );
     }
     // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
     if has_third_person_marker(text) || claim_text.is_some() && rewritten_third_party_marker(text) {
-        return Held("THIRD_PARTY");
+        return (
+            Held("THIRD_PARTY"),
+            Some(format!(
+                "[规则9:THIRD_PARTY] 涉及第三人或家庭成员信息（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 10. 未来节点、相对时间或明显短期状态（改写按 occurred_at 归位后应不再命中）。
     if temporal_marker(text) {
-        return Held("TEMPORAL");
+        return (
+            Held("TEMPORAL"),
+            Some(format!(
+                "[规则10:TEMPORAL] 包含未来节点或短期时间标记（text: {:?}）",
+                format_quote_excerpt(text)
+            )),
+        );
     }
     // 11. 显式陈述：quote 路径同 v2；claim 路径以"用户"主语句式为显式
-    //     （kind 由阶段 1 判定，v4 不对其重检）。
     match claim_text {
         Some(_) => {
             if text.starts_with("用户") {
-                Active
+                (
+                    Active,
+                    Some(format!(
+                        "[规则11:ACTIVE] 以用户为主语且通过显式校验（claim: {:?}）",
+                        format_quote_excerpt(text)
+                    )),
+                )
             } else {
                 match explicit_shape(text) {
-                    None => Held("NOT_EXPLICIT"),
-                    Some(shape) if shape.kind() == c.kind.as_str() => Active,
-                    Some(_) => Held("KIND_MISMATCH"),
+                    None => (
+                        Held("NOT_EXPLICIT"),
+                        Some(format!(
+                            "[规则11:NOT_EXPLICIT] 未命中显式陈述句式（claim: {:?}）",
+                            format_quote_excerpt(text)
+                        )),
+                    ),
+                    Some(shape) if shape.kind() == c.kind.as_str() => (
+                        Active,
+                        Some(format!(
+                            "[规则11:ACTIVE] 命中显式陈述句式（claim: {:?}）",
+                            format_quote_excerpt(text)
+                        )),
+                    ),
+                    Some(shape) => (
+                        Held("KIND_MISMATCH"),
+                        Some(format!(
+                            "[规则11:KIND_MISMATCH] 候选类别 {:?} 与陈述句式类别 {:?} 不符（claim: {:?}）",
+                            c.kind,
+                            shape.kind(),
+                            format_quote_excerpt(text)
+                        )),
+                    ),
                 }
             }
         }
         None => match explicit_shape(&c.quote) {
-            None => Held("NOT_EXPLICIT"),
-            Some(shape) if shape.kind() == c.kind.as_str() => Active,
-            Some(_) => Held("KIND_MISMATCH"),
+            None => (
+                Held("NOT_EXPLICIT"),
+                Some(format!(
+                    "[规则11:NOT_EXPLICIT] 未命中显式陈述句式（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            ),
+            Some(shape) if shape.kind() == c.kind.as_str() => (
+                Active,
+                Some(format!(
+                    "[规则11:ACTIVE] 命中显式陈述句式（quote: {:?}）",
+                    format_quote_excerpt(&c.quote)
+                )),
+            ),
+            Some(shape) => (
+                Held("KIND_MISMATCH"),
+                Some(format!(
+                    "[规则11:KIND_MISMATCH] 候选类别 {:?} 与陈述句式类别 {:?} 不符（quote: {:?}）",
+                    c.kind,
+                    shape.kind(),
+                    format_quote_excerpt(&c.quote)
+                )),
+            ),
         },
     }
 }
@@ -2142,5 +2418,94 @@ mod tests {
         assert!(s.contains("\"candidate_index\":3"));
         assert!(s.contains("\"speaker\":\"user\""));
         assert!(s.contains("我是做后端开发的"));
+    }
+
+    #[test]
+    fn b2_reason_text_generation_and_admit_v5_rules() {
+        // B2 规范验证：S08/S09 held 样本 reason_text 非空且提及命中规则；active 样本不崩。
+        let event_s08 = WindowEvent {
+            id: "ev_s08".into(),
+            role: "user".into(),
+            source_kind: "user".into(),
+            occurred_at: "2026-10-22T10:00:00Z".into(),
+            content: "我的健康记录里有心脏病。".into(),
+        };
+        let mut cand_s08 = ModelCandidate {
+            source_event_id: "ev_s08".into(),
+            quote: "我的健康记录里有心脏病。".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: Some(0.95),
+            claim: Some("用户有心脏病病史".into()),
+        };
+        let (adm_s08, reason_s08) = admit_v5_with_reason(&cand_s08, &[event_s08]);
+        assert_eq!(adm_s08, Admission::Held("SENSITIVE"));
+        assert!(reason_s08.is_some(), "S08 held 样本 reason_text 必须非空");
+        let text_s08 = reason_s08.unwrap();
+        assert!(
+            text_s08.contains("规则8") && text_s08.contains("SENSITIVE"),
+            "S08 reason_text 必须提及规则8及SENSITIVE: {text_s08}"
+        );
+        assert!(
+            text_s08.contains("我的健康记录里有心脏病。"),
+            "S08 reason_text 必须包含关键证据 quote: {text_s08}"
+        );
+
+        let event_s09 = WindowEvent {
+            id: "ev_s09".into(),
+            role: "user".into(),
+            source_kind: "user".into(),
+            occurred_at: "2026-10-22T10:00:00Z".into(),
+            content: "我患有哮喘。".into(),
+        };
+        let cand_s09 = ModelCandidate {
+            source_event_id: "ev_s09".into(),
+            quote: "我患有哮喘。".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: Some(0.95),
+            claim: Some("用户患有哮喘".into()),
+        };
+        let (adm_s09, reason_s09) = admit_v5_with_reason(&cand_s09, &[event_s09]);
+        assert_eq!(adm_s09, Admission::Held("SENSITIVE"));
+        assert!(reason_s09.is_some(), "S09 held 样本 reason_text 必须非空");
+        let text_s09 = reason_s09.unwrap();
+        assert!(
+            text_s09.contains("规则8") && text_s09.contains("SENSITIVE"),
+            "S09 reason_text 必须提及规则8及SENSITIVE: {text_s09}"
+        );
+        assert!(
+            text_s09.contains("我患有哮喘。"),
+            "S09 reason_text 必须包含关键证据 quote: {text_s09}"
+        );
+
+        // Active 样本：不断言具体内容，只断言不崩且正常返回
+        let event_active = WindowEvent {
+            id: "ev_act".into(),
+            role: "user".into(),
+            source_kind: "user".into(),
+            occurred_at: "2026-10-22T10:00:00Z".into(),
+            content: "我是后端开发，平时主要使用 Rust 写服务端。".into(),
+        };
+        let cand_active = ModelCandidate {
+            source_event_id: "ev_act".into(),
+            quote: "我是后端开发，平时主要使用 Rust 写服务端。".into(),
+            kind: "fact".into(),
+            occurred_at: None,
+            valid_until: None,
+            confidence: Some(0.98),
+            claim: Some("用户是后端开发，平时主要使用 Rust 写服务端。".into()),
+        };
+        let (adm_act, reason_act) = admit_v5_with_reason(&cand_active, &[event_active.clone()]);
+        assert_eq!(adm_act, Admission::Active);
+        assert!(reason_act.is_some(), "active 样本返回 reason_text 且不崩溃");
+
+        // 其它规则门 held/rejected 的 reason_text 检查
+        cand_s08.source_event_id = "non_existent".into();
+        let (adm_bad_source, r_bad_source) = admit_v5_with_reason(&cand_s08, &[event_active]);
+        assert_eq!(adm_bad_source, Admission::Rejected("BAD_SOURCE"));
+        assert!(r_bad_source.unwrap().contains("规则1:BAD_SOURCE"));
     }
 }

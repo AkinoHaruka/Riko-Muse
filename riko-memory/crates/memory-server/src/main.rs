@@ -1201,7 +1201,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "/v1/repair/actions/{action_id}/close",
                     post(close_repair_action),
                 )
-                .route("/v1/commitments", get(list_commitments).post(create_commitment))
+                .route(
+                    "/v1/commitments",
+                    get(list_commitments).post(create_commitment),
+                )
                 .route("/v1/commitments/{id}/fulfill", post(fulfill_commitment))
                 .route("/v1/commitments/{id}/cancel", post(cancel_commitment))
                 .route("/v1/recall/log", get(list_recall_log))
@@ -1533,6 +1536,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         c.status,
                         c.reason_code.clone().unwrap_or_else(|| "-".into())
                     );
+                    if let Some(ref r_text) = c.reason_text {
+                        println!("reason_text: {}", r_text);
+                    }
                     println!("created_at: {}", c.created_at);
                     println!("primary_evidence_id: {}", c.primary_evidence_id);
                     println!(
@@ -4032,6 +4038,8 @@ struct MemoryDetailResponse {
     valid_until: Option<String>,
     origin_agent_id: String,
     evidence_refs: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_text: Option<String>,
 }
 
 // ---- V2-P1 精读（doc7/05 §3、§4）----
@@ -4222,8 +4230,10 @@ async fn drive_one_task(
         store
             .task_run_record(scope, dom, kind, "skipped", 0, "no_longer_due")
             .map_err(|e| e.to_string())?;
-        if !store.task_finish(scope, dom, kind, &signal, &owner, true)
-            .map_err(|e| e.to_string())? {
+        if !store
+            .task_finish(scope, dom, kind, &signal, &owner, true)
+            .map_err(|e| e.to_string())?
+        {
             return Err("task_lease_lost".to_string());
         }
         return Ok(());
@@ -4296,7 +4306,12 @@ async fn drive_one_task(
                 Some("generated") => {
                     Ok(("ok".to_string(), 1, "model_generation".to_string(), true))
                 }
-                Some("already_generated") => Ok(("empty".to_string(),0,"already_generated".to_string(),false)),
+                Some("already_generated") => Ok((
+                    "empty".to_string(),
+                    0,
+                    "already_generated".to_string(),
+                    false,
+                )),
                 Some("empty_or_not_due") => Ok((
                     "empty".to_string(),
                     0,
@@ -4342,8 +4357,10 @@ async fn drive_one_task(
                     .task_run_record(scope, dom, kind, &outcome, count, &detail)
                     .map_err(|e| e.to_string())?;
             }
-            if !store.task_finish(scope, dom, kind, &signal, &owner, true)
-                .map_err(|e| e.to_string())? {
+            if !store
+                .task_finish(scope, dom, kind, &signal, &owner, true)
+                .map_err(|e| e.to_string())?
+            {
                 return Err("task_lease_lost".to_string());
             }
             Ok(())
@@ -4351,11 +4368,14 @@ async fn drive_one_task(
         Err(error) => {
             // P1 fallback already records its own failed model call.
             if !error.starts_with("generation_fallback:") {
-                store.task_run_record(scope, dom, kind, "error", 0, &format!("driver:{error}"))
+                store
+                    .task_run_record(scope, dom, kind, "error", 0, &format!("driver:{error}"))
                     .map_err(|e| e.to_string())?;
             }
-            if !store.task_finish(scope, dom, kind, &signal, &owner, false)
-                .map_err(|e| e.to_string())? {
+            if !store
+                .task_finish(scope, dom, kind, &signal, &owner, false)
+                .map_err(|e| e.to_string())?
+            {
                 return Err("task_lease_lost".to_string());
             }
             Err(error)
@@ -4501,9 +4521,13 @@ struct GenerationRunRequest {
     thread_id: Option<String>,
 }
 
-fn parse_generated_candidate(content: &str) -> Result<memory_store_sqlite::generation::GeneratedCandidate, serde_json::Error> {
+fn parse_generated_candidate(
+    content: &str,
+) -> Result<memory_store_sqlite::generation::GeneratedCandidate, serde_json::Error> {
     let trimmed = content.trim();
-    let json = trimmed.strip_prefix("```json\n").and_then(|s| s.strip_suffix("\n```"))
+    let json = trimmed
+        .strip_prefix("```json\n")
+        .and_then(|s| s.strip_suffix("\n```"))
         .unwrap_or(trimmed);
     serde_json::from_str(json)
 }
@@ -4518,63 +4542,142 @@ async fn generation_run(
 ) -> Response {
     use memory_extract::ExtractModel;
     let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
-    let Json(body) = match body { Ok(b) => b, Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "请求 JSON 无效") };
-    if !matches!(body.kind.as_str(), "alignment" | "nightly" | "quiet" | "repair_action") {
-        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "未知生成任务");
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                &req_id.0,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidField,
+                "请求 JSON 无效",
+            )
+        }
+    };
+    if !matches!(
+        body.kind.as_str(),
+        "alignment" | "nightly" | "quiet" | "repair_action"
+    ) {
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "未知生成任务",
+        );
     }
     if body.kind == "repair_action" && body.thread_id.as_deref().is_none_or(str::is_empty) {
-        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "repair_action 需要 thread_id");
+        return err(
+            &req_id.0,
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidField,
+            "repair_action 需要 thread_id",
+        );
     }
     let model = state.generation_model.lock().ok().and_then(|g| g.clone());
     if !state.generation_enabled {
-        return Json(serde_json::json!({"request_id":req_id.0,"status":"disabled"})).into_response();
+        return Json(serde_json::json!({"request_id":req_id.0,"status":"disabled"}))
+            .into_response();
     }
     if model.is_none() {
         let mut store = state.store.lock().unwrap();
         let template = if body.kind == "alignment" {
-            store.alignment_synthesis_refresh(&scope, &dom).ok().map(|row| alignment_json(&row))
+            store
+                .alignment_synthesis_refresh(&scope, &dom)
+                .ok()
+                .map(|row| alignment_json(&row))
         } else if matches!(body.kind.as_str(), "nightly" | "quiet") {
             store.alignment_synthesis_refresh(&scope, &dom).ok().map(|row| serde_json::json!({"generator_version":"reflection_template_v1","date":chrono::Utc::now().date_naive().to_string(),"body":row.body}))
-        } else { None };
+        } else {
+            None
+        };
         let _ = store.task_run_record(&scope, &dom, &body.kind, "error", 0, "model_unconfigured");
-        let rejected = store.generation_rejected_count(&scope, &dom, &body.kind).unwrap_or(0);
+        let rejected = store
+            .generation_rejected_count(&scope, &dom, &body.kind)
+            .unwrap_or(0);
         return Json(serde_json::json!({"request_id":req_id.0,"status":"fallback","reason":"model_unconfigured","rejected":rejected,"template":template})).into_response();
     }
     let model = model.unwrap();
     let prepared = (|| -> Result<_, memory_store_sqlite::StoreError> {
-        let mut store = state.store.lock().map_err(|_| memory_store_sqlite::StoreError::StateConflict)?;
-        let base = if body.kind == "alignment" { Some(store.alignment_synthesis_refresh(&scope, &dom)?) } else { None };
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| memory_store_sqlite::StoreError::StateConflict)?;
+        let base = if body.kind == "alignment" {
+            Some(store.alignment_synthesis_refresh(&scope, &dom)?)
+        } else {
+            None
+        };
         if matches!(body.kind.as_str(), "nightly" | "quiet") {
             let due = store.background_due(&scope, &dom, &state.schedule)?;
-            if (body.kind == "nightly" && !due.nightly.due) || (body.kind == "quiet" && !due.quiet.due) {
+            if (body.kind == "nightly" && !due.nightly.due)
+                || (body.kind == "quiet" && !due.quiet.due)
+            {
                 return Ok((base, Vec::new(), String::new()));
             }
         }
-        let thread = if body.kind == "repair_action" { body.thread_id.as_deref() } else { None };
+        let thread = if body.kind == "repair_action" {
+            body.thread_id.as_deref()
+        } else {
+            None
+        };
         let sources = store.generation_sources(&scope, &dom, thread)?;
         let signal = match body.kind.as_str() {
-            "alignment" => format!("synthesis_v2:{}:{}", dom.write, base.as_ref().unwrap().version),
+            "alignment" => format!(
+                "synthesis_v2:{}:{}",
+                dom.write,
+                base.as_ref().unwrap().version
+            ),
             "nightly" => format!("reflection_v1:nightly:{}", chrono::Utc::now().date_naive()),
-            "quiet" => format!("reflection_v1:quiet:{}:{}", chrono::Utc::now().date_naive(), sources.iter().map(|s| s.fingerprint.as_str()).collect::<Vec<_>>().join(":")),
-            _ => format!("repair_action_v1:{}:{}", thread.unwrap(), sources.iter().map(|s| s.reference.as_str()).collect::<Vec<_>>().join(":")),
+            "quiet" => format!(
+                "reflection_v1:quiet:{}:{}",
+                chrono::Utc::now().date_naive(),
+                sources
+                    .iter()
+                    .map(|s| s.fingerprint.as_str())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            ),
+            _ => format!(
+                "repair_action_v1:{}:{}",
+                thread.unwrap(),
+                sources
+                    .iter()
+                    .map(|s| s.reference.as_str())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            ),
         };
         if store.ledger_has(&scope, &dom, &body.kind, &signal)? {
             return Ok((base, Vec::new(), signal));
         }
-        if body.kind == "repair_action" && store.generation_artifact_has(&scope, &dom, "repair_action_v1", &signal)? {
+        if body.kind == "repair_action"
+            && store.generation_artifact_has(&scope, &dom, "repair_action_v1", &signal)?
+        {
             return Ok((base, Vec::new(), signal));
         }
         Ok((base, sources, signal))
     })();
     let (base, sources, signal) = match prepared {
         Ok(v) => v,
-        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+        Err(e) => {
+            return err(
+                &req_id.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                &e.to_string(),
+            )
+        }
     };
     if sources.is_empty() {
-        return Json(serde_json::json!({"request_id":req_id.0,"status":"empty_or_not_due"})).into_response();
+        return Json(serde_json::json!({"request_id":req_id.0,"status":"empty_or_not_due"}))
+            .into_response();
     }
     if let Some(base) = &base {
-        if let Ok(Some(latest)) = state.store.lock().unwrap().alignment_synthesis_latest(&scope, &dom) {
+        if let Ok(Some(latest)) = state
+            .store
+            .lock()
+            .unwrap()
+            .alignment_synthesis_latest(&scope, &dom)
+        {
             if latest.version > base.version {
                 return Json(serde_json::json!({"request_id":req_id.0,"status":"already_generated","synthesis":alignment_json(&latest)})).into_response();
             }
@@ -4585,7 +4688,8 @@ async fn generation_run(
         "nightly" | "quiet" => "你是有日期的复盘生成器。只输出 JSON: {\"sentences\":[{\"text\":\"一个实质句子\",\"refs\":[\"memory:ID\",\"rupture:ID\"]}]}。总结多条来源的变化、纠正和可执行的应对，最多 6 句，每句须引用给定来源。",
         _ => "你是受证据约束的相处指南生成器。只输出 JSON: {\"sentences\":[{\"text\":\"一个实质句子\",\"refs\":[\"memory:ID\",\"rupture:ID\"]}]}。每句必须引用给定来源；不要编造事实、ID 或无引用句。给出具体、有立场的建议，最多 8 句。",
     };
-    let user = serde_json::json!({"task":body.kind,"thread_id":body.thread_id,"sources":sources}).to_string();
+    let user = serde_json::json!({"task":body.kind,"thread_id":body.thread_id,"sources":sources})
+        .to_string();
     let result = model.extract(system, &user).await;
     let (candidate, failure_code) = match result {
         Ok(output) => match parse_generated_candidate(&output.content) {
@@ -4595,31 +4699,74 @@ async fn generation_run(
         Err(_) => (None, "model_transport_failed"),
     };
     let mut store = state.store.lock().unwrap();
-    let thread = if body.kind == "repair_action" { body.thread_id.as_deref() } else { None };
-    let published = candidate.as_ref().ok_or(memory_store_sqlite::StoreError::StaleInput).and_then(|candidate| {
-        match body.kind.as_str() {
-            "alignment" => store.generation_publish_synthesis(&scope, &dom, base.as_ref().unwrap(), &sources, candidate).and_then(|row| row.map(|r| serde_json::json!({"synthesis":alignment_json(&r)})).ok_or(memory_store_sqlite::StoreError::StaleInput)),
-            "nightly" | "quiet" => store.generation_publish_artifact(&scope, &dom, "reflection_v1", &signal, None, &sources, candidate).and_then(|id| id.map(|id| serde_json::json!({"artifact_id":id})).ok_or(memory_store_sqlite::StoreError::StaleInput)),
-            _ => {
-                store.generation_publish_repair_action(&scope, &dom, &signal, thread.unwrap(), &sources, candidate)
-                    .and_then(|id| id.map(|id| serde_json::json!({"artifact_id":id})).ok_or(memory_store_sqlite::StoreError::StaleInput))
-            },
-        }
-    });
+    let thread = if body.kind == "repair_action" {
+        body.thread_id.as_deref()
+    } else {
+        None
+    };
+    let published = candidate
+        .as_ref()
+        .ok_or(memory_store_sqlite::StoreError::StaleInput)
+        .and_then(|candidate| match body.kind.as_str() {
+            "alignment" => store
+                .generation_publish_synthesis(
+                    &scope,
+                    &dom,
+                    base.as_ref().unwrap(),
+                    &sources,
+                    candidate,
+                )
+                .and_then(|row| {
+                    row.map(|r| serde_json::json!({"synthesis":alignment_json(&r)}))
+                        .ok_or(memory_store_sqlite::StoreError::StaleInput)
+                }),
+            "nightly" | "quiet" => store
+                .generation_publish_artifact(
+                    &scope,
+                    &dom,
+                    "reflection_v1",
+                    &signal,
+                    None,
+                    &sources,
+                    candidate,
+                )
+                .and_then(|id| {
+                    id.map(|id| serde_json::json!({"artifact_id":id}))
+                        .ok_or(memory_store_sqlite::StoreError::StaleInput)
+                }),
+            _ => store
+                .generation_publish_repair_action(
+                    &scope,
+                    &dom,
+                    &signal,
+                    thread.unwrap(),
+                    &sources,
+                    candidate,
+                )
+                .and_then(|id| {
+                    id.map(|id| serde_json::json!({"artifact_id":id}))
+                        .ok_or(memory_store_sqlite::StoreError::StaleInput)
+                }),
+        });
     match published {
         Ok(payload) => {
             let _ = store.task_run_record(&scope, &dom, &body.kind, "ok", 1, "model_generation");
-            Json(serde_json::json!({"request_id":req_id.0,"status":"generated","result":payload})).into_response()
+            Json(serde_json::json!({"request_id":req_id.0,"status":"generated","result":payload}))
+                .into_response()
         }
         Err(e) => {
             let _ = store.task_run_record(&scope, &dom, &body.kind, "error", 0, failure_code);
-            let rejected = store.generation_rejected_count(&scope, &dom, &body.kind).unwrap_or(0);
+            let rejected = store
+                .generation_rejected_count(&scope, &dom, &body.kind)
+                .unwrap_or(0);
             let fallback = if let Some(base) = &base {
                 alignment_json(base)
             } else if matches!(body.kind.as_str(), "nightly" | "quiet") {
                 let summary = store.alignment_synthesis_refresh(&scope, &dom).ok();
                 serde_json::json!({"generator_version":"reflection_template_v1","date":chrono::Utc::now().date_naive().to_string(),"body":summary.map(|row| row.body).unwrap_or_default()})
-            } else { serde_json::Value::Null };
+            } else {
+                serde_json::Value::Null
+            };
             Json(serde_json::json!({"request_id":req_id.0,"status":"fallback","reason":failure_code,"detail":e.to_string(),"rejected":rejected,"template":fallback})).into_response()
         }
     }
@@ -4632,9 +4779,19 @@ async fn generation_artifacts(
     Extension(dom_ctx): Extension<DomainCtx>,
 ) -> Response {
     let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
-    match state.store.lock().unwrap().generation_artifacts_list(&scope, &dom) {
+    match state
+        .store
+        .lock()
+        .unwrap()
+        .generation_artifacts_list(&scope, &dom)
+    {
         Ok(items) => Json(serde_json::json!({"request_id":req_id.0,"items":items})).into_response(),
-        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+        Err(e) => err(
+            &req_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            &e.to_string(),
+        ),
     }
 }
 
@@ -5193,13 +5350,14 @@ async fn list_candidates_http(
         Ok(list) => {
             let mut items = Vec::with_capacity(list.len());
             for item in list {
-                let (evidence_quote, claim_text, kind, reason_code, created_at, id) =
+                let (evidence_quote, claim_text, kind, reason_code, reason_text, created_at, id) =
                     match guard.get_candidate(&scope, &item.id) {
                         Ok(Some(detail)) => (
                             detail.quote.clone(),
                             detail.quote,
                             detail.kind,
                             detail.reason_code,
+                            detail.reason_text,
                             detail.created_at,
                             detail.id,
                         ),
@@ -5208,6 +5366,7 @@ async fn list_candidates_http(
                             String::new(),
                             item.kind,
                             item.reason_code,
+                            item.reason_text,
                             item.created_at,
                             item.id,
                         ),
@@ -5225,6 +5384,7 @@ async fn list_candidates_http(
                     "claim_text": claim_text,
                     "kind": kind,
                     "reason_code": reason_code,
+                    "reason_text": reason_text,
                     "created_at": created_at,
                     "evidence_quote": evidence_quote,
                 }));
@@ -5838,6 +5998,7 @@ async fn explain_memory(
             "subject": ex.subject,
             "subject_source": ex.subject_source,
             "reason_code": ex.reason_code,
+            "reason_text": ex.reason_text,
             "stable_ref": ex.stable_ref,
             "visible": ex.visible,
             "relations": {
@@ -5910,6 +6071,7 @@ async fn get_memory(
                 valid_until: m.valid_until,
                 origin_agent_id: m.origin_agent_id,
                 evidence_refs: refs,
+                reason_text: m.reason_text,
             })
             .into_response()
         }
@@ -6009,10 +6171,10 @@ async fn search_memories(
                     let _ = guard.recall_log_write(
                         &body.query,
                         &hit_ids_json,
-                        None,  // scores 暂不记录
-                        None,  // rank 暂不记录
-                        None,  // cutoff_reason 暂不记录
-                        None,  // excluded 暂不记录
+                        None, // scores 暂不记录
+                        None, // rank 暂不记录
+                        None, // cutoff_reason 暂不记录
+                        None, // excluded 暂不记录
                     );
                 }
             }
@@ -7918,8 +8080,13 @@ async fn post_context_bundle(
                     let entry = format!("- [memory: {}] {}", m.memory_id, m.claim);
                     let entry_chars = entry.chars().count();
                     if let Some(reason) = retrieved_omission_reason(
-                        retrieved_items.len(), q_items, used_chars_retrieved, entry_chars,
-                        q_chars, used_total_chars, BUNDLE_TOTAL_CHARS,
+                        retrieved_items.len(),
+                        q_items,
+                        used_chars_retrieved,
+                        entry_chars,
+                        q_chars,
+                        used_total_chars,
+                        BUNDLE_TOTAL_CHARS,
                     ) {
                         retrieved_omitted.push(serde_json::json!({
                             "memory_id": mid,
@@ -7977,8 +8144,13 @@ async fn post_context_bundle(
                     );
                     let entry_chars = entry.chars().count();
                     if let Some(reason) = retrieved_omission_reason(
-                        retrieved_items.len(), q_items, used_chars_retrieved, entry_chars,
-                        q_chars, used_total_chars, BUNDLE_TOTAL_CHARS,
+                        retrieved_items.len(),
+                        q_items,
+                        used_chars_retrieved,
+                        entry_chars,
+                        q_chars,
+                        used_total_chars,
+                        BUNDLE_TOTAL_CHARS,
                     ) {
                         retrieved_omitted
                             .push(serde_json::json!({"page_id": pid, "reason": reason}));
@@ -8092,12 +8264,30 @@ mod bundle_channel_tests {
     #[test]
     fn retrieved_hard_budget_and_default_boundary() {
         assert_eq!(BUNDLE_TOTAL_CHARS, 8000);
-        assert_eq!(retrieved_omission_reason(23, 24, 2000, 100, 2400, 1000, 8000), None);
-        assert_eq!(retrieved_omission_reason(24, 24, 0, 10, 2400, 0, 8000), Some("ITEM_LIMIT"));
-        assert_eq!(retrieved_omission_reason(1, 24, 2390, 20, 2400, 0, 8000), Some("CHAR_LIMIT"));
-        assert_eq!(retrieved_omission_reason(1, 100, 6000, 113, 24000, 1886, 8000), None);
-        assert_eq!(retrieved_omission_reason(1, 100, 6000, 114, 24000, 1886, 8000), Some("TOTAL_CHAR_LIMIT"));
-        assert_eq!(retrieved_omission_reason(0, 100, 0, 8001, 24000, 0, 8000), Some("TOTAL_CHAR_LIMIT"));
+        assert_eq!(
+            retrieved_omission_reason(23, 24, 2000, 100, 2400, 1000, 8000),
+            None
+        );
+        assert_eq!(
+            retrieved_omission_reason(24, 24, 0, 10, 2400, 0, 8000),
+            Some("ITEM_LIMIT")
+        );
+        assert_eq!(
+            retrieved_omission_reason(1, 24, 2390, 20, 2400, 0, 8000),
+            Some("CHAR_LIMIT")
+        );
+        assert_eq!(
+            retrieved_omission_reason(1, 100, 6000, 113, 24000, 1886, 8000),
+            None
+        );
+        assert_eq!(
+            retrieved_omission_reason(1, 100, 6000, 114, 24000, 1886, 8000),
+            Some("TOTAL_CHAR_LIMIT")
+        );
+        assert_eq!(
+            retrieved_omission_reason(0, 100, 0, 8001, 24000, 0, 8000),
+            Some("TOTAL_CHAR_LIMIT")
+        );
     }
 }
 
