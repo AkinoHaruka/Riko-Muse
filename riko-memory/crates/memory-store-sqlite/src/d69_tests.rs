@@ -71,8 +71,8 @@ fn migration_0011_adds_runner_and_redecision_protocol() {
             r.get(0)
         })
         .unwrap();
-    // 按迁移纪律随新增迁移同步：0020（增补篇 F1 commitment）起为 20。
-    assert_eq!(applied, 21);
+    // 按迁移纪律随新增迁移同步。
+    assert_eq!(applied, memory_contract::SCHEMA_VERSION as i64);
     assert_eq!(
         store
             .dream_live_runner_count("9999-01-01T00:00:00Z")

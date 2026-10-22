@@ -107,6 +107,7 @@ pub enum StoreError {
 
 pub mod adjudication;
 pub mod alignment;
+pub mod generation;
 pub mod background;
 pub mod consolidation_jobs;
 #[cfg(test)]

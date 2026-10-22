@@ -126,6 +126,8 @@ mod tests {
             recency_mode: "none",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
         {
             let mut g = store.lock().unwrap();
@@ -263,6 +265,8 @@ mod tests {
             recency_mode: "none",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
         let ev = {
             let mut g = store.lock().unwrap();
@@ -889,6 +893,8 @@ mod tests {
             recency_mode: "none",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
         // 三个 session 各一作业：完成提交会置 succeeded 并使旧代际失效，不能复用同一作业。
         for (session, content) in [
@@ -1086,6 +1092,8 @@ mod tests {
             recency_mode: "none",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
         for session in ["s_old", "s_new"] {
             let t = chrono::Utc::now();

@@ -34,6 +34,10 @@ migrations_dir = "migrations"
 [dream]
 enabled = true
 
+# ---- P1 模型提炼：缺省关闭；显式 POST /v1/generation/run 才调用上述 chat 模型 ----
+[generation]
+enabled = false
+
 # ---- 运行限额（首版工程默认值，见 crates/memory-contract/src/lib.rs 的版本化常量）----
 # compose_timeout_ms = 500
 # spool_limit_mb = 100

@@ -720,6 +720,14 @@ struct Config {
     /// V2-B1 后台调度（缺省与 doc7/08 §1 的初始参数一致）。
     #[serde(default)]
     schedule: ScheduleSection,
+    #[serde(default)]
+    generation: GenerationSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct GenerationSection {
+    enabled: bool,
 }
 
 /// V2-B1 后台调度开关（doc7/08 §1、§2）。四项**互相独立**：
@@ -837,6 +845,8 @@ struct AppState {
     domains_enabled: bool,
     /// V2-B1：后台调度参数与四项独立开关。
     schedule: memory_domain::schedule::ScheduleConfig,
+    generation_enabled: bool,
+    generation_model: Arc<Mutex<Option<Arc<worker::OpenAiCompatibleClient>>>>,
 }
 
 #[tokio::main]
@@ -930,6 +940,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 domains_enabled: cfg.domains.enabled,
                 schedule: cfg.schedule.to_config(),
+                generation_enabled: cfg.generation.enabled,
+                generation_model: Arc::new(Mutex::new(None)),
             };
             // 提取 worker：模型配置齐全才启动；端点不可达时作业可见失败，不影响手工记忆（doc/09）。
             let model_cfg = match (&cfg.model_endpoint, &cfg.model_name, &cfg.model_key_file) {
@@ -961,6 +973,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => None,
             };
+            if cfg.generation.enabled {
+                if let Some(model) = model_cfg.clone() {
+                    let client = worker::OpenAiCompatibleClient::new(model)
+                        .map_err(|e| format!("生成模型配置无效: {e}"))?;
+                    *state.generation_model.lock().unwrap() = Some(Arc::new(client));
+                }
+            }
             worker::spawn_worker(state.clone(), model_cfg);
             // Dream 模型调用只能来自 DSH 常驻 runner；memoryd 仅运行语义索引作业。
             dream_worker::spawn_dream_pipeline(state.clone(), None, embedding_client, false);
@@ -1149,6 +1168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/v1/entries/{entry_id}", get(get_entry))
                 .route("/v1/tasks/due", get(tasks_due))
                 .route("/v1/tasks/run", post(tasks_run))
+                .route("/v1/generation/run", post(generation_run))
+                .route("/v1/generation/artifacts", get(generation_artifacts))
                 .route(
                     "/v1/repair/actions",
                     get(list_repair_actions).post(propose_repair_action),
@@ -4181,6 +4202,150 @@ async fn tasks_run(
             ErrorCode::InvalidField,
             &format!("任务回执被拒: {e}"),
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationRunRequest {
+    kind: String,
+    thread_id: Option<String>,
+}
+
+fn parse_generated_candidate(content: &str) -> Result<memory_store_sqlite::generation::GeneratedCandidate, serde_json::Error> {
+    let trimmed = content.trim();
+    let json = trimmed.strip_prefix("```json\n").and_then(|s| s.strip_suffix("\n```"))
+        .unwrap_or(trimmed);
+    serde_json::from_str(json)
+}
+
+/// Explicit opt-in runner. Normal turn/end/flush does not call the model.
+async fn generation_run(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+    body: Result<Json<GenerationRunRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    use memory_extract::ExtractModel;
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    let Json(body) = match body { Ok(b) => b, Err(_) => return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "请求 JSON 无效") };
+    if !matches!(body.kind.as_str(), "alignment" | "nightly" | "quiet" | "repair_action") {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "未知生成任务");
+    }
+    if body.kind == "repair_action" && body.thread_id.as_deref().is_none_or(str::is_empty) {
+        return err(&req_id.0, StatusCode::BAD_REQUEST, ErrorCode::InvalidField, "repair_action 需要 thread_id");
+    }
+    let model = state.generation_model.lock().ok().and_then(|g| g.clone());
+    if !state.generation_enabled {
+        return Json(serde_json::json!({"request_id":req_id.0,"status":"disabled"})).into_response();
+    }
+    if model.is_none() {
+        let mut store = state.store.lock().unwrap();
+        let template = if body.kind == "alignment" {
+            store.alignment_synthesis_refresh(&scope, &dom).ok().map(|row| alignment_json(&row))
+        } else if matches!(body.kind.as_str(), "nightly" | "quiet") {
+            store.alignment_synthesis_refresh(&scope, &dom).ok().map(|row| serde_json::json!({"generator_version":"reflection_template_v1","date":chrono::Utc::now().date_naive().to_string(),"body":row.body}))
+        } else { None };
+        let _ = store.task_run_record(&scope, &dom, &body.kind, "error", 0, "model_unconfigured");
+        let rejected = store.generation_rejected_count(&scope, &dom, &body.kind).unwrap_or(0);
+        return Json(serde_json::json!({"request_id":req_id.0,"status":"fallback","reason":"model_unconfigured","rejected":rejected,"template":template})).into_response();
+    }
+    let model = model.unwrap();
+    let prepared = (|| -> Result<_, memory_store_sqlite::StoreError> {
+        let mut store = state.store.lock().map_err(|_| memory_store_sqlite::StoreError::StateConflict)?;
+        let base = if body.kind == "alignment" { Some(store.alignment_synthesis_refresh(&scope, &dom)?) } else { None };
+        if matches!(body.kind.as_str(), "nightly" | "quiet") {
+            let due = store.background_due(&scope, &dom, &state.schedule)?;
+            if (body.kind == "nightly" && !due.nightly.due) || (body.kind == "quiet" && !due.quiet.due) {
+                return Ok((base, Vec::new(), String::new()));
+            }
+        }
+        let thread = if body.kind == "repair_action" { body.thread_id.as_deref() } else { None };
+        let sources = store.generation_sources(&scope, &dom, thread)?;
+        let signal = match body.kind.as_str() {
+            "alignment" => format!("synthesis_v2:{}:{}", dom.write, base.as_ref().unwrap().version),
+            "nightly" => format!("reflection_v1:nightly:{}", chrono::Utc::now().date_naive()),
+            "quiet" => format!("reflection_v1:quiet:{}:{}", chrono::Utc::now().date_naive(), sources.iter().map(|s| s.fingerprint.as_str()).collect::<Vec<_>>().join(":")),
+            _ => format!("repair_action_v1:{}:{}", thread.unwrap(), sources.iter().map(|s| s.reference.as_str()).collect::<Vec<_>>().join(":")),
+        };
+        if store.ledger_has(&scope, &dom, &body.kind, &signal)? {
+            return Ok((base, Vec::new(), signal));
+        }
+        if body.kind == "repair_action" && store.generation_artifact_has(&scope, &dom, "repair_action_v1", &signal)? {
+            return Ok((base, Vec::new(), signal));
+        }
+        Ok((base, sources, signal))
+    })();
+    let (base, sources, signal) = match prepared {
+        Ok(v) => v,
+        Err(e) => return err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
+    };
+    if sources.is_empty() {
+        return Json(serde_json::json!({"request_id":req_id.0,"status":"empty_or_not_due"})).into_response();
+    }
+    if let Some(base) = &base {
+        if let Ok(Some(latest)) = state.store.lock().unwrap().alignment_synthesis_latest(&scope, &dom) {
+            if latest.version > base.version {
+                return Json(serde_json::json!({"request_id":req_id.0,"status":"already_generated","synthesis":alignment_json(&latest)})).into_response();
+            }
+        }
+    }
+    let system = match body.kind.as_str() {
+        "repair_action" => "你是修复行动提议生成器。只输出 JSON: {\"sentences\":[{\"text\":\"具体行动句\",\"refs\":[\"rupture:ID\"]},{\"text\":\"预期行为句\",\"refs\":[\"rupture:ID\"]}]}。恰好两句，每句引用本线程 rupture；只提议，不得写已激活或已解决。",
+        "nightly" | "quiet" => "你是有日期的复盘生成器。只输出 JSON: {\"sentences\":[{\"text\":\"一个实质句子\",\"refs\":[\"memory:ID\",\"rupture:ID\"]}]}。总结多条来源的变化、纠正和可执行的应对，最多 6 句，每句须引用给定来源。",
+        _ => "你是受证据约束的相处指南生成器。只输出 JSON: {\"sentences\":[{\"text\":\"一个实质句子\",\"refs\":[\"memory:ID\",\"rupture:ID\"]}]}。每句必须引用给定来源；不要编造事实、ID 或无引用句。给出具体、有立场的建议，最多 8 句。",
+    };
+    let user = serde_json::json!({"task":body.kind,"thread_id":body.thread_id,"sources":sources}).to_string();
+    let result = model.extract(system, &user).await;
+    let (candidate, failure_code) = match result {
+        Ok(output) => match parse_generated_candidate(&output.content) {
+            Ok(candidate) => (Some(candidate), "citation_invalid"),
+            Err(_) => (None, "model_json_invalid"),
+        },
+        Err(_) => (None, "model_transport_failed"),
+    };
+    let mut store = state.store.lock().unwrap();
+    let thread = if body.kind == "repair_action" { body.thread_id.as_deref() } else { None };
+    let published = candidate.as_ref().ok_or(memory_store_sqlite::StoreError::StaleInput).and_then(|candidate| {
+        match body.kind.as_str() {
+            "alignment" => store.generation_publish_synthesis(&scope, &dom, base.as_ref().unwrap(), &sources, candidate).and_then(|row| row.map(|r| serde_json::json!({"synthesis":alignment_json(&r)})).ok_or(memory_store_sqlite::StoreError::StaleInput)),
+            "nightly" | "quiet" => store.generation_publish_artifact(&scope, &dom, "reflection_v1", &signal, None, &sources, candidate).and_then(|id| id.map(|id| serde_json::json!({"artifact_id":id})).ok_or(memory_store_sqlite::StoreError::StaleInput)),
+            _ => {
+                store.generation_publish_repair_action(&scope, &dom, &signal, thread.unwrap(), &sources, candidate)
+                    .and_then(|id| id.map(|id| serde_json::json!({"artifact_id":id})).ok_or(memory_store_sqlite::StoreError::StaleInput))
+            },
+        }
+    });
+    match published {
+        Ok(payload) => {
+            let _ = store.task_run_record(&scope, &dom, &body.kind, "ok", 1, "model_generation");
+            Json(serde_json::json!({"request_id":req_id.0,"status":"generated","result":payload})).into_response()
+        }
+        Err(e) => {
+            let _ = store.task_run_record(&scope, &dom, &body.kind, "error", 0, failure_code);
+            let rejected = store.generation_rejected_count(&scope, &dom, &body.kind).unwrap_or(0);
+            let fallback = if let Some(base) = &base {
+                alignment_json(base)
+            } else if matches!(body.kind.as_str(), "nightly" | "quiet") {
+                let summary = store.alignment_synthesis_refresh(&scope, &dom).ok();
+                serde_json::json!({"generator_version":"reflection_template_v1","date":chrono::Utc::now().date_naive().to_string(),"body":summary.map(|row| row.body).unwrap_or_default()})
+            } else { serde_json::Value::Null };
+            Json(serde_json::json!({"request_id":req_id.0,"status":"fallback","reason":failure_code,"detail":e.to_string(),"rejected":rejected,"template":fallback})).into_response()
+        }
+    }
+}
+
+async fn generation_artifacts(
+    State(state): State<AppState>,
+    Extension(scope): Extension<ScopeKey>,
+    Extension(req_id): Extension<RequestId>,
+    Extension(dom_ctx): Extension<DomainCtx>,
+) -> Response {
+    let dom = dom_or_return!(&state, &scope, &dom_ctx, &req_id.0, None);
+    match state.store.lock().unwrap().generation_artifacts_list(&scope, &dom) {
+        Ok(items) => Json(serde_json::json!({"request_id":req_id.0,"items":items})).into_response(),
+        Err(e) => err(&req_id.0, StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, &e.to_string()),
     }
 }
 
@@ -10821,6 +10986,8 @@ enabled = false
             recency_mode: "linear",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
         let response = dream_runner_claim(
             State(state.clone()),
@@ -10935,6 +11102,8 @@ enabled = false
             recency_mode: "linear",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
 
         // 1. 不存在的 commitment ID -> 404 NOT_FOUND
@@ -11053,6 +11222,8 @@ enabled = false
             recency_mode: "linear",
             domains_enabled: false,
             schedule: memory_domain::schedule::ScheduleConfig::default(),
+            generation_enabled: false,
+            generation_model: Arc::new(Mutex::new(None)),
         };
 
         // limit = 0 -> clamped to 1

@@ -450,6 +450,11 @@ impl Store {
                 params![scope.tenant_id, scope.user_id, eid],
             )?;
             tx.execute(
+                "DELETE FROM repair_actions WHERE tenant_id=?1 AND user_id=?2 AND thread_id NOT IN
+                   (SELECT DISTINCT thread_id FROM rupture_events WHERE tenant_id=?1 AND user_id=?2 AND thread_id IS NOT NULL)",
+                params![scope.tenant_id, scope.user_id],
+            )?;
+            tx.execute(
                 "DELETE FROM repair_threads WHERE tenant_id=?1 AND user_id=?2
                    AND id NOT IN (SELECT DISTINCT thread_id FROM rupture_events
                                   WHERE tenant_id=?1 AND user_id=?2 AND thread_id IS NOT NULL)",
@@ -464,6 +469,31 @@ impl Store {
                               WHERE jt.value NOT IN (SELECT id FROM repair_threads
                                                      WHERE tenant_id=?1 AND user_id=?2)))",
                 params![scope.tenant_id, scope.user_id],
+            )?;
+            // P1 generated text is a derived copy of the cited source. Remove the
+            // complete artifact whenever this purge removes one of its inputs.
+            tx.execute(
+                "DELETE FROM generation_artifacts WHERE tenant_id=?1 AND user_id=?2 AND EXISTS (
+                   SELECT 1 FROM json_each(generation_artifacts.sentence_refs_json,'$.source_fingerprints') j
+                   WHERE j.key='memory:' || ?3 OR (j.key LIKE 'rupture:%' AND
+                     NOT EXISTS(SELECT 1 FROM rupture_events r WHERE r.tenant_id=?1 AND r.user_id=?2 AND 'rupture:' || r.id=j.key)))",
+                params![scope.tenant_id, scope.user_id, memory_id],
+            )?;
+            tx.execute(
+                "DELETE FROM repair_actions WHERE tenant_id=?1 AND user_id=?2
+                   AND generator_version='repair_action_v1'
+                   AND (generation_artifact_id IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM generation_artifacts a WHERE a.id=repair_actions.generation_artifact_id
+                       AND a.tenant_id=?1 AND a.user_id=?2))",
+                params![scope.tenant_id, scope.user_id],
+            )?;
+            tx.execute(
+                "DELETE FROM alignment_synthesis WHERE tenant_id=?1 AND user_id=?2 AND
+                 json_extract(source_refs_json,'$.generator_version')='synthesis_v2' AND EXISTS (
+                   SELECT 1 FROM json_each(alignment_synthesis.source_refs_json,'$.source_fingerprints') j
+                   WHERE j.key='memory:' || ?3 OR (j.key LIKE 'rupture:%' AND
+                     NOT EXISTS(SELECT 1 FROM rupture_events r WHERE r.tenant_id=?1 AND r.user_id=?2 AND 'rupture:' || r.id=j.key)))",
+                params![scope.tenant_id, scope.user_id, memory_id],
             )?;
             // 3d. 删事件本体 + 墓碑（source_id=content sha，防 spool 重放复活）。
             tx.execute(

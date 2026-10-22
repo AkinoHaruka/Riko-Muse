@@ -463,34 +463,28 @@ impl Store {
         scope: &ScopeKey,
         dom: &DomainScope,
     ) -> Result<Option<AlignmentSynthesisRow>, StoreError> {
-        let row = self
-            .conn()
-            .query_row(
+        let mut stmt = self.conn().prepare(
                 "SELECT version, window_since, window_until, rupture_turns, user_turns,
                         correction_free_rate, open_repair_threads, body, source_refs_json,
-                        generated_at
+                        generated_at, domain_id
                  FROM alignment_synthesis
                  WHERE tenant_id=?1 AND user_id=?2
                    AND domain_id IN (SELECT value FROM json_each(?3))
-                 ORDER BY version DESC LIMIT 1",
-                params![scope.tenant_id, scope.user_id, dom.read_json()],
-                |r| {
-                    Ok(AlignmentSynthesisRow {
-                        version: r.get(0)?,
-                        window_since: r.get(1)?,
-                        window_until: r.get(2)?,
-                        rupture_turns: r.get(3)?,
-                        user_turns: r.get(4)?,
-                        correction_free_rate: r.get(5)?,
-                        open_repair_threads: r.get(6)?,
-                        body: r.get(7)?,
-                        source_refs_json: r.get(8)?,
-                        generated_at: r.get(9)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(row)
+                 ORDER BY version DESC")?;
+        let rows = stmt.query_map(params![scope.tenant_id, scope.user_id, dom.read_json()], |r| Ok((map_synthesis_row(r)?, r.get::<_, String>(10)?)))?;
+        for row in rows {
+            let (row, row_domain) = row?;
+            let refs: serde_json::Value = serde_json::from_str(&row.source_refs_json).unwrap_or_default();
+            if refs.get("generator_version").and_then(|v| v.as_str()) == Some("synthesis_v2") {
+                let candidate: Result<crate::generation::GeneratedCandidate,_> = serde_json::from_value(serde_json::json!({"sentences":refs["sentences"]}));
+                let Some(fingerprints) = refs.get("source_fingerprints").and_then(|v| v.as_object()) else { continue };
+                let snapshot: Vec<_> = fingerprints.iter().filter_map(|(reference, fp)| Some(crate::generation::GenerationSource { reference: reference.clone(), text: String::new(), fingerprint: fp.as_str()?.to_string(), thread_id: None, evidence_id: None, start_byte: None, end_byte: None })).collect();
+                let source_domain = DomainScope::new(row_domain.clone(), vec![row_domain]);
+                if candidate.ok().is_none_or(|c| self.generation_validate(scope, &source_domain, None, &snapshot, &c, 2).is_err()) { continue; }
+            }
+            return Ok(Some(row));
+        }
+        Ok(None)
     }
 
     /// synthesis 再生成（doc7/01 §1.4 触发策略）：无版本 / 累计 rupture 数超出已计入
@@ -508,13 +502,15 @@ impl Store {
         let latest: Option<(i64, String, i64, i64, i64, i64)> = tx
             .query_row(
                 "SELECT version, window_until, rupture_turns, open_repair_threads, user_turns,
-                        (SELECT COALESCE(SUM(rupture_turns),0) FROM alignment_synthesis
-                          WHERE tenant_id=alignment_synthesis.tenant_id
-                            AND user_id=alignment_synthesis.user_id
-                            AND domain_id=alignment_synthesis.domain_id)
-                 FROM alignment_synthesis
-                 WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3
-                 ORDER BY version DESC LIMIT 1",
+                        (SELECT COALESCE(SUM(prior.rupture_turns),0) FROM alignment_synthesis prior
+                          WHERE prior.tenant_id=a.tenant_id
+                            AND prior.user_id=a.user_id
+                            AND prior.domain_id=a.domain_id
+                            AND json_extract(prior.source_refs_json,'$.generator_version') IS NULL)
+                 FROM alignment_synthesis a
+                 WHERE a.tenant_id=?1 AND a.user_id=?2 AND a.domain_id=?3
+                   AND json_extract(a.source_refs_json,'$.generator_version') IS NULL
+                 ORDER BY a.version DESC LIMIT 1",
                 params![scope.tenant_id, scope.user_id, domain],
                 |r| {
                     Ok((
@@ -632,10 +628,10 @@ impl Store {
             correction_free_rate,
             &open_thread_rows,
         );
-        let version = match latest.as_ref().map(|(v, ..)| *v) {
-            Some(v) => v + 1,
-            None => 1,
-        };
+        // Model rows share this version chain, but do not change the template trigger.
+        let version: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM alignment_synthesis WHERE tenant_id=?1 AND user_id=?2 AND domain_id=?3",
+            params![scope.tenant_id, scope.user_id, domain], |r| r.get(0))?;
         tx.execute(
             "INSERT INTO alignment_synthesis
              (tenant_id, user_id, domain_id, version, window_since, window_until, rupture_turns,

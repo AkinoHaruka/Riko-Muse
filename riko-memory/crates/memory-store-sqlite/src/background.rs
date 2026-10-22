@@ -11,12 +11,14 @@ use uuid::Uuid;
 
 use crate::{now_rfc3339, Store, StoreError};
 
-pub const TASK_KINDS: [&str; 5] = [
+pub const TASK_KINDS: [&str; 7] = [
     "upkeep",
     "relationships",
     "nightly",
     "quiet",
     "rupture_scan",
+    "alignment",
+    "repair_action",
 ];
 const RUN_OUTCOMES: [&str; 4] = ["ok", "empty", "error", "skipped"];
 const PROPOSERS: [&str; 3] = ["model", "user", "cli"];
@@ -328,7 +330,19 @@ impl Store {
             params![scope.tenant_id, scope.user_id, thread_id],
             map_action,
         )?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let actions: Vec<RepairAction> = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut visible = Vec::new();
+        for action in actions {
+            if action.generator_version.as_deref() == Some("repair_action_v1") {
+                let artifact_id: Option<String> = self.conn().query_row(
+                    "SELECT generation_artifact_id FROM repair_actions WHERE tenant_id=?1 AND user_id=?2 AND id=?3",
+                    params![scope.tenant_id,scope.user_id,action.id], |r| r.get(0))?;
+                let Some(artifact_id) = artifact_id else { continue; };
+                if !self.generation_artifact_visible(scope, &artifact_id)? { continue; }
+            }
+            visible.push(action);
+        }
+        Ok(visible)
     }
 
     /// 激活：只有 proposed → active，且必须有授权人。
