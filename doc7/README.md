@@ -53,6 +53,7 @@
 | 11-P05-DSH-rc2子Agent契约适配施工规范.md | P0.5：DSH 0.2.1-rc.2 子 Agent 契约映射、Dream 工具隔离阻断点及后续验收门槛（无迁移） |
 | 13-P1-模型提炼生成器施工规范.md | P1：引用约束的 synthesis/reflection/action 模型生成器、显式触发与回退；schema 22，交接 37 |
 | 14-P2-宿主调度驱动施工规范.md | P2：DSH jobs/subagent seam 现场核对、三种驱动形态选型、serve 内置执行语义、schema 23 租约与验收 |
+| 15-P3-注入预算与形态施工规范.md | P3：120 条 active 临时库审计、8000 字符硬上限、24 条默认检索与注入形态决定 |
 
 ## V2 卡登记（2026-10-06，依据 Muse-V2迭代开发文档 00/06）
 
