@@ -1,6 +1,12 @@
-# 相处指南
+<!--
+DEPRECATED / 已废弃:
+此文件仅为历史静态占位/参考，不得再被当作“活的对齐综合（alignment synthesis）”呈现。
+内核 memoryd alignment synthesis（通过 POST /v1/context/bundle 的 segments[alignment] 注入）是唯一的活源与单一真相源。
+-->
 
-> 这是每轮对话都会带入的简短行为指南。像 Muse 的 alignment synthesis 一样，优先记录能指导行动的稳定模式；保持精炼，更新时以用户明确表达和近期反馈为准。
+# 相处指南（已废弃静态参考）
+
+> 【已废弃】：本静态文件不再作为活的对齐综合呈现。内核 memoryd alignment synthesis（通过 context/bundle 的 alignment 段注入）为唯一活源与单一真相源。以下内容仅作离线参考。
 
 ## 用户偏好
 

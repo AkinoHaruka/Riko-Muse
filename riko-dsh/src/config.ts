@@ -44,6 +44,14 @@ export interface AdapterConfig {
    * 不允许回退到随机会话 ID，避免 Soul 随会话漂移。
    */
   agentName: string;
+  /**
+   * 文件版 Soul 覆盖开关（B1 收口：默认 false）。
+   * 必须显式 opt-in；启用时走 Soul 装配路径（order 10300，按 agent 隔离），
+   * 绝不作为平行注入。
+   */
+  fileSoulEnabled: boolean;
+  /** 文件版 Soul 路径（fileSoulEnabled 时使用；空则使用默认路径）。 */
+  soulFile: string;
 }
 
 const DEFAULT_MEMORY_URL = "http://127.0.0.1:8791";
@@ -86,6 +94,11 @@ export function loadConfig(raw: unknown): AdapterConfig {
     requireContextBundle: boolOr(r.requireContextBundle, false),
     soulTimeoutMs: positiveIntOr(r.soulTimeoutMs, DEFAULT_SOUL_TIMEOUT_MS, "soulTimeoutMs"),
     agentName,
+    fileSoulEnabled: boolOr(
+      r.fileSoulEnabled ?? (process.env.RIKO_DSH_FILE_SOUL === "1" || process.env.RIKO_DSH_FILE_SOUL === "true" ? true : undefined),
+      false,
+    ),
+    soulFile: strOr(r.soulFile ?? process.env.RIKO_DSH_SOUL_FILE, "").trim(),
   };
 }
 

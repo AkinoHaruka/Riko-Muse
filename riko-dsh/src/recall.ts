@@ -160,6 +160,34 @@ function wrapData(kind: string, text: string): string {
   return `<agent_memory kind="${kind}">\n${escapeXmlData(text)}\n</agent_memory>`;
 }
 
+export interface FileSoulOptions {
+  /** 是否启用文件版 Soul 覆盖（默认 false）。 */
+  enabled: boolean;
+  /**
+   * 目标 agent ID（默认同 agentName）；
+   * 只有匹配的 agent 才会使用该文件覆盖，其余 agent 保持隔离。
+   */
+  targetAgent?: string;
+  /** 获取文件版 Soul 文本。 */
+  getSoulText?: (agentId: string) => string;
+}
+
+/**
+ * 稳健解析 Agent 身份：优先使用显式 agentId/name；
+ * 若 agent.id 非随机会话前缀（如 'agent-1'、'agent-2'），用于多 agent 隔离；
+ * 否则回退配置的稳定 agentName（或原始 id）。
+ */
+export function resolveAgentId(
+  agent?: { id?: unknown; agentId?: unknown; name?: unknown },
+  defaultAgentName?: string,
+): string {
+  if (typeof agent?.agentId === "string" && agent.agentId) return agent.agentId;
+  if (typeof agent?.name === "string" && agent.name) return agent.name;
+  const idStr = agent?.id === undefined ? "" : String(agent.id);
+  if (idStr && !idStr.startsWith("session-")) return idStr;
+  return defaultAgentName || idStr;
+}
+
 /**
  * D6 v6：`system-prompt/assemble` waterfall 监听（doc6/03 §1、doc6/06 §3）。
  * 事件签名（官方 @477b4f4）：`(assembly, context, next)`，返回值 authoritative。
@@ -168,14 +196,19 @@ function wrapData(kind: string, text: string): string {
  * persona suffix 之后）；GET /v1/soul 受 context.signal 与 soulTimeoutMs 共同
  * 取消；超时/离线/取消不注入、不缓存旧正文（删除/改版下一步生效）；空正文
  * 不产生空 section。
+ *
+ * B1 编排收口：
+ * - 单一真相源 = 内核 Soul（order 10300，按 agent 隔离）。
+ * - 文件版 Soul 覆盖（fileSoulOpts）需显式 opt-in（默认关），且走本装配路径
+ *   （同样的 order/隔离语义），不作为平行注入。
  */
-/** 部署级稳定 agent ID（doc6/03 §1）；空则回退会话 ID（人格按会话隔离）。 */
 export function makeSoulAssembleHook(
   client: MemoryClient,
   logger: Logger,
   soulTimeoutMs: number,
   disabled: () => boolean,
   agentName: string,
+  fileSoulOpts?: FileSoulOptions,
 ) {
   return async function soulAssemble(
     assembly: { sections: Array<Record<string, unknown>> },
@@ -192,9 +225,25 @@ export function makeSoulAssembleHook(
     if (isSubagentSessionHeader(context.agent?.session?.header)) return result;
     if (disabled()) return result;
     if (result.sections.some((s) => s.name === SOUL_SECTION_NAME)) return result;
-    const fallback = context.agent?.id === undefined ? "" : String(context.agent.id);
-    const agentId = agentName || fallback;
+    const agentId = resolveAgentId(context.agent, agentName);
     if (!agentId) return result;
+
+    if (fileSoulOpts?.enabled) {
+      const matchesTarget = !fileSoulOpts.targetAgent || fileSoulOpts.targetAgent === agentId;
+      if (matchesTarget) {
+        const fileText = (fileSoulOpts.getSoulText?.(agentId) ?? "").trim();
+        if (fileText.length > 0) {
+          result.sections.push({
+            name: SOUL_SECTION_NAME,
+            order: SOUL_SECTION_ORDER,
+            text: `<agent_memory:soul version="0">\n${escapeXmlData(fileText)}\n</agent_memory:soul>`,
+            interpolate: false,
+          });
+          return result;
+        }
+      }
+    }
+
     try {
       const r = await client.soul(agentId, context.signal);
       if (r.failure !== "ok" || r.status !== 200) {
@@ -238,7 +287,7 @@ export function makeBundleHook(
     if (decision.kind !== "enter" || payload.signal.aborted) return decision;
     if (alreadyInjected(decision)) return decision;
     const query = latestOriginalUserText(payload.messages);
-    const agentId = agentName || String(payload.agent.id);
+    const agentId = resolveAgentId(payload.agent, agentName);
     try {
       const r = await client.contextBundle(
         {

@@ -24,7 +24,7 @@ import { registerAlignment } from "./alignment.js";
 import { registerApprovalInterception } from "./approval.js";
 import { registerCompactionTuning } from "./compaction.js";
 import { registerRetryPolicy } from "./retry.js";
-import { registerTwinSoul } from "./soul.js";
+import { createFileSoulWatcher, defaultSoulFilePath, type FileSoulWatcher } from "./soul.js";
 import { buildMemoryTools, type AgentLike, type ToolExecLike } from "./tools.js";
 
 export const name = "riko-dsh";
@@ -63,6 +63,7 @@ class AgentMemoryPlugin {
   private readonly spool: Spool;
   private readonly pipeline: EventPipeline;
   private readonly dreamRunner: DreamRunner;
+  private fileSoulWatcher?: FileSoulWatcher;
   private disposed = false;
   /** 装载期可降级：握手缺 capability 时停用 v6（doc6/06 §1 不静默落回）。 */
   private cfg: AdapterConfig;
@@ -181,12 +182,31 @@ class AgentMemoryPlugin {
 
   /** 注册 system-prompt/assemble waterfall：唯一 Soul system section。 */
   private registerSoulAssemble(): void {
+    if (this.cfg.fileSoulEnabled) {
+      const filePath = this.cfg.soulFile || defaultSoulFilePath();
+      this.fileSoulWatcher = createFileSoulWatcher(
+        filePath,
+        () => {
+          try {
+            this.ctx.emit("system-prompt/change");
+          } catch {
+            // best-effort
+          }
+        },
+        this.logger,
+      );
+    }
     const hook = makeSoulAssembleHook(
       this.client,
       this.logger,
       this.cfg.soulTimeoutMs,
       () => this.disposed,
       this.cfg.agentName,
+      this.fileSoulWatcher ? {
+        enabled: true,
+        targetAgent: this.cfg.agentName,
+        getSoulText: (_agentId: string) => this.fileSoulWatcher?.getText() ?? "",
+      } : undefined,
     );
     // system-prompt/assemble 的分发 subject 是 context.scope（agent scope，doc6/03 §1
     // 预核）。每个 agent 创建时在其 scope ctx 上注册 scoped listener——官方
@@ -244,6 +264,7 @@ class AgentMemoryPlugin {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.fileSoulWatcher?.close();
     await this.dreamRunner.dispose();
     await this.pipeline.dispose();
     this.spool.dispose();
@@ -253,7 +274,7 @@ class AgentMemoryPlugin {
 /** Cordis 插件入口：apply 必须同步完成装载契约，异步启动错误要可见。 */
 export function apply(ctx: Context, config: Config = {}): void {
   const plugin = new AgentMemoryPlugin(ctx, config);
-  registerTwinSoul(ctx);
+  // B1 编排收口：默认只走内核 Soul（order 10300，按 agent 隔离）；不再注册平行 twin-soul。
   // Register before plugin.start() installs recall, so this outer hook adds
   // alignment after the downstream memory hook has prepared its decision.
   registerAlignment(ctx);

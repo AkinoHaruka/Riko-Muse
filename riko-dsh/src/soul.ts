@@ -1,4 +1,10 @@
-/** File-based twin personality injected into the DSH system prompt. */
+/**
+ * File-based twin personality.
+ *
+ * B1 编排收口：内核 Soul（order 10300，按 agent 隔离）是单一真相源。
+ * 本模块提供文件监听与读取辅助（createFileSoulWatcher）；旧版全局平行注入
+ * registerTwinSoul 已废弃，默认不再调用。
+ */
 import { readFile, readFileSync, watch, type FSWatcher } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,7 +27,75 @@ function warn(ctx: Context, message: string): void {
   logger?.warn?.(`riko-dsh: ${message}`);
 }
 
-/** Register the live soul section and release its file watcher with the plugin. */
+export interface FileSoulWatcher {
+  getText(): string;
+  close(): void;
+}
+
+/** Create a hot-reloading watcher for a local soul file. */
+export function createFileSoulWatcher(
+  soulFile = defaultSoulFilePath(),
+  onChange?: () => void,
+  logger?: { warn(msg: string): void },
+): FileSoulWatcher {
+  const path = resolve(soulFile);
+  let soulText = "";
+  try {
+    soulText = readFileSync(path, "utf8");
+  } catch (error) {
+    logger?.warn(`soul 文件无法读取: ${path} (${error instanceof Error ? error.message : String(error)})`);
+  }
+
+  let watcher: FSWatcher | undefined;
+  let reloadTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const reload = () => {
+    readFile(path, "utf8", (error, nextText) => {
+      if (error) {
+        if (error.code === "ENOENT") {
+          nextText = "";
+        } else {
+          logger?.warn(`soul 文件重载失败: ${path} (${error.message})`);
+          return;
+        }
+      }
+      if (nextText === soulText) return;
+      soulText = nextText;
+      try {
+        onChange?.();
+      } catch (emitError) {
+        logger?.warn(`system prompt 更新通知失败: ${emitError instanceof Error ? emitError.message : String(emitError)}`);
+      }
+    });
+  };
+
+  try {
+    watcher = watch(dirname(path), (_eventType, filename) => {
+      if (filename !== null && filename.toString() !== basename(path)) return;
+      if (reloadTimer !== undefined) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => {
+        reloadTimer = undefined;
+        reload();
+      }, 40);
+    });
+    watcher.on("error", (error) => logger?.warn(`soul 文件监听失败: ${error.message}`));
+  } catch (error) {
+    logger?.warn(`soul 文件监听无法启动: ${path} (${error instanceof Error ? error.message : String(error)})`);
+  }
+
+  return {
+    getText: () => soulText,
+    close: () => {
+      if (reloadTimer !== undefined) clearTimeout(reloadTimer);
+      watcher?.close();
+    },
+  };
+}
+
+/**
+ * @deprecated B1 编排收口：默认只走内核 Soul（order 10300）；
+ * 全局 twin-soul（order 100）平行注入已废弃。若需文件覆盖，使用 config.fileSoulEnabled opt-in。
+ */
 export function registerTwinSoul(ctx: Context, soulFile = defaultSoulFilePath()): void {
   const path = resolve(soulFile);
 

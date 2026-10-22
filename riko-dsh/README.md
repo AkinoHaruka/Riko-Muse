@@ -28,11 +28,13 @@ The token file must remain outside Git and outside the plugin package. Do not pu
 
 ## Twin personality
 
-The bundle includes an editable `soul.md` at the `@riko/dsh` package root. It is injected as the `twin-soul` system prompt section and watched while DSH is running, so saving the file takes effect without a restart. Set `RIKO_DSH_SOUL_FILE` to an absolute or relative path to use a different local file. The file-based section is independent of the API-backed `riko-dsh:soul` section; both are included in the assembled prompt.
+The single authoritative source of truth for agent personality is the kernel Soul (`GET /v1/soul`, injected as `riko-dsh:soul` at order 10300, isolated per agent).
+
+The bundle includes an editable `soul.md` at the `@riko/dsh` package root for optional local override. File-based personality injection (`twin-soul` at order 100) is deprecated and disabled by default. If file-based override is needed, explicitly opt in via `fileSoulEnabled: true` (or `RIKO_DSH_FILE_SOUL=1`). When enabled, it routes through the Soul assembly path (`riko-dsh:soul` at order 10300) with identical per-agent and child-session isolation semantics, rather than injecting as a parallel section.
 
 ## Relationship guidance
 
-The bundle also includes an editable `alignment.md` at the package root. Its concise guidance on user preferences, communication style, boundaries, and current relationship state is injected on each top-level turn after memory context. Changes are watched and take effect without restarting DSH. Set `RIKO_DSH_ALIGNMENT_FILE` to use a different local file.
+Kernel alignment synthesis from `memoryd` (`POST /v1/context/bundle` segment `alignment`) is the single authoritative source of truth. The static `alignment.md` file is deprecated and preserved only as a static reference.
 
 ## Riko-App API Bridge
 
