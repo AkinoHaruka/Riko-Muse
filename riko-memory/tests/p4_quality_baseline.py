@@ -9,6 +9,7 @@ import pathlib
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -94,15 +95,19 @@ def run_model(label, endpoint, model, key, extra=''):
                                   for r in con.execute('SELECT kind,quote,claim,status,reason_code FROM memory_candidates '
                                                        'WHERE primary_evidence_id=? ORDER BY created_at,id',
                                                        (event_ids[case['id']],))]
-                    active = [x for x in candidates if x['status'] == 'candidate']
+                    # Newly promoted rows become rejected/PROMOTED. An admitted
+                    # duplicate-active row stays candidate and links its evidence
+                    # to the existing active memory (jobs.rs rule 8a).
+                    active = [x for x in candidates if x['reason_code'] == 'PROMOTED' or x['status'] == 'candidate']
                     actual = 'active' if active else 'held' if any(x['status'] == 'held' for x in candidates) else 'reject'
                     points = [x for x in case['claim_points'].split(';') if x]
                     claims = ' '.join(x['claim'] for x in active).lower()
-                    points_match = all(x.lower() in claims for x in points) if active else False
+                    points_match = all(any(alt.lower() in claims for alt in x.split('/')) for x in points) if active else False
+                    kind_match = any(x['kind'] == case['kind'] for x in active)
                     expected = case['expected']
-                    mismatch = expected != 'disputed' and (actual != expected or expected == 'active' and not points_match)
+                    mismatch = expected != 'disputed' and (actual != expected or expected == 'active' and not (points_match and kind_match))
                     rows[case['id']] = {**case, 'actual': actual, 'points_match': points_match,
-                                        'mismatch': bool(mismatch), 'candidates': candidates}
+                                        'kind_match': kind_match, 'mismatch': bool(mismatch), 'candidates': candidates}
                 held = Counter(x['reason_code'] for row in rows.values() for x in row['candidates'] if x['status'] == 'held')
                 leaks = [case_id for case_id, row in rows.items()
                          if row['bucket'] in ('third_party', 'policy') and row['actual'] == 'active']
@@ -119,7 +124,36 @@ def run_model(label, endpoint, model, key, extra=''):
                 server.wait(timeout=15)
 
 
+def recount_file(path):
+    """Recompute summaries from saved candidate rows without another model call."""
+    result = json.loads(path.read_text())
+    annotations = {case['id']: case for case in CASES}
+    for case_id, row in result['cases'].items():
+        assert row['text'] == annotations[case_id]['text'], 'corpus text changed after model run'
+        row.update(annotations[case_id])
+        active = [x for x in row['candidates'] if x['reason_code'] == 'PROMOTED' or x['status'] == 'candidate']
+        row['actual'] = 'active' if active else 'held' if any(x['status'] == 'held' for x in row['candidates']) else 'reject'
+        points = [x for x in row['claim_points'].split(';') if x]
+        claims = ' '.join(x['claim'] for x in active).lower()
+        row['points_match'] = bool(active) and all(any(alt.lower() in claims for alt in x.split('/')) for x in points)
+        row['kind_match'] = any(x['kind'] == row['kind'] for x in active)
+        row['mismatch'] = row['expected'] != 'disputed' and (
+            row['actual'] != row['expected'] or row['expected'] == 'active' and not (row['points_match'] and row['kind_match']))
+    rows = result['cases']
+    result['counts'] = dict(Counter(row['actual'] for row in rows.values()))
+    result['policy_leaks'] = [k for k, row in rows.items()
+                              if row['bucket'] in ('third_party', 'policy') and row['actual'] == 'active']
+    result['mismatches'] = [k for k, row in rows.items() if row['mismatch']]
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+    return result
+
+
 if __name__ == '__main__':
+    if '--recount' in sys.argv:
+        for path in sorted(OUT.glob('*.json')):
+            result = recount_file(path)
+            print(path.name, result['counts'], 'policy_leaks', result['policy_leaks'])
+        raise SystemExit(0)
     if not EXE.exists():
         raise SystemExit('build memoryd first')
     models = [
