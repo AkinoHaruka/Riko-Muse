@@ -17,11 +17,13 @@ migrations_dir = "migrations"
 
 # ---- D6-8 语义支路（doc6/04 §2：全部显式配置；未配置即 disabled，只做词法）----
 # embedding 为单独配置的 OpenAI 兼容 /embeddings 端点（完整 URL，不猜路径）。
-# embedding_endpoint = "https://api.example.com/v1/embeddings"
-# embedding_model = "bge-m3"
+# 示例：Google Gemini Embedding 2（GA 推荐；默认 3072 维，支持 OpenAI 兼容端点）
+# embedding_endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
+# embedding_model = "gemini-embedding-2"
 # embedding_key_file = "secrets/embedding.key"
-# embedding_dimensions = 1024            # 预期维度；响应维度不符即失败
+# embedding_dimensions = 3072            # 预期维度；响应维度不符即失败
 # embedding_timeout_secs = 30            # provider 请求保护超时；查询不另设延迟预算
+# 亦支持其他 OpenAI 兼容 embedding 服务（如 bge-m3 等，设置相应 endpoint / model / dimensions）
 # semantic_min_similarity = 0.3           # 在线向量候选余弦下限（含边界，范围 0..1）
 # reranker 须单独配置专用 rerank 端点（Jina/Cohere 兼容形状）；不配则保留 RRF 顺序。
 # rerank_endpoint = "https://api.example.com/v1/rerank"

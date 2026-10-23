@@ -386,6 +386,79 @@ mod tests {
             "embedding 端点传输失败"
         );
     }
+
+    #[test]
+    fn embedding_client_gemini_2_config_and_model_id() {
+        let cfg = super::EmbeddingConfig {
+            endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/embeddings".into(),
+            model: "gemini-embedding-2".into(),
+            api_key: "dummy-key".into(),
+            timeout: std::time::Duration::from_secs(30),
+            dimensions: 3072,
+        };
+        let client = super::EmbeddingClient::new(cfg).expect("valid gemini-embedding-2 config");
+        assert_eq!(client.model_id(), "gemini-embedding-2");
+    }
+
+    #[test]
+    fn embedding_client_rejects_invalid_config() {
+        let mut cfg = super::EmbeddingConfig {
+            endpoint: "not-a-url".into(),
+            model: "gemini-embedding-2".into(),
+            api_key: "dummy-key".into(),
+            timeout: std::time::Duration::from_secs(30),
+            dimensions: 3072,
+        };
+        assert!(super::EmbeddingClient::new(cfg.clone()).is_err());
+
+        cfg.endpoint = "ftp://example.com/v1/embeddings".into();
+        assert!(super::EmbeddingClient::new(cfg.clone()).is_err());
+
+        cfg.endpoint = "https://example.com".into();
+        assert!(super::EmbeddingClient::new(cfg.clone()).is_err());
+
+        cfg.endpoint = "https://example.com/v1/embeddings".into();
+        cfg.dimensions = 0;
+        assert!(super::EmbeddingClient::new(cfg).is_err());
+    }
+
+    #[test]
+    fn decodes_gemini_embedding_2_3072_proto3_response() {
+        // Simulates Google OpenAI-compatible endpoint with gemini-embedding-2:
+        // Item 0 omits index (proto3 0-omitted), items 1..2 have explicit indices.
+        let v0 = vec![0.001f32; 3072];
+        let v1 = vec![0.002f32; 3072];
+        let v2 = vec![0.003f32; 3072];
+        let json_str = format!(
+            r#"{{"data":[{{"object":"embedding","embedding":{:?}}},{{"object":"embedding","index":1,"embedding":{:?}}},{{"object":"embedding","index":2,"embedding":{:?}}}]}}"#,
+            v0, v1, v2
+        );
+        let decoded = decode_embeddings_response(json_str.as_bytes(), 3, 3072).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].len(), 3072);
+        assert_eq!(decoded[1].len(), 3072);
+        assert_eq!(decoded[2].len(), 3072);
+        assert!((decoded[0][0] - 0.001).abs() < 1e-6);
+        assert!((decoded[1][0] - 0.002).abs() < 1e-6);
+        assert!((decoded[2][0] - 0.003).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_gemini_embedding_2_dimension_mismatch() {
+        let v0 = vec![0.001f32; 3072];
+        let json_str = format!(
+            r#"{{"data":[{{"object":"embedding","embedding":{:?}}}]}}"#,
+            v0
+        );
+        let result = decode_embeddings_response(json_str.as_bytes(), 1, 1536);
+        assert!(matches!(
+            result,
+            Err(EmbeddingError::DimensionMismatch {
+                expected: 1536,
+                actual: 3072
+            })
+        ));
+    }
 }
 
 /// reranker 配置（doc6/04 §2：单独配置 rerank 端点；未配置时 rerank_status=disabled）。
