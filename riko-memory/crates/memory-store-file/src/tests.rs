@@ -1759,3 +1759,450 @@ fn soul_verbatim_retrieval_and_history_round_trip() {
     assert_eq!(bundle.soul["body"].as_str().unwrap(), complex_soul);
     assert_eq!(bundle.soul["char_count"].as_u64().unwrap(), complex_soul.chars().count() as u64);
 }
+
+#[test]
+fn f5prime_golden_bundle_three_categories_rendering() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    // 1. Category 1: 正常条目（有证据、有发生时间、有 speaker/agent，precedence=session）
+    let ev1 = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &at(10),
+            "主人在对话中说最喜欢吃红富士苹果",
+        )
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, "主人在对话中说最喜欢吃红富士苹果", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 2. Category 2: 无来源条目（引用了一个不存在的 evidence ID）
+    let missing_ev_id = "ev-missing-99999999-0000";
+    let c2_id = Uuid::now_v7().to_string();
+    let c2_body = "孤立无来源的记忆断言不可被注入";
+    let c2_doc = ClaimDocument {
+        front: ClaimFrontMatter {
+            id: c2_id.clone(),
+            domain_id: USER_MAIN_DOMAIN.to_string(),
+            kind: "fact".to_string(),
+            status: "active".to_string(),
+            version: 1,
+            source_class: "user_explicit".to_string(),
+            claim_sha256: claim_sha256(MemoryKind::Fact, c2_body),
+            normalized_claim: normalize_v1(c2_body),
+            occurred_at: Some("2026-10-24T00:00:00Z".to_string()),
+            valid_from: None,
+            valid_until: None,
+            origin_host_id: "host".to_string(),
+            origin_agent_id: "riko".to_string(),
+            created_at: "2026-10-24T00:00:00Z".to_string(),
+            updated_at: "2026-10-24T00:00:00Z".to_string(),
+            reason_code: "manual".to_string(),
+            reason_text: None,
+            supersedes: None,
+            evidence: vec![ClaimEvidenceRef {
+                id: missing_ev_id.to_string(),
+                start_byte: None,
+                end_byte: None,
+                content_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            }],
+        },
+        body: c2_body.to_string(),
+    };
+    fs::write(
+        scope_dir.join("memory/claims").join(format!("{c2_id}.md")),
+        c2_doc.to_bytes().unwrap(),
+    )
+    .unwrap();
+
+    // 3. Category 3: 冲突对条目（同主题相反断言，同 session precedence，同发生时间）
+    let ev3_a = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(20), "用户喜欢在晚上听爵士乐放松")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3_a = match store
+        .remember(&scope, &origin, &ev3_a, "用户喜欢在晚上听爵士乐放松", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev3_b = match store
+        .record_evidence(&scope, &origin, 3, "user", "user", &at(20), "用户讨厌在晚上听爵士乐放松")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3_b = match store
+        .remember(&scope, &origin, &ev3_b, "用户讨厌在晚上听爵士乐放松", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 重建索引以纳入所有条目
+    store.rebuild_index(&scope).unwrap();
+
+    // 搜索验证：无来源条目在搜索接口中返回，但标注 has_source = false
+    let (hits, _) = store.search_memories(&scope, "不可被注入", 10, false, None).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, c2_id);
+    assert!(!hits[0].has_source, "无来源条目在搜索中必须标 has_source = false");
+    assert_eq!(hits[0].source_locator.as_deref(), Some("<missing>"));
+
+    // 执行 Golden bundle 查询：包含正常主题、冲突主题以及库里完全没有的主题（"宇宙航行"）
+    // 设置 compact_max_items: Some(0) 使条目完整进入 retrieved 段供验收
+    let bundle = store
+        .context_bundle_with_limits(&scope, "agent", "苹果 爵士乐 宇宙航行", None, None, Some(0))
+        .unwrap();
+
+    let ret_text = bundle.retrieved["text"].as_str().unwrap();
+
+    // 打印 golden bundle 渲染全文
+    println!("=== GOLDEN BUNDLE FULL RENDERING ===\n{}\n====================================", ret_text);
+
+    // 验收项 1: 规则头部固定输出
+    assert!(ret_text.contains("[PRIORITY & CONFLICT RULES]"));
+    assert!(ret_text.contains("soul > 用户显式更正 > 时间较新条目 > 种子默认"));
+    assert!(ret_text.contains("session > project > global"));
+
+    // 验收项 2: 冲突对出现时块内有显式冲突提示
+    assert!(ret_text.contains("[CONFLICT DETECTED]"));
+    assert!(ret_text.contains(&c3_a));
+    assert!(ret_text.contains(&c3_b));
+    assert!(ret_text.contains("未替模型做选择"));
+
+    // 验收项 3: 行形状带齐身份、时间、来源（类型+定位+摘录）、标量
+    assert!(ret_text.contains(&format!("- [claim: {}] 主人在对话中说最喜欢吃红富士苹果", c1)));
+    assert!(ret_text.contains("身份: speaker=user"));
+    assert!(ret_text.contains("时间: occurred_at=2026-10-23T12:00:10"));
+    assert!(ret_text.contains("来源: [user_explicit] session#"));
+    assert!(ret_text.contains("原文摘录: \"主人在对话中说最喜欢吃红富士苹果\""));
+    assert!(ret_text.contains("标量: precedence=session, version=v1, indexed_as_of="));
+
+    // 验收项 4: 无来源条目在 bundle 两段均不可见
+    assert!(!ret_text.contains(&c2_id), "无来源条目 c2 不得进入 retrieved 段");
+    let comp_items = bundle.segments[0]["items"].as_array().unwrap();
+    for it in comp_items {
+        assert_ne!(it["stable_refs"][0].as_str().unwrap(), format!("riko://memory/{}", c2_id));
+    }
+
+    // 验收项 5: 覆盖信号行数字与实际一致，且包含零命中主题「宇宙航行」
+    assert!(ret_text.contains("[COVERAGE SIGNALS]"));
+    assert!(ret_text.contains("命中条数 (matched_count): 6"));
+    assert!(ret_text.contains("预算略过条数 (omitted_count): 0"));
+    assert!(ret_text.contains("未命中主题 (unmatched_topics): [\"宇宙航行\"] (库里没有相关记录)"));
+
+    // JSON 结构字段断言
+    assert_eq!(bundle.retrieved["matched_count"], 6);
+    assert_eq!(bundle.retrieved["omitted_count"], 0);
+    assert_eq!(bundle.retrieved["unmatched_topics"], serde_json::json!(["宇宙航行"]));
+    let conflicts = bundle.retrieved["conflicts"].as_array().unwrap();
+    assert!(!conflicts.is_empty(), "必须检测到冲突对");
+
+    // 验证 compact 段中条目的元数据完整性
+    let bundle_compact = store
+        .context_bundle(&scope, "agent", "苹果", None, None)
+        .unwrap();
+    let comp_seg_items = bundle_compact.segments[0]["items"].as_array().unwrap();
+    let found_c1_in_comp = comp_seg_items.iter().find(|it| {
+        it["stable_refs"][0].as_str().unwrap() == format!("riko://memory/{}", c1)
+    });
+    assert!(found_c1_in_comp.is_some());
+    let c1_item = found_c1_in_comp.unwrap();
+    assert_eq!(c1_item["speaker"], "user");
+    assert_eq!(c1_item["has_source"], true);
+    assert_eq!(c1_item["precedence"], "session");
+    assert_eq!(c1_item["version"], 1);
+}
+
+#[test]
+fn f5prime_no_source_claim_invisible_in_bundle_both_segments() {
+    let (_temp, store, scope, _origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    // 构造无来源的孤立 claim
+    let fake_ev = "ev-not-exist";
+    let fake_c_id = Uuid::now_v7().to_string();
+    let fake_body = "完全没有任何证据记录的凭空断言";
+    let doc = ClaimDocument {
+        front: ClaimFrontMatter {
+            id: fake_c_id.clone(),
+            domain_id: USER_MAIN_DOMAIN.to_string(),
+            kind: "fact".to_string(),
+            status: "active".to_string(),
+            version: 1,
+            source_class: "user_explicit".to_string(),
+            claim_sha256: claim_sha256(MemoryKind::Fact, fake_body),
+            normalized_claim: normalize_v1(fake_body),
+            occurred_at: Some("2026-10-24T00:00:00Z".to_string()),
+            valid_from: None,
+            valid_until: None,
+            origin_host_id: "host".to_string(),
+            origin_agent_id: "riko".to_string(),
+            created_at: "2026-10-24T00:00:00Z".to_string(),
+            updated_at: "2026-10-24T00:00:00Z".to_string(),
+            reason_code: "manual".to_string(),
+            reason_text: None,
+            supersedes: None,
+            evidence: vec![ClaimEvidenceRef {
+                id: fake_ev.to_string(),
+                start_byte: None,
+                end_byte: None,
+                content_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            }],
+        },
+        body: fake_body.to_string(),
+    };
+    fs::write(
+        scope_dir.join("memory/claims").join(format!("{fake_c_id}.md")),
+        doc.to_bytes().unwrap(),
+    )
+    .unwrap();
+
+    // 同时将它写入 MEMORY.md 的 curated 列表（模拟试图进入 compact 段）
+    let overview_content = format!(
+        "---\nriko_format: memory_overview_v1\ndomain_id: user_main\nsource_generation: gen1\ngenerated_at: 2026-10-24T00:00:00Z\n---\n\n# Curated Memory Overview\n\n<!-- riko:ref memory={} version=1 -->\n- [{}] {}\n",
+        fake_c_id, fake_c_id, fake_body
+    );
+    fs::write(scope_dir.join("MEMORY.md"), overview_content).unwrap();
+
+    store.rebuild_index(&scope).unwrap();
+
+    // 1. 搜索能返回并标无来源
+    let (hits, _) = store.search_memories(&scope, "凭空断言", 10, false, None).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, fake_c_id);
+    assert!(!hits[0].has_source);
+    assert_eq!(hits[0].source_locator.as_deref(), Some("<missing>"));
+
+    // 2. context_bundle: 两段均不可见！
+    let bundle = store
+        .context_bundle(&scope, "agent", "凭空断言", None, None)
+        .unwrap();
+
+    // compact 段不可见
+    let compact_items = bundle.segments[0]["items"].as_array().unwrap();
+    assert_eq!(compact_items.len(), 0, "无来源条目坚决不得进入 compact 段");
+
+    // retrieved 段不可见
+    let ret_text = bundle.retrieved["text"].as_str().unwrap();
+    assert!(!ret_text.contains(&fake_c_id), "无来源条目坚决不得进入 retrieved 文本");
+    let ret_items = bundle.retrieved["items"].as_array().unwrap();
+    assert_eq!(ret_items.len(), 0, "无来源条目坚决不得进入 retrieved items");
+}
+
+#[test]
+fn f5prime_coverage_signals_and_unmatched_topics_and_budget_omitted() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "用户喜爱品尝深度烘焙咖啡豆")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let _c1 = match store
+        .remember(&scope, &origin, &ev1, "用户喜爱品尝深度烘焙咖啡豆", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "用户喜爱品尝西湖龙井绿茶")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let _c2 = match store
+        .remember(&scope, &origin, &ev2, "用户喜爱品尝西湖龙井绿茶", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 查询包含两个命中主题和一个零命中主题（"超弦理论"）
+    let bundle = store
+        .context_bundle(&scope, "agent", "咖啡 绿茶 超弦理论", None, None)
+        .unwrap();
+
+    let ret_text = bundle.retrieved["text"].as_str().unwrap();
+    assert!(ret_text.contains("命中条数 (matched_count): 2"));
+    assert!(ret_text.contains("预算略过条数 (omitted_count): 0"));
+    assert!(ret_text.contains("未命中主题 (unmatched_topics): [\"超弦理论\"] (库里没有相关记录)"));
+    assert_eq!(bundle.retrieved["unmatched_topics"], serde_json::json!(["超弦理论"]));
+    assert_eq!(bundle.retrieved["matched_count"], 2);
+    assert_eq!(bundle.retrieved["omitted_count"], 0);
+
+    // 验证 compact 段中条目在 retrieved 段去重
+    let bundle_with_compact = store
+        .context_bundle_with_limits(&scope, "agent", "咖啡 绿茶", None, None, Some(1))
+        .unwrap();
+    assert_eq!(bundle_with_compact.retrieved["deduped"], 1);
+}
+
+#[test]
+fn f5prime_conflict_pair_detected_explicitly_in_bundle_text() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "用户支持在代码中使用4空格缩进")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, "用户支持在代码中使用4空格缩进", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(1), "用户反对在代码中使用4空格缩进")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember(&scope, &origin, &ev2, "用户反对在代码中使用4空格缩进", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let bundle = store
+        .context_bundle_with_limits(&scope, "agent", "4空格缩进", None, None, Some(0))
+        .unwrap();
+
+    let ret_text = bundle.retrieved["text"].as_str().unwrap();
+    assert!(ret_text.contains("[CONFLICT DETECTED]"));
+    assert!(ret_text.contains(&c1));
+    assert!(ret_text.contains(&c2));
+    assert!(ret_text.contains("未替模型做选择"));
+
+    let conflicts = bundle.retrieved["conflicts"].as_array().unwrap();
+    assert!(!conflicts.is_empty(), "必须检测到冲突对");
+    assert!(conflicts.iter().any(|c| {
+        (c["id_a"] == c1 && c["id_b"] == c2) || (c["id_a"] == c2 && c["id_b"] == c1)
+    }));
+}
+
+#[test]
+fn f5prime_missing_fields_explicitly_marked_and_degraded_indexed_as_of() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    // 构造缺少 occurred_at 和证据 byte span 的老条目
+    let ev = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "老系统记录的简单主张")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+
+    let old_c_id = Uuid::now_v7().to_string();
+    let old_doc = ClaimDocument {
+        front: ClaimFrontMatter {
+            id: old_c_id.clone(),
+            domain_id: USER_MAIN_DOMAIN.to_string(),
+            kind: "fact".to_string(),
+            status: "active".to_string(),
+            version: 1,
+            source_class: "user_explicit".to_string(),
+            claim_sha256: claim_sha256(MemoryKind::Fact, "老系统记录的简单主张"),
+            normalized_claim: normalize_v1("老系统记录的简单主张"),
+            occurred_at: None, // 缺失发生时间！
+            valid_from: None,
+            valid_until: None,
+            origin_host_id: "host".to_string(),
+            origin_agent_id: "unknown".to_string(), // 缺失 agent_id！
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            reason_code: "legacy".to_string(),
+            reason_text: None,
+            supersedes: None,
+            evidence: vec![ClaimEvidenceRef {
+                id: ev.clone(),
+                start_byte: None, // 缺失 span 定位！
+                end_byte: None,
+                content_sha256: raw_content_hash("老系统记录的简单主张"),
+            }],
+        },
+        body: "老系统记录的简单主张".to_string(),
+    };
+    fs::write(
+        scope_dir.join("memory/claims").join(format!("{old_c_id}.md")),
+        old_doc.to_bytes().unwrap(),
+    )
+    .unwrap();
+
+    store.rebuild_index(&scope).unwrap();
+
+    // 1. Fresh 状态下的 bundle 检查缺失字段标记
+    let bundle_fresh = store
+        .context_bundle_with_limits(&scope, "agent", "简单主张", None, None, Some(0))
+        .unwrap();
+    let ret_text_fresh = bundle_fresh.retrieved["text"].as_str().unwrap();
+
+    // 显式标注缺失，不静默编造
+    assert!(ret_text_fresh.contains("agent=<missing>"));
+    assert!(ret_text_fresh.contains("occurred_at=<missing> (recorded_at=2026-01-01T00:00:00Z)"));
+    assert!(ret_text_fresh.contains("(byte: <missing>)"));
+    assert_eq!(bundle_fresh.lexical_status, "ok");
+
+    // 2. 外部直接更新条目元数据，使索引指纹不匹配处于 Stale 状态
+    let mut modified_doc = old_doc.clone();
+    modified_doc.front.updated_at = "2026-10-24T00:00:01Z".to_string();
+    atomic_replace(
+        &claim_path(&scope_dir, &old_c_id).unwrap(),
+        &modified_doc.to_bytes().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.check_index_freshness(&scope).unwrap(),
+        IndexFreshness::Stale
+    );
+
+    // 3. Stale 降级直扫下的 bundle 检查
+    let bundle_degraded = store
+        .context_bundle_with_limits(&scope, "agent", "简单主张", None, None, Some(0))
+        .unwrap();
+    assert_eq!(bundle_degraded.lexical_status, "index_degraded");
+
+    let ret_text_degraded = bundle_degraded.retrieved["text"].as_str().unwrap();
+    // indexed_as_of 如实反映 degraded_direct_scan
+    assert!(ret_text_degraded.contains("indexed_as_of=degraded_direct_scan"));
+    assert_eq!(
+        bundle_degraded.retrieved["items"][0]["indexed_as_of"],
+        "degraded_direct_scan"
+    );
+}

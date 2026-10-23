@@ -35,8 +35,9 @@ pub use bank::{
 };
 pub use index::{IndexFreshness, IndexManifest, IndexRebuildReport, ProjectionIndex};
 pub use read::{
-    is_claim_visible, speaker_of, EvidenceDetail, ExplainRelations, FileBundleResult,
-    FileReader, FileSearchHit, MemoryExplain,
+    detect_conflicts, format_bundle_entry, is_claim_visible, is_claim_visible_with_options,
+    speaker_of, BundleConflict, EvidenceDetail, ExplainRelations, FileBundleResult, FileReader,
+    FileSearchHit, MemoryExplain, ResolvedSourceInfo, BUNDLE_PRIORITY_RULES_HEADER,
 };
 pub use vectors::{cosine_similarity, VectorEntryMeta, VectorManifest, VectorRecord, VectorStore};
 
