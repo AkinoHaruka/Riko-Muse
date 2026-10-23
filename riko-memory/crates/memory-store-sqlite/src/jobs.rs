@@ -2249,9 +2249,9 @@ mod tests {
             session_id: "s1".into(),
         };
 
-        // 写入三条事件：S08、S09 与一条 active 陈述
-        ingest(&mut store, &scope, "s1", 1, "我的健康记录里有心脏病。");
-        ingest(&mut store, &scope, "s1", 2, "我患有哮喘。");
+        // 写入三条事件：S08 (CONTEXT_UNCERTAIN)、S09 (TEMPORAL) 与一条 active 陈述
+        ingest(&mut store, &scope, "s1", 1, "如果明天天气好，我就去骑车。");
+        ingest(&mut store, &scope, "s1", 2, "我下周要去北京出差。");
         ingest(
             &mut store,
             &scope,
@@ -2278,18 +2278,21 @@ mod tests {
         let ev2 = &events[1];
         let ev3 = &events[2];
 
-        // 1. S08: Held("SENSITIVE")
+        // 1. S08: Held("CONTEXT_UNCERTAIN")
         let cand_s08 = memory_extract::ModelCandidate {
             source_event_id: ev1.id.clone(),
-            quote: "我的健康记录里有心脏病。".into(),
+            quote: "如果明天天气好，我就去骑车。".into(),
             kind: "fact".into(),
             occurred_at: None,
             valid_until: None,
             confidence: Some(0.95),
-            claim: Some("用户有心脏病病史".into()),
+            claim: Some("如果明天天气好，用户就去骑车".into()),
         };
         let (adm_s08, reason_s08) = memory_extract::admit_v5_with_reason(&cand_s08, &events);
-        assert_eq!(adm_s08, memory_extract::Admission::Held("SENSITIVE"));
+        assert_eq!(
+            adm_s08,
+            memory_extract::Admission::Held("CONTEXT_UNCERTAIN")
+        );
         assert!(reason_s08.is_some());
 
         let out_s08 = store
@@ -2298,22 +2301,22 @@ mod tests {
         assert!(matches!(
             out_s08,
             CandidateOutcome::Held {
-                reason: "SENSITIVE"
+                reason: "CONTEXT_UNCERTAIN"
             }
         ));
 
-        // 2. S09: Held("SENSITIVE")
+        // 2. S09: Held("TEMPORAL")
         let cand_s09 = memory_extract::ModelCandidate {
             source_event_id: ev2.id.clone(),
-            quote: "我患有哮喘。".into(),
+            quote: "我下周要去北京出差。".into(),
             kind: "fact".into(),
             occurred_at: None,
             valid_until: None,
             confidence: Some(0.95),
-            claim: Some("用户患有哮喘".into()),
+            claim: Some("用户下周要去北京出差".into()),
         };
         let (adm_s09, reason_s09) = memory_extract::admit_v5_with_reason(&cand_s09, &events);
-        assert_eq!(adm_s09, memory_extract::Admission::Held("SENSITIVE"));
+        assert_eq!(adm_s09, memory_extract::Admission::Held("TEMPORAL"));
         assert!(reason_s09.is_some());
 
         let out_s09 = store
@@ -2321,9 +2324,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             out_s09,
-            CandidateOutcome::Held {
-                reason: "SENSITIVE"
-            }
+            CandidateOutcome::Held { reason: "TEMPORAL" }
         ));
 
         // 3. Active 样本
@@ -2362,8 +2363,9 @@ mod tests {
             );
             let text = detail.reason_text.unwrap();
             assert!(
-                text.contains("规则8") && text.contains("SENSITIVE"),
-                "held 理由文本必须提及规则8及SENSITIVE: {text}"
+                (text.contains("规则4") && text.contains("CONTEXT_UNCERTAIN"))
+                    || (text.contains("规则10") && text.contains("TEMPORAL")),
+                "held 理由文本必须提及对应规则及原因: {text}"
             );
         }
 
@@ -2413,7 +2415,7 @@ mod tests {
                 &v4_job,
                 &origin,
                 &cand_s08,
-                memory_extract::Admission::Held("SENSITIVE"),
+                memory_extract::Admission::Held("CONTEXT_UNCERTAIN"),
                 Some("伪造的v4理由".into()),
             )
             .unwrap();

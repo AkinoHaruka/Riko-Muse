@@ -371,10 +371,6 @@ pub fn admit_v1(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
     if !explicit_enough(&c.quote) {
         return Held("NOT_EXPLICIT");
     }
-    // 7. 敏感内容保守闸门。
-    if sensitive(&c.quote) {
-        return Held("SENSITIVE");
-    }
     Active
 }
 
@@ -411,21 +407,9 @@ pub fn admit_v2(c: &ModelCandidate, events: &[WindowEvent]) -> Admission {
     if multi_claim(&c.quote) {
         return Held("MULTI_CLAIM");
     }
-    // 6. fact/preference 缺明确归属主体（第三人主语不在此停，继续到规则 9）。
+    // 6. fact/preference 缺明确归属主体（已识别第三人主语不在此停，按后续规则裁决）。
     if matches!(c.kind.as_str(), "fact" | "preference") && unclear_subject(&c.quote) {
         return Held("UNCLEAR_SUBJECT");
-    }
-    // 7. 凭据内容：任何路径不得 active。
-    if secret_like(&c.quote) {
-        return Held("SECRET");
-    }
-    // 8. 健康/过敏/诊断/病历等敏感个人信息。
-    if sensitive_health(&c.quote) {
-        return Held("SENSITIVE");
-    }
-    // 9. 第三人事实、家庭成员信息。
-    if has_third_person_marker(&c.quote) {
-        return Held("THIRD_PARTY");
     }
     // 10. 未来节点、相对时间或明显短期状态。
     if temporal_marker(&c.quote) {
@@ -586,36 +570,6 @@ pub fn admit_v4_with_reason(
             Held("UNCLEAR_SUBJECT"),
             Some(format!(
                 "[规则6:UNCLEAR_SUBJECT] 缺少明确归属主体（text: {:?}）",
-                format_quote_excerpt(text)
-            )),
-        );
-    }
-    // 7. 凭据内容：任何路径不得 active。
-    if secret_like(text) {
-        return (
-            Held("SECRET"),
-            Some(format!(
-                "[规则7:SECRET] 包含密码/凭据/机密类标记（text: {:?}）",
-                format_quote_excerpt(text)
-            )),
-        );
-    }
-    // 8. 健康/过敏/诊断/病历等敏感个人信息。
-    if sensitive_health(text) {
-        return (
-            Held("SENSITIVE"),
-            Some(format!(
-                "[规则8:SENSITIVE] 命中健康敏感词（text: {:?}）",
-                format_quote_excerpt(text)
-            )),
-        );
-    }
-    // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
-    if has_third_person_marker(text) || claim_text.is_some() && rewritten_third_party_marker(text) {
-        return (
-            Held("THIRD_PARTY"),
-            Some(format!(
-                "[规则9:THIRD_PARTY] 涉及第三人或家庭成员信息（text: {:?}）",
                 format_quote_excerpt(text)
             )),
         );
@@ -804,36 +758,6 @@ pub fn admit_v5_with_reason(
             )),
         );
     }
-    // 7. 凭据内容：任何路径不得 active。
-    if secret_like(text) {
-        return (
-            Held("SECRET"),
-            Some(format!(
-                "[规则7:SECRET] 包含密码/凭据/机密类标记（text: {:?}）",
-                format_quote_excerpt(text)
-            )),
-        );
-    }
-    // 8. 健康/过敏/诊断/病历等敏感个人信息。
-    if sensitive_health_v5(&c.quote) || claim_text.is_some_and(sensitive_health_v5) {
-        return (
-            Held("SENSITIVE"),
-            Some(format!(
-                "[规则8:SENSITIVE] 命中健康敏感词（quote: {:?}）",
-                format_quote_excerpt(&c.quote)
-            )),
-        );
-    }
-    // 9. 第三人事实、家庭成员信息（claim 路径加"用户的X"形式兜底）。
-    if has_third_person_marker(text) || claim_text.is_some() && rewritten_third_party_marker(text) {
-        return (
-            Held("THIRD_PARTY"),
-            Some(format!(
-                "[规则9:THIRD_PARTY] 涉及第三人或家庭成员信息（text: {:?}）",
-                format_quote_excerpt(text)
-            )),
-        );
-    }
     // 10. 未来节点、相对时间或明显短期状态（改写按 occurred_at 归位后应不再命中）。
     if temporal_marker(text) {
         return (
@@ -927,31 +851,6 @@ fn rewritten_multi_claim(claim: &str) -> bool {
     segments > 1
 }
 
-/// claim 路径的第三人标记（防御层）：rewrite prompt 已禁止改写第三人命题，
-/// 此处捕获"用户的父亲"这类 v2 词表覆盖不到的改写形式。
-fn rewritten_third_party_marker(claim: &str) -> bool {
-    [
-        "用户的父亲",
-        "用户的妈妈",
-        "用户的母亲",
-        "用户的哥哥",
-        "用户的姐姐",
-        "用户的弟弟",
-        "用户的妹妹",
-        "用户的儿子",
-        "用户的女儿",
-        "用户的孩子",
-        "用户的家人",
-        "用户的同事",
-        "用户的朋友",
-        "用户父亲",
-        "用户母亲",
-        "用户家里",
-    ]
-    .iter()
-    .any(|w| claim.contains(w))
-}
-
 /// claim 路径的主语判定：`用户` 主语句式视为显式；否则沿用 v2 逻辑。
 fn rewritten_unclear_subject(text: &str, is_claim: bool) -> bool {
     if is_claim && text.starts_with("用户") {
@@ -1006,85 +905,6 @@ fn explicit_enough(quote: &str) -> bool {
         return head.contains("工作");
     }
     false
-}
-
-/// 敏感检测（doc/13 §5.7）：明显内容的保守闸门，不声称覆盖所有敏感数据。
-/// 手写匹配（避免正则依赖）：关键词（大小写不敏感）→ 可选空白 → : = ： → 可选空白 → 值。
-fn sensitive(quote: &str) -> bool {
-    let lower = quote.to_lowercase();
-    let chars: Vec<char> = lower.chars().collect();
-    let bytes_len = chars.len();
-
-    // 模式 1：password / passwd / 密码 → 分隔符 → 非空白值 ≥4
-    for key in ["password", "passwd", "密码"] {
-        let kc: Vec<char> = key.chars().collect();
-        for start in 0..bytes_len.saturating_sub(kc.len() - 1) {
-            if chars[start..].starts_with(&kc) {
-                if let Some(value_len) = value_after_sep(&chars, start + kc.len()) {
-                    if value_len >= 4 {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    // 模式 2：api key 变体 / token → 分隔符 → [A-Za-z0-9_-] ≥12
-    for key in ["api_key", "api-key", "api key", "apikey", "token"] {
-        let kc: Vec<char> = key.chars().collect();
-        for start in 0..bytes_len.saturating_sub(kc.len() - 1) {
-            if chars[start..].starts_with(&kc) {
-                if let Some(value_len) = value_after_sep(&chars, start + kc.len()) {
-                    if value_len >= 12 {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    // 模式 3：sk- 后跟 ≥12 个 [A-Za-z0-9_-]
-    let sk: Vec<char> = "sk-".chars().collect();
-    for start in 0..bytes_len.saturating_sub(sk.len() - 1) {
-        if chars[start..].starts_with(&sk) {
-            let mut n = 0;
-            for &c in &chars[start + sk.len()..] {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    n += 1;
-                } else {
-                    break;
-                }
-            }
-            if n >= 12 {
-                return true;
-            }
-        }
-    }
-    // 字面词。
-    ["身份证", "银行卡", "诊断", "病历"]
-        .iter()
-        .any(|w| quote.contains(w))
-}
-
-/// 从 pos 起：跳空白 → 若遇 : = ： 则再跳其后的空白 → 数连续非空白字符数（无分隔符则 None）。
-fn value_after_sep(chars: &[char], pos: usize) -> Option<usize> {
-    let mut i = pos;
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= chars.len() {
-        return None;
-    }
-    if ![':', '=', '：'].contains(&chars[i]) {
-        return None;
-    }
-    i += 1;
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    let mut n = 0;
-    while i + n < chars.len() && !chars[i + n].is_whitespace() {
-        n += 1;
-    }
-    Some(n)
 }
 
 // ---- admit_v2 候选粒度与阻断词判定（doc5/02 §2、doc5/03 §6—7）----
@@ -1153,7 +973,7 @@ fn has_third_person_marker(quote: &str) -> bool {
 
 /// 缺明确归属主体（doc5/03 §7）：fact/preference 片段既无第一人称主语也无第三人
 /// 主语 → held:UNCLEAR_SUBJECT，不能用同事件别处的「我」补 claim。
-/// 已识别第三人主语的不在此停（继续到 THIRD_PARTY）。
+/// 已识别第三人主语的不在此停（2026-10-23 规则 9 THIRD_PARTY 已删除，主语明确的第三人陈述继续按后续规则裁决）。
 fn unclear_subject(quote: &str) -> bool {
     let q = quote.trim().to_lowercase();
     !has_first_person_subject(&q) && !has_third_person_marker(quote)
@@ -1176,360 +996,6 @@ fn temporal_marker(quote: &str) -> bool {
     ]
     .iter()
     .any(|w| quote.contains(w))
-}
-
-/// 健康敏感词（doc5/03 §7 有限词表）。命中即 held:SENSITIVE；不声称覆盖所有健康表达。
-fn sensitive_health(quote: &str) -> bool {
-    [
-        "过敏",
-        "诊断",
-        "病历",
-        "疾病",
-        "吃药",
-        "服药",
-        "身份证",
-        "银行卡",
-    ]
-    .iter()
-    .any(|w| quote.contains(w))
-}
-
-/// P5b finite health policy implementing doc7/17 §2 rule groups (Chinese & English)
-/// and false positive avoidance rules.
-fn sensitive_health_v5(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let t = lower.as_str();
-
-    // 1. 证件与银行卡（保持 v4 规则）
-    for w in ["身份证", "银行卡"] {
-        if t.contains(w) {
-            return true;
-        }
-    }
-    for w in ["identity card", "id card", "bank card", "credit card"] {
-        if contains_english_term(t, w) {
-            return true;
-        }
-    }
-
-    let personal_zh = ["我", "本人", "自己", "用户", "身体"]
-        .iter()
-        .any(|w| t.contains(w));
-    let personal_en = ["i ", "i'", "my ", "me ", "user ", "the user "]
-        .iter()
-        .any(|w| t.starts_with(w) || t.contains(&format!(" {w}")));
-
-    // 组 1：疾病名与患病陈述
-    // 常见明确疾病名可独立命中；结合个人归属与患病动词
-    // 避开产品「心脏」图标、书名里的疾病词
-    let explicit_diseases_zh = [
-        "心脏病",
-        "哮喘",
-        "糖尿病",
-        "高血压",
-        "癌症",
-        "肺炎",
-        "抑郁症",
-        "冠心病",
-        "阿尔茨海默",
-        "白血病",
-        "痛风",
-        "癫痫",
-        "肾衰竭",
-        "心肌梗死",
-        "肿瘤",
-    ];
-    for d in explicit_diseases_zh {
-        if t.contains(d) {
-            let is_media = ["书", "小说", "海报", "图标", "应用", "app"]
-                .iter()
-                .any(|w| t.contains(&format!("{d}{w}")))
-                || ["关于", "画了", "设计"]
-                    .iter()
-                    .any(|w| t.contains(&format!("{w}{d}")));
-            let has_personal_possession = ["患有", "得了", "确诊", &format!("有{d}")]
-                .iter()
-                .any(|p| t.contains(p));
-            if !is_media || has_personal_possession {
-                return true;
-            }
-        }
-    }
-
-    for v in ["患有", "得了", "被确诊", "患上"] {
-        if t.contains(v)
-            && ["病", "症", "癌", "炎", "障碍", "残疾", "阳性", "哮喘"]
-                .iter()
-                .any(|w| t.contains(w))
-        {
-            return true;
-        }
-    }
-
-    let explicit_diseases_en = [
-        "asthma",
-        "diabetes",
-        "hypertension",
-        "heart disease",
-        "cancer",
-        "pneumonia",
-        "depression",
-        "leukemia",
-        "epilepsy",
-    ];
-    for d in explicit_diseases_en {
-        if contains_english_term(t, d) {
-            let is_media = [
-                "book", "novel", "movie", "poster", "icon", "app", "software",
-            ]
-            .iter()
-            .any(|w| t.contains(&format!("{d} {w}")))
-                || t.contains(&format!("about {d}"))
-                || t.contains(&format!("regarding {d}"));
-            if is_media {
-                continue;
-            }
-            if t.contains("diagnosed with") {
-                return true;
-            }
-            if personal_en
-                && ["have", "had", "has", "with", "got", "suffer"]
-                    .iter()
-                    .any(|w| t.contains(w))
-            {
-                return true;
-            }
-        }
-    }
-
-    // 组 2：症状陈述
-    // 第一人称或用户归属 + 胸痛/呼吸困难/发烧/头晕/疼痛 等症状
-    // 避开「这个 bug 让我头疼」等常见技术比喻
-    let symptoms_zh = [
-        "胸痛",
-        "呼吸困难",
-        "发烧",
-        "高烧",
-        "头晕",
-        "身体疼痛",
-        "胃痛",
-        "偏头痛",
-        "胸闷",
-        "恶心想吐",
-    ];
-    if personal_zh && symptoms_zh.iter().any(|s| t.contains(s)) {
-        return true;
-    }
-    if personal_zh && (t.contains("头疼") || t.contains("头痛")) {
-        let is_metaphor = ["bug", "代码", "程序", "编译", "报错", "故障", "系统"]
-            .iter()
-            .any(|m| t.contains(m));
-        if !is_metaphor {
-            return true;
-        }
-    }
-
-    let symptoms_en = [
-        "chest pain",
-        "shortness of breath",
-        "fever",
-        "dizziness",
-        "stomach pain",
-        "body pain",
-        "migraine",
-    ];
-    if personal_en && symptoms_en.iter().any(|s| contains_english_term(t, s)) {
-        return true;
-    }
-    if personal_en && contains_english_term(t, "headache") {
-        let is_metaphor = ["bug", "code", "error", "system", "icon"]
-            .iter()
-            .any(|m| t.contains(m));
-        if !is_metaphor {
-            return true;
-        }
-    }
-
-    // 组 3：诊断、病史与治疗
-    // 诊断/确诊/病史/病历/治疗/服药/处方/手术 及 diagnosis/medical history/prescription/surgery
-    // 避开「故障诊断」「代码病史」之类技术或比喻用法
-    let is_tech_diag = ["故障诊断", "系统诊断", "网络诊断", "性能诊断", "硬件诊断"]
-        .iter()
-        .any(|m| t.contains(m));
-    let is_tech_hist = ["代码病史", "版本病史", "提交病史"]
-        .iter()
-        .any(|m| t.contains(m));
-    if t.contains("诊断") && !is_tech_diag {
-        return true;
-    }
-    if t.contains("病史") && !is_tech_hist {
-        return true;
-    }
-    for term in ["确诊", "病历", "处方", "手术", "过敏", "服药", "吃药"] {
-        if t.contains(term) {
-            return true;
-        }
-    }
-
-    if contains_english_term(t, "medical history") {
-        return true;
-    }
-    for term in [
-        "prescription",
-        "surgery",
-        "medication",
-        "allergy",
-        "allergic",
-    ] {
-        if contains_english_term(t, term) {
-            return true;
-        }
-    }
-    if contains_english_term(t, "diagnosis")
-        && !t.contains("fault diagnosis")
-        && !t.contains("bug diagnosis")
-        && !t.contains("system diagnosis")
-    {
-        return true;
-    }
-    for phrase in [
-        "take medicine",
-        "taking medicine",
-        "take medication",
-        "taking pills",
-    ] {
-        if t.contains(phrase) {
-            return true;
-        }
-    }
-
-    // 组 4：健康记录
-    // 健康记录/体检报告/检查结果/化验单/医疗记录 及 health record/medical record/lab result，归属于用户时命中
-    // 避开「我在开发健康记录应用」等产品名
-    let records_zh = [
-        "健康记录",
-        "体检报告",
-        "检查结果",
-        "化验单",
-        "医疗记录",
-        "体检单",
-    ];
-    for rec in records_zh {
-        if t.contains(rec) {
-            let is_product = ["应用", "软件", "app", "系统", "平台"]
-                .iter()
-                .any(|suffix| t.contains(&format!("{rec}{suffix}")))
-                || ["开发", "设计", "做一款", "做一个", "做"]
-                    .iter()
-                    .any(|prefix| t.contains(&format!("{prefix}{rec}")));
-            if !is_product {
-                return true;
-            }
-        }
-    }
-
-    let records_en = [
-        "health record",
-        "medical record",
-        "lab result",
-        "medical test result",
-    ];
-    for rec in records_en {
-        if contains_english_term(t, rec) {
-            let is_product = ["app", "application", "software", "system", "platform"]
-                .iter()
-                .any(|suffix| t.contains(&format!("{rec} {suffix}")))
-                || [
-                    "design",
-                    "designing",
-                    "develop",
-                    "developing",
-                    "build",
-                    "building",
-                ]
-                .iter()
-                .any(|prefix| {
-                    t.contains(&format!("{prefix} {rec}"))
-                        || t.contains(&format!("{prefix} a {rec}"))
-                });
-            if !is_product {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn contains_english_term(text: &str, term: &str) -> bool {
-    text.match_indices(term).any(|(start, _)| {
-        let end = start + term.len();
-        let left = start == 0
-            || !text[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphabetic());
-        let right = end == text.len()
-            || !text[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic());
-        left && right
-    })
-}
-
-/// 凭据内容（doc5/03 §7）：继承 v1 sensitive() 的密码/token/API key/sk- 值形态，
-/// 命中即 held:SECRET——自动提取与 memory_remember 直写均不得 active（doc5/04 §2）。
-/// 与 v1 的差异只是不再包含健康/证件字面词（后者归 SENSITIVE）；不把值打印到日志。
-fn secret_like(quote: &str) -> bool {
-    let lower = quote.to_lowercase();
-    let chars: Vec<char> = lower.chars().collect();
-    let bytes_len = chars.len();
-
-    // 模式 1：password / passwd / 密码 → 分隔符 → 非空白值 ≥4
-    for key in ["password", "passwd", "密码"] {
-        let kc: Vec<char> = key.chars().collect();
-        for start in 0..bytes_len.saturating_sub(kc.len() - 1) {
-            if chars[start..].starts_with(&kc) {
-                if let Some(value_len) = value_after_sep(&chars, start + kc.len()) {
-                    if value_len >= 4 {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    // 模式 2：api key 变体 / token → 分隔符 → [A-Za-z0-9_-] ≥12
-    for key in ["api_key", "api-key", "api key", "apikey", "token"] {
-        let kc: Vec<char> = key.chars().collect();
-        for start in 0..bytes_len.saturating_sub(kc.len() - 1) {
-            if chars[start..].starts_with(&kc) {
-                if let Some(value_len) = value_after_sep(&chars, start + kc.len()) {
-                    if value_len >= 12 {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    // 模式 3：sk- 后跟 ≥12 个 [A-Za-z0-9_-]
-    let sk: Vec<char> = "sk-".chars().collect();
-    for start in 0..bytes_len.saturating_sub(sk.len() - 1) {
-        if chars[start..].starts_with(&sk) {
-            let mut n = 0;
-            for &c in &chars[start + sk.len()..] {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    n += 1;
-                } else {
-                    break;
-                }
-            }
-            if n >= 12 {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// admit_v2 明确句式（doc5/03 §6 最小受支持集合）。quote 匹配到哪个 kind 的形状。
@@ -1692,84 +1158,136 @@ pub fn explicit_shape(quote: &str) -> Option<ExplicitShape> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn admit_v5_health_rule_groups_and_rewrite_union() {
+    fn test_g1_policy_gates_removed_three_examples() {
         use super::*;
-        for (positive, negative) in [
-            ("我患有哮喘", "我画了心脏图标"),
-            ("I have asthma", "I have an asthma book"),
-            ("我有胸痛", "这个 bug 让我头疼"),
-            ("I have chest pain", "I have a headache icon"),
-            ("我有诊断病史", "我在做故障诊断和代码病史分析"),
-            ("I have a medical history", "I wrote a code history"),
-            ("我的健康记录里有心脏病", "我在开发健康记录应用"),
-            (
-                "My health record has a result",
-                "I design a health record app",
-            ),
-        ] {
-            assert!(sensitive_health_v5(positive), "missed: {positive}");
-            assert!(!sensitive_health_v5(negative), "false positive: {negative}");
-        }
-        for text in [
-            "我吃苹果",
-            "I eat apples",
-            "故障诊断",
-            "代码病史",
-            "这个 bug 让我头疼",
-        ] {
-            assert!(!sensitive_health_v5(text), "false positive: {text}");
-        }
-        for text in [
-            "我平时做软件开发，我有高血压",
-            "我是一名应用架构师，我有哮喘",
-            "我对花生过敏。",
-            "我有糖尿病诊断。",
-            "我的病历写着高血压。",
-            "我的健康记录里有心脏病。",
-            "我患有哮喘。",
-            "我对虾过敏。",
-        ] {
-            assert!(sensitive_health_v5(text), "should be sensitive: {text}");
-        }
-        for quote in ["我的健康记录里有心脏病。", "我患有哮喘。"] {
-            let event = WindowEvent {
+        // 2026-10-23 主人亲令：删除所有敏感门（SECRET / SENSITIVE / THIRD_PARTY）。
+        // 断言三例不再因上述三道门被 held，其余结构规则照常。
+
+        // 例 1：我有心脏病
+        {
+            let quote = "我有心脏病";
+            let ev = WindowEvent {
                 id: "e1".into(),
                 role: "user".into(),
                 source_kind: "user".into(),
-                occurred_at: "2026-10-22T00:00:00Z".into(),
+                occurred_at: "2026-10-23T08:00:00Z".into(),
                 content: quote.into(),
             };
-            let candidate = ModelCandidate {
+            // v2 纯 quote 路径：结构规则 explicit_shape 未命中 -> NOT_EXPLICIT（不再是 SENSITIVE）
+            let cand_v2 = ModelCandidate {
                 source_event_id: "e1".into(),
                 quote: quote.into(),
                 kind: "fact".into(),
                 occurred_at: None,
                 valid_until: None,
                 confidence: None,
-                claim: Some("用户有一项长期情况".into()),
+                claim: None,
             };
-            assert_eq!(admit_v5(&candidate, &[event]), Admission::Held("SENSITIVE"));
+            let adm_v2 = admit_v2(&cand_v2, &[ev.clone()]);
+            assert_ne!(adm_v2, Admission::Held("SENSITIVE"));
+            assert_eq!(adm_v2, Admission::Held("NOT_EXPLICIT"));
+
+            // v5 带改写 claim 路径：以"用户"起头且无其它阻断 -> Active（不再是 SENSITIVE）
+            let cand_v5 = ModelCandidate {
+                source_event_id: "e1".into(),
+                quote: quote.into(),
+                kind: "fact".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: Some(0.95),
+                claim: Some("用户有心脏病".into()),
+            };
+            let (adm_v5, _) = admit_v5_with_reason(&cand_v5, &[ev]);
+            assert_ne!(adm_v5, Admission::Held("SENSITIVE"));
+            assert_eq!(adm_v5, Admission::Active);
         }
-        // quote is clean, claim adds sensitive info -> union rule 8 also holds
+
+        // 例 2：密码是 hunter2（凭据陈述）
         {
-            let quote = "我平时喜欢散步。";
-            let event = WindowEvent {
+            let ev_text = "记住我的密码是 hunter2";
+            let ev = WindowEvent {
                 id: "e2".into(),
                 role: "user".into(),
                 source_kind: "user".into(),
-                occurred_at: "2026-10-22T00:00:00Z".into(),
+                occurred_at: "2026-10-23T08:00:00Z".into(),
+                content: ev_text.into(),
+            };
+            let cand_inst = ModelCandidate {
+                source_event_id: "e2".into(),
+                quote: "记住我的密码是 hunter2".into(),
+                kind: "instruction".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: None,
+                claim: None,
+            };
+            let adm_v2 = admit_v2(&cand_inst, &[ev.clone()]);
+            assert_ne!(adm_v2, Admission::Held("SECRET"));
+            assert_eq!(adm_v2, Admission::Active);
+
+            let (adm_v5, _) = admit_v5_with_reason(&cand_inst, &[ev]);
+            assert_ne!(adm_v5, Admission::Held("SECRET"));
+            assert_eq!(adm_v5, Admission::Active);
+
+            // 纯陈述：我的密码是 hunter2
+            let ev_fact = WindowEvent {
+                id: "e2_fact".into(),
+                role: "user".into(),
+                source_kind: "user".into(),
+                occurred_at: "2026-10-23T08:00:00Z".into(),
+                content: "我的密码是 hunter2".into(),
+            };
+            let cand_fact = ModelCandidate {
+                source_event_id: "e2_fact".into(),
+                quote: "我的密码是 hunter2".into(),
+                kind: "fact".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: None,
+                claim: None,
+            };
+            let adm_fact = admit_v2(&cand_fact, &[ev_fact]);
+            assert_ne!(adm_fact, Admission::Held("SECRET"));
+            assert_eq!(adm_fact, Admission::Held("NOT_EXPLICIT"));
+        }
+
+        // 例 3：我姐在成都教书
+        {
+            let quote = "我姐在成都教书";
+            let ev = WindowEvent {
+                id: "e3".into(),
+                role: "user".into(),
+                source_kind: "user".into(),
+                occurred_at: "2026-10-23T08:00:00Z".into(),
                 content: quote.into(),
             };
-            let candidate = ModelCandidate {
-                source_event_id: "e2".into(),
+            // v2 纯 quote 路径：主语明确（不走 UNCLEAR_SUBJECT），explicit_shape 未命中 -> NOT_EXPLICIT（不再是 THIRD_PARTY）
+            let cand_v2 = ModelCandidate {
+                source_event_id: "e3".into(),
                 quote: quote.into(),
                 kind: "fact".into(),
                 occurred_at: None,
                 valid_until: None,
                 confidence: None,
-                claim: Some("用户患有高血压。".into()),
+                claim: None,
             };
-            assert_eq!(admit_v5(&candidate, &[event]), Admission::Held("SENSITIVE"));
+            let adm_v2 = admit_v2(&cand_v2, &[ev.clone()]);
+            assert_ne!(adm_v2, Admission::Held("THIRD_PARTY"));
+            assert_eq!(adm_v2, Admission::Held("NOT_EXPLICIT"));
+
+            // v5 带改写 claim 路径：以"用户"起头 -> Active（不再是 THIRD_PARTY）
+            let cand_v5 = ModelCandidate {
+                source_event_id: "e3".into(),
+                quote: quote.into(),
+                kind: "fact".into(),
+                occurred_at: None,
+                valid_until: None,
+                confidence: Some(0.95),
+                claim: Some("用户的姐姐在成都教书".into()),
+            };
+            let (adm_v5, _) = admit_v5_with_reason(&cand_v5, &[ev]);
+            assert_ne!(adm_v5, Admission::Held("THIRD_PARTY"));
+            assert_eq!(adm_v5, Admission::Active);
         }
     }
     use super::*;
@@ -1905,13 +1423,14 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_held() {
+    fn admit_v1_no_longer_holds_sensitive() {
         let events = vec![ev("记住我的密码：abc12345")];
         let c = ModelCandidate {
             kind: "instruction".into(),
             ..cand("记住我的密码：abc12345")
         };
-        assert_eq!(admit_v1(&c, &events), Admission::Held("SENSITIVE"));
+        // 2026-10-23 删除敏感门后，admit_v1 判定指令明确且不再被 SENSITIVE 阻断，变为 Active
+        assert_eq!(admit_v1(&c, &events), Admission::Active);
         // 单独谈论「密码」一词不被阻断。
         let events2 = vec![ev("我不喜欢密码学课")];
         let c2 = ModelCandidate {
@@ -2014,15 +1533,12 @@ mod tests {
     }
 
     #[test]
-    fn temporal_and_health_markers() {
-        // doc5/03 §7：未来/短期词与健康词的有限集合。
+    fn temporal_markers() {
+        // doc5/03 §7：未来/短期词的有限集合。
         assert!(temporal_marker("我今年九月开始新工作"));
         assert!(temporal_marker("老笔记本电池坏了"));
         assert!(temporal_marker("我下周去上海"));
         assert!(!temporal_marker("我在杭州做后端开发"));
-        assert!(sensitive_health("我对花生过敏"));
-        assert!(sensitive_health("我有哮喘诊断"));
-        assert!(!sensitive_health("我喜欢用暗色主题写代码"));
     }
 
     #[test]
@@ -2156,11 +1672,19 @@ mod tests {
         assert_eq!(f("以后回答请用中文", "instruction"), Active, "A10");
         assert_eq!(
             f("我们家小孩今年九月上小学一年级", "fact"),
-            Held("THIRD_PARTY"),
-            "A11：固定顺序先记第三人"
+            Held("TEMPORAL"),
+            "A11：第三人门删除后，继续向后命中TEMPORAL"
         );
-        assert_eq!(f("我对花生过敏", "fact"), Held("SENSITIVE"), "A12");
-        assert_eq!(f("我姐在成都教书", "fact"), Held("THIRD_PARTY"), "A13");
+        assert_eq!(
+            f("我对花生过敏", "fact"),
+            Held("NOT_EXPLICIT"),
+            "A12：敏感门删除后，结构未命中显式句式"
+        );
+        assert_eq!(
+            f("我姐在成都教书", "fact"),
+            Held("NOT_EXPLICIT"),
+            "A13：第三人门删除后，结构未命中显式句式"
+        );
         assert_eq!(
             f("老笔记本电池坏了", "fact"),
             Held("UNCLEAR_SUBJECT"),
@@ -2176,8 +1700,8 @@ mod tests {
         );
         assert_eq!(
             f("我的 API key：sk-0123456789abcdef", "fact"),
-            Held("SECRET"),
-            "A19"
+            Held("NOT_EXPLICIT"),
+            "A19：SECRET门删除后，结构未命中显式句式"
         );
         assert_eq!(f("我喜欢暗色主题", "fact"), Held("KIND_MISMATCH"), "A27");
         // 我以后... 不因内部含「以后」被当作指令（doc5/03 §6 instruction 边界）。
@@ -2352,13 +1876,11 @@ mod tests {
         // Muse D.5 例 1 的合并句式（，谓语并列）不算多命题。
         c.claim = Some("用户是后端开发，平时主要写 Rust".into());
         assert_eq!(admit_v4(&c, &events), Admission::Active);
-        // 内容政策门不因 rewrite 放水：第三人（单句改写形式）照旧 held。
-        // （门序与 v2 一致：MULTI_CLAIM 在 THIRD_PARTY 之前——"用户不吃香菜。用户的
-        // 母亲不碰辣"这种双主语改写会先停 MULTI_CLAIM。）
+        // 2026-10-23 政策门删除后：第三人（单句改写形式）与健康改写正常放行 Active。
         let events_fam = mk_events(&["我妈不碰辣"]);
         let mut fam = held_cand("我妈不碰辣", 0);
         fam.claim = Some("用户的母亲不碰辣".into());
-        assert_eq!(admit_v4(&fam, &events_fam), Admission::Held("THIRD_PARTY"));
+        assert_eq!(admit_v4(&fam, &events_fam), Admission::Active);
         // 改写句里再次出现独立用户主语（句号分隔）→ MULTI_CLAIM。
         let mut multi2 = held_cand("我喜欢咖啡，也喜欢茶", 0);
         multi2.kind = "preference".into();
@@ -2368,14 +1890,11 @@ mod tests {
             admit_v4(&multi2, &events_pref),
             Admission::Held("MULTI_CLAIM")
         );
-        // 敏感/时效。
+        // 健康改写放行 Active；时效改写仍按规则 10 TEMPORAL 拦截。
         let events_health = mk_events(&["我对花生过敏"]);
         let mut health = held_cand("我对花生过敏", 0);
         health.claim = Some("用户对花生过敏".into());
-        assert_eq!(
-            admit_v4(&health, &events_health),
-            Admission::Held("SENSITIVE")
-        );
+        assert_eq!(admit_v4(&health, &events_health), Admission::Active);
         let events_temp = mk_events(&["我最近在肝星穹铁道"]);
         let mut temporal = held_cand("我最近在肝星穹铁道", 0);
         temporal.claim = Some("用户最近在玩星穹铁道".into());
@@ -2422,33 +1941,33 @@ mod tests {
 
     #[test]
     fn b2_reason_text_generation_and_admit_v5_rules() {
-        // B2 规范验证：S08/S09 held 样本 reason_text 非空且提及命中规则；active 样本不崩。
+        // B2 规范验证：held 样本 reason_text 非空且提及命中规则；active 样本不崩。
         let event_s08 = WindowEvent {
             id: "ev_s08".into(),
             role: "user".into(),
             source_kind: "user".into(),
             occurred_at: "2026-10-22T10:00:00Z".into(),
-            content: "我的健康记录里有心脏病。".into(),
+            content: "如果明天天气好，我就去骑车。".into(),
         };
         let mut cand_s08 = ModelCandidate {
             source_event_id: "ev_s08".into(),
-            quote: "我的健康记录里有心脏病。".into(),
+            quote: "如果明天天气好，我就去骑车。".into(),
             kind: "fact".into(),
             occurred_at: None,
             valid_until: None,
             confidence: Some(0.95),
-            claim: Some("用户有心脏病病史".into()),
+            claim: Some("如果明天天气好，用户就去骑车".into()),
         };
         let (adm_s08, reason_s08) = admit_v5_with_reason(&cand_s08, &[event_s08]);
-        assert_eq!(adm_s08, Admission::Held("SENSITIVE"));
+        assert_eq!(adm_s08, Admission::Held("CONTEXT_UNCERTAIN"));
         assert!(reason_s08.is_some(), "S08 held 样本 reason_text 必须非空");
         let text_s08 = reason_s08.unwrap();
         assert!(
-            text_s08.contains("规则8") && text_s08.contains("SENSITIVE"),
-            "S08 reason_text 必须提及规则8及SENSITIVE: {text_s08}"
+            text_s08.contains("规则4") && text_s08.contains("CONTEXT_UNCERTAIN"),
+            "S08 reason_text 必须提及规则4及CONTEXT_UNCERTAIN: {text_s08}"
         );
         assert!(
-            text_s08.contains("我的健康记录里有心脏病。"),
+            text_s08.contains("如果明天天气好"),
             "S08 reason_text 必须包含关键证据 quote: {text_s08}"
         );
 
@@ -2457,28 +1976,28 @@ mod tests {
             role: "user".into(),
             source_kind: "user".into(),
             occurred_at: "2026-10-22T10:00:00Z".into(),
-            content: "我患有哮喘。".into(),
+            content: "我下周要去北京出差。".into(),
         };
         let cand_s09 = ModelCandidate {
             source_event_id: "ev_s09".into(),
-            quote: "我患有哮喘。".into(),
+            quote: "我下周要去北京出差。".into(),
             kind: "fact".into(),
             occurred_at: None,
             valid_until: None,
             confidence: Some(0.95),
-            claim: Some("用户患有哮喘".into()),
+            claim: Some("用户下周要去北京出差".into()),
         };
         let (adm_s09, reason_s09) = admit_v5_with_reason(&cand_s09, &[event_s09]);
-        assert_eq!(adm_s09, Admission::Held("SENSITIVE"));
+        assert_eq!(adm_s09, Admission::Held("TEMPORAL"));
         assert!(reason_s09.is_some(), "S09 held 样本 reason_text 必须非空");
         let text_s09 = reason_s09.unwrap();
         assert!(
-            text_s09.contains("规则8") && text_s09.contains("SENSITIVE"),
-            "S09 reason_text 必须提及规则8及SENSITIVE: {text_s09}"
+            text_s09.contains("规则10") && text_s09.contains("TEMPORAL"),
+            "S09 reason_text 必须提及规则10及TEMPORAL: {text_s09}"
         );
         assert!(
-            text_s09.contains("我患有哮喘。"),
-            "S09 reason_text 必须包含关键证据 quote: {text_s09}"
+            text_s09.contains("下周要去北京出差"),
+            "S09 reason_text 必须包含关键证据 text: {text_s09}"
         );
 
         // Active 样本：不断言具体内容，只断言不崩且正常返回

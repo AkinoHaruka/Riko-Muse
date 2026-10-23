@@ -69,6 +69,7 @@
 | [43 B2 reason_text 生成](43-B2-reason_text生成交付记录.md) | 迁移 0024（schema 24）、确定性 reason_text 模板生成与关键引用切片、admit_v5 落库与 v4/历史版本严格 NULL 隔离、GET /v1/candidates、GET /v1/memories/{id}/explain、GET /v1/memories/{id} 及 CLI 暴露。 |
 | [44 B3 Dream 作业域接线交付记录](44-B3-Dream作业域接线交付记录.md) | Dream 作业域 13 处 DOM 接线至 `DomainScope::for_job`、CLI 10 个子命令支持 `--domain` 消除 14 处主域写死、`v2_domain_tests` 新增作业域隔离测试，Rust 199 passed / TS 50 passed。 |
 | [45 B1 Soul 双轨收口交付记录](45-B1-Soul双轨收口交付记录.md) | **最新**：单一真相源=内核 Soul（order 10300，按 agent 隔离）；移除非隔离 twin-soul 平行注入；文件版覆盖显式 opt-in（默认关且走装配路径保持隔离）；alignment.md 标注废弃并指向内核 synthesis。TS 54 passed / 0 failed。 |
+| [46 G1 删除敏感门交付记录](46-G1-删除敏感门交付记录.md) | **最新**：2026-10-23 主人亲令全删内容政策门（SECRET/SENSITIVE/THIRD_PARTY）；admit_v1/v2/v4/v5 破例变更；门函数全删；第三人陈述不再被 THIRD_PARTY 阻断且按后续规则正常裁决；Rust 250 passed / TS 54 passed。 |
 
 ## 30 秒状态
 
