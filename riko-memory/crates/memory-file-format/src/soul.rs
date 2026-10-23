@@ -11,6 +11,7 @@ pub struct SoulFrontMatter {
     pub body_sha256: String,
     pub updated_at: String,
     pub actor_kind: String,
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,12 @@ impl SoulDocument {
                 Some("actor_kind"),
             ));
         }
+        if let Some(ref origin) = self.front.origin {
+            validate_control_text(origin, "origin")?;
+            if origin.is_empty() {
+                return Err(FormatError::new(ReasonCode::InvalidField, Some("origin")));
+            }
+        }
         if self.body.chars().count() > SOUL_BODY_MAX_SCALARS {
             return Err(FormatError::new(ReasonCode::InvalidField, Some("body")));
         }
@@ -58,8 +65,12 @@ impl SoulDocument {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
         self.validate()?;
+        let origin_line = match &self.front.origin {
+            Some(o) => format!("origin: {o}\n"),
+            None => String::new(),
+        };
         let mut out = format!(
-            "---\nriko_format: {SOUL_FORMAT}\nagent_id: {}\nversion: {}\nbody_sha256: {}\nupdated_at: {}\nactor_kind: {}\n---\n\n",
+            "---\nriko_format: {SOUL_FORMAT}\nagent_id: {}\nversion: {}\nbody_sha256: {}\nupdated_at: {}\nactor_kind: {}\n{origin_line}---\n\n",
             self.front.agent_id,
             self.front.version,
             self.front.body_sha256,
@@ -107,6 +118,16 @@ impl SoulDocument {
         let body_sha256 = take(&mut lines, "body_sha256: ")?;
         let updated_at = take(&mut lines, "updated_at: ")?;
         let actor_kind = take(&mut lines, "actor_kind: ")?;
+        let origin = if let Some(line) = lines.clone().next() {
+            if let Some(val) = line.strip_prefix("origin: ") {
+                lines.next();
+                Some(val.to_owned())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if lines.next().is_some() {
             return Err(FormatError::new(ReasonCode::UnexpectedField, None));
         }
@@ -117,6 +138,7 @@ impl SoulDocument {
                 body_sha256,
                 updated_at,
                 actor_kind,
+                origin,
             },
             body: body.to_owned(),
         };

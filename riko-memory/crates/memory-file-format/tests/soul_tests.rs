@@ -29,6 +29,18 @@ fn soul_rejects_more_than_2000_unicode_scalars() {
 }
 
 #[test]
+fn soul_origin_bundled_default_round_trip_is_byte_stable() {
+    let mut document = SoulDocument::parse(GOOD).unwrap();
+    document.front.origin = Some("bundled-default".into());
+    let bytes = document.to_bytes().unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("origin: bundled-default\n"));
+    let parsed = SoulDocument::parse(&bytes).unwrap();
+    assert_eq!(parsed.front.origin, Some("bundled-default".into()));
+    assert_eq!(parsed.to_bytes().unwrap(), bytes);
+}
+
+#[test]
 fn soul_body_bytes_are_not_normalized() {
     let mut document = SoulDocument::parse(GOOD).unwrap();
     document.body = "e\u{301}\r\n".into();

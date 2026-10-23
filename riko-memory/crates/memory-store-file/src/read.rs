@@ -7,6 +7,7 @@ use crate::{now, raw_content_hash, read_bytes, suppressed, EvidenceBlock, StoreE
 use memory_domain::{normalize_v1, USER_MAIN_DOMAIN};
 use memory_file_format::claim::ClaimDocument;
 use memory_file_format::overview::MemoryOverview;
+use memory_file_format::soul::SoulDocument;
 use memory_recall::{cjk_bigrams, is_single_char_query, latin_tokens, rrf_score};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -17,6 +18,7 @@ pub const BUNDLE_TOTAL_CHARS: usize = 8000;
 pub const BUNDLE_COMPACT_CHARS: usize = 1200;
 pub const BUNDLE_ALIGNMENT_CHARS: usize = 600;
 pub const BUNDLE_RELATIONSHIP_ITEMS: usize = 8;
+pub const SOUL_EMPTY_MARKER: &str = "未配置人格文件";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EvidenceDetail {
@@ -81,6 +83,7 @@ pub struct FileSearchHit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileBundleResult {
+    pub soul: serde_json::Value,
     pub segments: serde_json::Value,
     pub budget: serde_json::Value,
     pub resident: serde_json::Value,
@@ -685,10 +688,12 @@ impl FileReader {
         Ok(hits)
     }
 
-    /// Build context bundle conforming to the 4-segment budget (compact → alignment → relationships → retrieved).
+    /// Build context bundle conforming to the 4-segment budget (compact → alignment → relationships → retrieved)
+    /// and explicit soul segment.
     pub fn context_bundle(
         scope_dir: &Path,
         _agent_id: &str,
+        soul_doc: Option<&SoulDocument>,
         query: &str,
         overview: Option<&MemoryOverview>,
         alignment_doc: Option<&str>,
@@ -699,6 +704,29 @@ impl FileReader {
         suppressions: &[Suppression],
     ) -> Result<FileBundleResult, StoreError> {
         let mut used_total_chars = 0usize;
+
+        // Soul segment: explicit empty state marker if missing or empty
+        let (soul_body, soul_version, soul_chars) = match soul_doc {
+            Some(doc) if !doc.body.trim().is_empty() => {
+                let cost = doc.body.chars().count();
+                (doc.body.clone(), doc.front.version, cost)
+            }
+            _ => {
+                let empty_marker = SOUL_EMPTY_MARKER.to_string();
+                let cost = empty_marker.chars().count();
+                (empty_marker, 0, cost)
+            }
+        };
+        used_total_chars += soul_chars;
+
+        let soul_segment = serde_json::json!({
+            "segment": "soul",
+            "domain_id": USER_MAIN_DOMAIN,
+            "version": soul_version,
+            "char_count": soul_chars,
+            "complete": true,
+            "body": soul_body,
+        });
 
         // 1. Compact segment
         let mut compact_seg_items = Vec::new();
@@ -883,6 +911,7 @@ impl FileReader {
         let lexical_status = if degraded { "index_degraded" } else { "ok" };
 
         Ok(FileBundleResult {
+            soul: soul_segment,
             segments,
             budget: serde_json::json!({
                 "total_chars": BUNDLE_TOTAL_CHARS,
