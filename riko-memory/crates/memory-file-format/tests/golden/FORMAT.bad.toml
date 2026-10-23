@@ -1,0 +1,9 @@
+format = "file_store_v2"
+version = 2
+evidence = "evidence_v1"
+claim = "memory_v1"
+soul = "soul_v1"
+overview = "memory_overview_v1"
+operation = "riko-operation-v1"
+receipt = "riko-receipt-v1"
+fence = "riko-fence-v1"

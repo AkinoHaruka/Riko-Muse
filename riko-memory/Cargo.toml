@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/memory-contract",
     "crates/memory-domain",
+    "crates/memory-file-format",
     "crates/memory-store-sqlite",
     "crates/memory-extract",
     "crates/memory-recall",
@@ -17,6 +18,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 memory-contract = { path = "crates/memory-contract" }
 memory-domain = { path = "crates/memory-domain" }
+memory-file-format = { path = "crates/memory-file-format" }
 memory-store-sqlite = { path = "crates/memory-store-sqlite" }
 memory-extract = { path = "crates/memory-extract" }
 memory-recall = { path = "crates/memory-recall" }

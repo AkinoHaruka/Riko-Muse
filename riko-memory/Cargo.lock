@@ -879,6 +879,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-file-format"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "memory-domain",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "memory-recall"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,1 @@
+{"format":"riko-operation-v1","id":"op-1","scope_id":"scope-1","domain_id":"user_main","operation":"memory_correct","actor_kind":"user","actor_id":"user-1","target_id":"019a12ab-4c00-7c01-9000-111111111111","expected_version":3,"occurred_at":"2026-10-23T14:40:00.000000Z","payload":{"reason_code":"user_correction"}}

@@ -1,0 +1,16 @@
+[package]
+name = "memory-file-format"
+description = "file_store_v1 canonical file grammar and validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memory-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "0.8"
+unicode-normalization = "0.1"
+sha2 = "0.10"
+hex = "0.4"
