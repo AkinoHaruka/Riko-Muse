@@ -1190,3 +1190,374 @@ fn explain_memory_returns_verbatim_spans_speaker_and_relations() {
     assert_eq!(new_explain.status, "active");
     assert_eq!(new_explain.relations.supersedes, Some(c1));
 }
+
+fn compute_tree_hashes(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if current.is_dir() {
+            let mut entries: Vec<_> = fs::read_dir(&current).unwrap().map(|e| e.unwrap()).collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.is_file() {
+                    let rel = p.strip_prefix(dir).unwrap().to_string_lossy().to_string();
+                    if rel == "LOCK" || rel.ends_with("/LOCK") {
+                        continue;
+                    }
+                    let bytes = fs::read(&p).unwrap();
+                    map.insert(rel, sha256_hex(&bytes));
+                }
+            }
+        }
+    }
+    map
+}
+
+#[test]
+fn forget_closure_full_invisibility_derived_and_index_cleared_reextract_blocked() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    // 1. Ingest evidence and remember
+    let ev_text = "用户特别喜欢在夜晚散步，思考哲学与宇宙";
+    let ev_id = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), ev_text)
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c_id = match store
+        .remember(&scope, &origin, &ev_id, ev_text, MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Before forget: visible in search, explain, bundle, MEMORY.md, and bank/opinions.md
+    let (hits, _) = store.search_memories(&scope, "散步", 10, false, None).unwrap();
+    assert!(hits.iter().any(|h| h.id == c_id));
+    assert!(store.explain_memory(&scope, &c_id, false).unwrap().is_some());
+    let bundle = store.context_bundle(&scope, "a", "散步", None, None).unwrap();
+    let compact_items = bundle.segments[0]["items"].as_array().unwrap();
+    assert!(compact_items.iter().any(|it| it["body"].as_str().unwrap().contains("散步")));
+
+    let bank_view = store.get_bank_facet(&scope, "opinions").unwrap();
+    assert!(bank_view.items.iter().any(|it| it.memory_id == c_id));
+
+    // 2. Full forget closure
+    store.forget_claim(&scope, &c_id).unwrap();
+
+    // Assertion 1: Three read paths are absolutely invisible
+    let (hits_after, _) = store.search_memories(&scope, "散步", 10, false, None).unwrap();
+    assert!(!hits_after.iter().any(|h| h.id == c_id));
+    assert_eq!(store.explain_memory(&scope, &c_id, false).unwrap().map(|e| e.claim), None);
+    assert_eq!(store.get_claim(&scope, &c_id).unwrap().map(|c| c.body), None);
+    assert_eq!(store.get_memory(&scope, &c_id).unwrap().map(|c| c.body), None);
+
+    let bundle_after = store.context_bundle(&scope, "a", "散步", None, None).unwrap();
+    let compact_after = bundle_after.segments[0]["items"].as_array().unwrap();
+    assert!(!compact_after.iter().any(|it| it["body"].as_str().unwrap().contains("散步")));
+
+    // Assertion 2: Derived files (MEMORY.md and bank/*.md) do not contain the item
+    let overview = store.get_overview(&scope).unwrap();
+    if let Some(ov) = overview {
+        assert!(!ov.curated.iter().any(|r| r.memory_id == c_id));
+    }
+    let bank_view_after = store.get_bank_facet(&scope, "opinions").unwrap();
+    assert!(!bank_view_after.items.iter().any(|it| it.memory_id == c_id));
+
+    // Assertion 3: Projection index SQLite db has no residue of this claim
+    let db_path = ProjectionIndex::db_path(&scope_dir);
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    let count_proj: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM projected_items WHERE object_id = ?1",
+            [&c_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_proj, 0, "projected_items must not contain forgotten claim");
+
+    let count_fts: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM fts_items WHERE object_id = ?1",
+            [&c_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_fts, 0, "fts_items must not contain forgotten claim");
+
+    let count_grams: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM cjk_grams WHERE object_id = ?1",
+            [&c_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_grams, 0, "cjk_grams must not contain forgotten claim");
+
+    // Assertion 4: Extraction-side and Direct-write suppression checks block re-entry
+    // Doc8/06 rule 7: check extraction blocked
+    let is_suppressed_extract = store
+        .check_extraction_suppressed(&scope, &ev_id, MemoryKind::Preference, ev_text)
+        .unwrap();
+    assert!(is_suppressed_extract, "extraction side must block suppressed evidence");
+
+    // Direct write blocked
+    let rewrite_res = store.remember(&scope, &origin, &ev_id, ev_text, MemoryKind::Preference);
+    assert!(matches!(rewrite_res, Err(StoreError::Suppressed)));
+}
+
+#[test]
+fn upkeep_processes_ledger_idempotently_and_second_run_is_zero_diff() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    // Ingest two evidence blocks
+    let ev1 = store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "第一条日常事件记录")
+        .unwrap();
+    let ev2 = store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "第二条日常事件记录")
+        .unwrap();
+    let id1 = match ev1 { IngestOutcome::Recorded(id) => id, _ => unreachable!() };
+    let id2 = match ev2 { IngestOutcome::Recorded(id) => id, _ => unreachable!() };
+
+    // Remember one claim
+    let _claim = store
+        .remember(&scope, &origin, &id2, "第二条日常事件记录", MemoryKind::Fact)
+        .unwrap();
+
+    // First upkeep: should process new evidences and write ledger
+    let report1 = store.upkeep(&scope).unwrap();
+    assert_eq!(report1.new_evidence_processed, 2);
+    assert!(report1.files_modified > 0);
+
+    // Verify ledger exists and contains both IDs
+    let ledger_path = scope_dir.join("memory/LEDGER");
+    assert!(ledger_path.exists());
+    let ledger_text = fs::read_to_string(&ledger_path).unwrap();
+    assert!(ledger_text.contains(&id1));
+    assert!(ledger_text.contains(&id2));
+
+    // Capture file tree hashes after first upkeep
+    let tree_before = compute_tree_hashes(&scope_dir);
+
+    // Run second upkeep immediately: must be strictly idempotent with zero modifications
+    let report2 = store.upkeep(&scope).unwrap();
+    assert_eq!(report2.new_evidence_processed, 0);
+    assert_eq!(report2.expired_materialized, 0);
+    assert_eq!(report2.derived_refreshed, false);
+    assert_eq!(report2.index_rebuilt, false);
+    assert_eq!(report2.files_modified, 0, "second upkeep must have 0 files modified");
+
+    // Capture file tree hashes after second upkeep
+    let tree_after = compute_tree_hashes(&scope_dir);
+
+    // Assert exact equality of entire file tree hashes
+    assert_eq!(tree_before, tree_after, "entire file tree must be byte-for-byte identical on second upkeep");
+}
+
+#[test]
+fn upkeep_materializes_expired_claims_to_expired_status_and_invisible() {
+    let (_temp, store, scope, origin) = fixture();
+
+    let ev_id = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "即将过期的短期偏好")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!()
+    };
+
+    let claim_id = match store
+        .remember(&scope, &origin, &ev_id, "即将过期的短期偏好", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!()
+    };
+
+    // Mutate claim front matter to set valid_until in the past
+    let scope_dir = store.scope_dir(&scope).unwrap();
+    let path = scope_dir.join("memory/claims").join(format!("{claim_id}.md"));
+    let mut claim_doc = ClaimDocument::parse(&fs::read(&path).unwrap()).unwrap();
+    claim_doc.front.valid_until = Some("2026-01-01T00:00:00.000000Z".to_string());
+    fs::write(&path, claim_doc.to_bytes().unwrap()).unwrap();
+
+    // Verify claim is still active in file before upkeep
+    let claim_pre = ClaimDocument::parse(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(claim_pre.front.status, "active");
+
+    // Run upkeep to materialize expiration
+    let report = store.upkeep(&scope).unwrap();
+    assert_eq!(report.expired_materialized, 1);
+
+    // Verify claim file now has status = "expired" and bumped version
+    let claim_post = ClaimDocument::parse(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(claim_post.front.status, "expired");
+    assert_eq!(claim_post.front.version, 2);
+    assert_eq!(claim_post.front.reason_code, "expired");
+
+    // Verify invisible in read paths
+    assert_eq!(store.get_memory(&scope, &claim_id).unwrap(), None);
+    let (hits, _) = store.search_memories(&scope, "短期偏好", 10, false, None).unwrap();
+    assert!(!hits.iter().any(|h| h.id == claim_id));
+    let bundle = store.context_bundle(&scope, "a", "短期偏好", None, None).unwrap();
+    let compact_items = bundle.segments[0]["items"].as_array().unwrap();
+    assert!(!compact_items.iter().any(|it| it["body"].as_str().unwrap().contains("短期偏好")));
+}
+
+#[test]
+fn upkeep_zero_signal_zero_action_preserves_tree_hash() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    // Settle into steady state
+    let ev_id = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "长期稳定事实：地球围绕太阳旋转")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    store
+        .remember(&scope, &origin, &ev_id, "长期稳定事实：地球围绕太阳旋转", MemoryKind::Fact)
+        .unwrap();
+
+    // Initial upkeep to establish steady state
+    store.upkeep(&scope).unwrap();
+
+    // Record hashes before dry run
+    let hashes_before = compute_tree_hashes(&scope_dir);
+
+    // Dry run upkeep with zero signals
+    let report = store.upkeep(&scope).unwrap();
+    assert_eq!(report.new_evidence_processed, 0);
+    assert_eq!(report.expired_materialized, 0);
+    assert_eq!(report.derived_refreshed, false);
+    assert_eq!(report.index_rebuilt, false);
+    assert_eq!(report.files_modified, 0);
+
+    // Record hashes after dry run
+    let hashes_after = compute_tree_hashes(&scope_dir);
+
+    assert_eq!(hashes_before, hashes_after, "dry run upkeep must not touch any files in scope directory");
+}
+
+#[test]
+fn supersede_atomicity_and_consistency_no_conflicting_window() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "旧事实：用户现居北京")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c_old = match store
+        .remember(&scope, &origin, &ev1, "旧事实：用户现居北京", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "新事实：用户搬家现居杭州")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+
+    // Supersede in single lock
+    let c_new = match store
+        .supersede(&scope, &c_old, &origin, &ev2, "新事实：用户搬家现居杭州", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Assert states are consistent
+    let old_doc = store.read_claim_file(&scope_dir, &c_old).unwrap().unwrap();
+    let new_doc = store.read_claim_file(&scope_dir, &c_new).unwrap().unwrap();
+
+    assert_eq!(old_doc.front.status, "superseded");
+    assert_eq!(old_doc.front.version, 2);
+    assert_eq!(new_doc.front.status, "active");
+    assert_eq!(new_doc.front.version, 1);
+    assert_eq!(new_doc.front.supersedes, Some(c_old.clone()));
+
+    // Visibility: old is invisible without history, new is visible
+    assert_eq!(store.get_memory(&scope, &c_old).unwrap(), None);
+    assert_eq!(store.get_memory(&scope, &c_new).unwrap().unwrap().body, "新事实：用户搬家现居杭州");
+
+    // Curated MEMORY.md only contains new claim
+    let overview = store.get_overview(&scope).unwrap().unwrap();
+    assert!(overview.curated.iter().any(|r| r.memory_id == c_new));
+    assert!(!overview.curated.iter().any(|r| r.memory_id == c_old));
+
+    // Reflections bank facet contains old claim because it has an actual supersede edge
+    let refl_view = store.get_bank_facet(&scope, "reflections").unwrap();
+    assert!(refl_view.items.iter().any(|it| it.memory_id == c_old));
+}
+
+#[test]
+fn bank_derived_views_instant_invalidation_before_refresh() {
+    let (_temp, store, scope, origin) = fixture();
+    let scope_dir = store.scope_dir(&scope).unwrap();
+
+    let ev = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "用户偏好每天早起慢跑5公里")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c_id = match store
+        .remember(&scope, &origin, &ev, "用户偏好每天早起慢跑5公里", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Ensure bank file exists
+    let view1 = store.get_bank_facet(&scope, "opinions").unwrap();
+    assert_eq!(view1.items.len(), 1);
+    assert_eq!(view1.items[0].memory_id, c_id);
+    assert_eq!(view1.skipped_stale, 0);
+
+    // Directly mutate claim on disk to expired without running upkeep/refresh
+    let path = scope_dir.join("memory/claims").join(format!("{c_id}.md"));
+    let mut claim_doc = ClaimDocument::parse(&fs::read(&path).unwrap()).unwrap();
+    claim_doc.front.valid_until = Some("2026-01-01T00:00:00.000000Z".to_string());
+    fs::write(&path, claim_doc.to_bytes().unwrap()).unwrap();
+
+    // Read view: source verification triggers instant invalidation before upkeep
+    let view2 = store.get_bank_facet(&scope, "opinions").unwrap();
+    assert_eq!(view2.items.len(), 0, "stale claim must be instantly skipped");
+    assert_eq!(view2.skipped_stale, 1, "skipped_stale must record the invalidated claim");
+
+    // Now run upkeep to physically reconcile the bank file
+    let report = store.upkeep(&scope).unwrap();
+    assert_eq!(report.expired_materialized, 1);
+    assert_eq!(report.derived_refreshed, true);
+
+    let view3 = store.get_bank_facet(&scope, "opinions").unwrap();
+    assert_eq!(view3.items.len(), 0);
+    assert_eq!(view3.skipped_stale, 0, "after refresh bank file matches live state with 0 stale");
+}

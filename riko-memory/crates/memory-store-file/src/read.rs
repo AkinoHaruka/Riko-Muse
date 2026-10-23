@@ -135,7 +135,10 @@ pub fn is_claim_visible(
 
     // 3. Suppressions
     let raw_hash = raw_content_hash(&claim.body);
-    if suppressed(suppressions, &claim.front.id) || suppressed(suppressions, &raw_hash) {
+    if suppressed(suppressions, &claim.front.id)
+        || suppressed(suppressions, &raw_hash)
+        || suppressed(suppressions, &claim.front.claim_sha256)
+    {
         return false;
     }
 

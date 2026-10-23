@@ -24,16 +24,30 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
+pub mod bank;
 pub mod index;
 pub mod read;
 pub mod vectors;
 
+pub use bank::{
+    facets_of, BankFacetView, BankItem, BankStore, FACETS, FACET_EXPERIENCE, FACET_OPINIONS,
+    FACET_REFLECTIONS, FACET_WORLD,
+};
 pub use index::{IndexFreshness, IndexManifest, IndexRebuildReport, ProjectionIndex};
 pub use read::{
     is_claim_visible, speaker_of, EvidenceDetail, ExplainRelations, FileBundleResult,
     FileReader, FileSearchHit, MemoryExplain,
 };
 pub use vectors::{cosine_similarity, VectorEntryMeta, VectorManifest, VectorRecord, VectorStore};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpkeepReport {
+    pub new_evidence_processed: usize,
+    pub expired_materialized: usize,
+    pub derived_refreshed: bool,
+    pub index_rebuilt: bool,
+    pub files_modified: usize,
+}
 
 const SCOPE_FILE: &str = "SCOPE.toml";
 const SUPPRESSIONS_FILE: &str = "SUPPRESSIONS";
@@ -313,6 +327,7 @@ impl FileStore {
     ) -> Result<Option<EvidenceBlock>, StoreError> {
         validate_uuid(evidence_id)?;
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         for block in self.all_evidence_dir(&scope_dir)? {
             if block.header.id == evidence_id {
                 if self.is_suppressed_dir(&scope_dir, &block.header.content_sha256)? {
@@ -331,6 +346,7 @@ impl FileStore {
     ) -> Result<Vec<EvidenceBlock>, StoreError> {
         validate_date(date)?;
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let path = scope_dir.join("memory").join(format!("{date}.md"));
         if !path.exists() {
             return Ok(Vec::new());
@@ -354,7 +370,7 @@ impl FileStore {
         kind: MemoryKind,
     ) -> Result<RememberOutcome, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
-        let _lock = self.lock_scope(&scope_dir)?;
+        let _lock = self.lock_scope_exclusive(&scope_dir)?;
         self.remember_locked(&scope_dir, origin, user_evidence_id, quote, kind, None)
     }
 
@@ -369,14 +385,14 @@ impl FileStore {
     ) -> Result<RememberOutcome, StoreError> {
         validate_uuid(old_memory_id)?;
         let scope_dir = self.scope_dir(scope)?;
-        let _lock = self.lock_scope(&scope_dir)?;
+        let _lock = self.lock_scope_exclusive(&scope_dir)?;
         let mut old = self
             .read_claim_file(&scope_dir, old_memory_id)?
             .ok_or(StoreError::ClaimNotFound)?;
         if old.front.status != "active" {
             return Err(StoreError::VersionConflict);
         }
-        let outcome = self.remember_locked(
+        let doc_or_dedup = self.prepare_new_claim(
             &scope_dir,
             origin,
             user_evidence_id,
@@ -384,15 +400,33 @@ impl FileStore {
             kind,
             Some(old_memory_id),
         )?;
+        let new_claim = match doc_or_dedup {
+            Ok(c) => c,
+            Err(dedup) => return Ok(dedup),
+        };
+        let new_id = new_claim.front.id.clone();
+
+        // Update old claim
         old.front.status = "superseded".into();
         old.front.version += 1;
         old.front.updated_at = now();
         old.front.reason_code = "superseded".into();
-        let old_path = claim_path(&scope_dir, old_memory_id)?;
-        atomic_replace(&old_path, &old.to_bytes()?)?;
+
+        // Atomically replace new and old claims together within the same lock
+        atomic_replace(&claim_path(&scope_dir, &new_id)?, &new_claim.to_bytes()?)?;
+        atomic_replace(&claim_path(&scope_dir, old_memory_id)?, &old.to_bytes()?)?;
+
+        // Materialize overview & bank facets & rebuild projection index
         self.write_overview(&scope_dir)?;
+        let all_claims = self.all_claims_dir(&scope_dir)?;
+        let suppressions = self.read_suppressions(&scope_dir)?;
+        let _ = BankStore::refresh_all(&scope_dir, &all_claims, &suppressions, &now());
         let _ = ProjectionIndex::rebuild(&scope_dir);
-        Ok(outcome)
+
+        Ok(RememberOutcome::Created {
+            memory_id: new_id,
+            version: 1,
+        })
     }
 
     pub fn get_claim(
@@ -402,12 +436,14 @@ impl FileStore {
     ) -> Result<Option<ClaimDocument>, StoreError> {
         validate_uuid(memory_id)?;
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let Some(claim) = self.read_claim_file(&scope_dir, memory_id)? else {
             return Ok(None);
         };
         if claim.front.status == "forgotten"
             || self.is_suppressed_dir(&scope_dir, &raw_content_hash(&claim.body))?
             || self.is_suppressed_dir(&scope_dir, memory_id)?
+            || self.is_suppressed_dir(&scope_dir, &claim.front.claim_sha256)?
         {
             return Ok(None);
         }
@@ -432,6 +468,7 @@ impl FileStore {
     ) -> Result<Option<ClaimDocument>, StoreError> {
         validate_uuid(memory_id)?;
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let Some(claim) = self.read_claim_file(&scope_dir, memory_id)? else {
             return Ok(None);
         };
@@ -447,13 +484,14 @@ impl FileStore {
     /// Rebuild the projection index for the given scope.
     pub fn rebuild_index(&self, scope: &ScopeKey) -> Result<IndexRebuildReport, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
-        let _lock = self.lock_scope(&scope_dir)?;
+        let _lock = self.lock_scope_exclusive(&scope_dir)?;
         ProjectionIndex::rebuild(&scope_dir)
     }
 
     /// Check freshness of the projection index for the given scope.
     pub fn check_index_freshness(&self, scope: &ScopeKey) -> Result<IndexFreshness, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         ProjectionIndex::check_freshness(&scope_dir)
     }
 
@@ -469,7 +507,7 @@ impl FileStore {
         vector: &[f32],
     ) -> Result<(), StoreError> {
         let scope_dir = self.scope_dir(scope)?;
-        let _lock = self.lock_scope(&scope_dir)?;
+        let _lock = self.lock_scope_exclusive(&scope_dir)?;
         let vectors_dir = ProjectionIndex::vectors_dir(&scope_dir);
         VectorStore::upsert_vector(
             &vectors_dir,
@@ -493,6 +531,7 @@ impl FileStore {
     ) -> Result<Option<MemoryExplain>, StoreError> {
         validate_uuid(memory_id)?;
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let all_evidence = self.all_evidence_dir(&scope_dir)?;
         let all_claims = self.all_claims_dir(&scope_dir)?;
         let suppressions = self.read_suppressions(&scope_dir)?;
@@ -516,6 +555,7 @@ impl FileStore {
         query_vector: Option<&[f32]>,
     ) -> Result<(Vec<FileSearchHit>, bool), StoreError> {
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let all_evidence = self.all_evidence_dir(&scope_dir)?;
         let all_claims = self.all_claims_dir(&scope_dir)?;
         let suppressions = self.read_suppressions(&scope_dir)?;
@@ -554,6 +594,7 @@ impl FileStore {
         compact_max_items: Option<usize>,
     ) -> Result<FileBundleResult, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let overview = self.get_overview(scope)?;
         let all_evidence = self.all_evidence_dir(&scope_dir)?;
         let all_claims = self.all_claims_dir(&scope_dir)?;
@@ -575,6 +616,7 @@ impl FileStore {
     /// Read non-forgotten, non-suppressed claims in deterministic creation order.
     pub fn list_claims(&self, scope: &ScopeKey) -> Result<Vec<ClaimDocument>, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let suppressions = self.read_suppressions(&scope_dir)?;
         let mut claims = self
             .all_claims_dir(&scope_dir)?
@@ -583,6 +625,7 @@ impl FileStore {
                 c.front.status != "forgotten"
                     && !suppressed(&suppressions, &c.front.id)
                     && !suppressed(&suppressions, &raw_content_hash(&c.body))
+                    && !suppressed(&suppressions, &c.front.claim_sha256)
             })
             .collect::<Vec<_>>();
         claims.sort_by(|a, b| a.front.created_at.cmp(&b.front.created_at));
@@ -595,6 +638,7 @@ impl FileStore {
         scope: &ScopeKey,
     ) -> Result<Option<memory_file_format::overview::MemoryOverview>, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let path = scope_dir.join("MEMORY.md");
         if !path.exists() {
             return Ok(None);
@@ -606,36 +650,124 @@ impl FileStore {
         )?))
     }
 
-    /// F2' checkpoint only: mark the claim forgotten and add one simple
-    /// `(object id, raw content hash)` suppression line. F4' owns full closure.
-    /// Calling forget on an already forgotten claim is idempotent and does not bump version.
+    /// Read a derived bank facet view with real-time freshness verification.
+    pub fn get_bank_facet(
+        &self,
+        scope: &ScopeKey,
+        facet: &str,
+    ) -> Result<BankFacetView, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
+        let all_claims = self.all_claims_dir(&scope_dir)?;
+        let suppressions = self.read_suppressions(&scope_dir)?;
+        BankStore::read_view(&scope_dir, facet, &all_claims, &suppressions, &now())
+    }
+
+    /// F4' full forget closure: mark claim forgotten, write tombstone suppressions
+    /// (object id, raw content hash, normalized claim key, evidence sources),
+    /// rewrite MEMORY.md and bank facets, and purge projection indexes.
     pub fn forget_claim(&self, scope: &ScopeKey, memory_id: &str) -> Result<(), StoreError> {
         validate_uuid(memory_id)?;
         let scope_dir = self.scope_dir(scope)?;
-        let _lock = self.lock_scope(&scope_dir)?;
+        let _lock = self.lock_scope_exclusive(&scope_dir)?;
         let mut claim = self
             .read_claim_file(&scope_dir, memory_id)?
             .ok_or(StoreError::ClaimNotFound)?;
-        let content_hash = raw_content_hash(&claim.body);
+
         let mut records = self.read_suppressions(&scope_dir)?;
+
+        // 1. memory_id and raw content hash
+        let content_hash = raw_content_hash(&claim.body);
         if !records.iter().any(|r| r.object_id == memory_id) {
             records.push(Suppression {
                 object_id: memory_id.to_owned(),
                 content_sha256: content_hash,
             });
-            self.write_suppressions(&scope_dir, &records)?;
         }
-        if claim.front.status == "forgotten" {
-            return Ok(());
+        // 2. Normalized claim key
+        let norm_hash = sha256_hex(claim.front.normalized_claim.as_bytes());
+        if !records.iter().any(|r| r.object_id == claim.front.claim_sha256) {
+            records.push(Suppression {
+                object_id: claim.front.claim_sha256.clone(),
+                content_sha256: norm_hash,
+            });
         }
-        claim.front.status = "forgotten".into();
-        claim.front.version += 1;
-        claim.front.updated_at = now();
-        claim.front.reason_code = "forgotten".into();
-        atomic_replace(&claim_path(&scope_dir, memory_id)?, &claim.to_bytes()?)?;
+        // 3. Evidence sources
+        for ev in &claim.front.evidence {
+            if !records.iter().any(|r| r.object_id == ev.id) {
+                records.push(Suppression {
+                    object_id: ev.id.clone(),
+                    content_sha256: ev.content_sha256.clone(),
+                });
+            }
+        }
+        self.write_suppressions(&scope_dir, &records)?;
+
+        if claim.front.status != "forgotten" {
+            claim.front.status = "forgotten".into();
+            claim.front.version += 1;
+            claim.front.updated_at = now();
+            claim.front.reason_code = "forgotten".into();
+            atomic_replace(&claim_path(&scope_dir, memory_id)?, &claim.to_bytes()?)?;
+        }
+
         self.write_overview(&scope_dir)?;
+        let all_claims = self.all_claims_dir(&scope_dir)?;
+        let _ = BankStore::refresh_all(&scope_dir, &all_claims, &records, &now());
         let _ = ProjectionIndex::rebuild(&scope_dir);
         Ok(())
+    }
+
+    /// Check if a specific ID or content hash is currently suppressed.
+    pub fn is_suppressed(&self, scope: &ScopeKey, key_or_hash: &str) -> Result<bool, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
+        self.is_suppressed_dir(&scope_dir, key_or_hash)
+    }
+
+    /// Extraction-side suppression check (doc8/06 rule 7): verify whether a candidate
+    /// memory extracted from an evidence block is blocked by suppressions.
+    pub fn check_extraction_suppressed(
+        &self,
+        scope: &ScopeKey,
+        evidence_id: &str,
+        kind: MemoryKind,
+        claim_text: &str,
+    ) -> Result<bool, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
+        let suppressions = self.read_suppressions(&scope_dir)?;
+
+        if suppressed(&suppressions, evidence_id) {
+            return Ok(true);
+        }
+        if let Some(ev) = self.get_evidence(scope, evidence_id)? {
+            if suppressed(&suppressions, &ev.header.content_sha256) {
+                return Ok(true);
+            }
+        }
+        let raw_hash = raw_content_hash(claim_text);
+        if suppressed(&suppressions, &raw_hash) {
+            return Ok(true);
+        }
+        let c_sha256 = claim_sha256(kind, claim_text);
+        if suppressed(&suppressions, &c_sha256) {
+            return Ok(true);
+        }
+        let norm_hash = sha256_hex(normalize_v1(claim_text).as_bytes());
+        if suppressed(&suppressions, &norm_hash) {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Deterministic background upkeep: processes unprocessed evidence into the ledger,
+    /// materializes expired claims, refreshes derived views (MEMORY.md and bank facets),
+    /// and ensures index consistency. Fully idempotent with zero action when no signals exist.
+    pub fn upkeep(&self, scope: &ScopeKey) -> Result<UpkeepReport, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_exclusive(&scope_dir)?;
+        self.upkeep_locked(&scope_dir)
     }
 
     pub fn get_soul(
@@ -644,6 +776,7 @@ impl FileStore {
         agent_id: &str,
     ) -> Result<Option<SoulDocument>, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let path = soul_dir(&scope_dir, agent_id)?.join("SOUL.md");
         if !path.exists() {
             return Ok(None);
@@ -724,6 +857,7 @@ impl FileStore {
             return Ok(None);
         }
         let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope_shared(&scope_dir)?;
         let path = soul_dir(&scope_dir, agent_id)?
             .join("history")
             .join(format!("{version}.md"));
@@ -734,7 +868,7 @@ impl FileStore {
         Ok(Some(SoulDocument::parse(&read_bytes(&path)?)?))
     }
 
-    fn remember_locked(
+    fn prepare_new_claim(
         &self,
         scope_dir: &Path,
         origin: &Origin,
@@ -742,7 +876,7 @@ impl FileStore {
         quote: &str,
         kind: MemoryKind,
         supersedes: Option<&str>,
-    ) -> Result<RememberOutcome, StoreError> {
+    ) -> Result<Result<ClaimDocument, RememberOutcome>, StoreError> {
         validate_uuid(evidence_id)?;
         let evidence = self
             .all_evidence_dir(scope_dir)?
@@ -780,27 +914,35 @@ impl FileStore {
         {
             return Err(StoreError::Suppressed);
         }
-        // F1 claim bodies are canonical containers around the original UTF-8
-        // bytes. Normalization is metadata-only and must not rewrite the body.
         let body = quote.to_owned();
         let raw_hash = raw_content_hash(&body);
         if self.is_suppressed_dir(scope_dir, &raw_hash)? {
             return Err(StoreError::Suppressed);
         }
+        let c_sha256 = claim_sha256(kind, &body);
+        if self.is_suppressed_dir(scope_dir, &c_sha256)? {
+            return Err(StoreError::Suppressed);
+        }
+        let norm_hash = sha256_hex(normalize_v1(&body).as_bytes());
+        if self.is_suppressed_dir(scope_dir, &norm_hash)? {
+            return Err(StoreError::Suppressed);
+        }
+
         for existing in self.all_claims_dir(scope_dir)? {
             if supersedes == Some(existing.front.id.as_str()) {
                 continue;
             }
             if existing.front.status == "active"
                 && existing.front.kind == kind.as_str()
-                && existing.front.claim_sha256 == claim_sha256(kind, &body)
+                && existing.front.claim_sha256 == c_sha256
             {
-                return Ok(RememberOutcome::Dedup {
+                return Ok(Err(RememberOutcome::Dedup {
                     memory_id: existing.front.id,
                     version: existing.front.version,
-                });
+                }));
             }
         }
+
         let id = Uuid::now_v7().to_string();
         let time = now();
         let claim = ClaimDocument {
@@ -811,7 +953,7 @@ impl FileStore {
                 status: "active".into(),
                 version: 1,
                 source_class: "user_explicit".into(),
-                claim_sha256: claim_sha256(kind, &body),
+                claim_sha256: c_sha256,
                 normalized_claim: normalize_v1(&body),
                 occurred_at: Some(evidence.header.occurred_at.clone()),
                 valid_from: None,
@@ -836,32 +978,93 @@ impl FileStore {
             },
             body,
         };
-        atomic_replace(&claim_path(scope_dir, &id)?, &claim.to_bytes()?)?;
-        self.write_overview(scope_dir)?;
-        let _ = ProjectionIndex::rebuild(scope_dir);
-        Ok(RememberOutcome::Created {
-            memory_id: id,
-            version: 1,
-        })
+        Ok(Ok(claim))
+    }
+
+    fn remember_locked(
+        &self,
+        scope_dir: &Path,
+        origin: &Origin,
+        evidence_id: &str,
+        quote: &str,
+        kind: MemoryKind,
+        supersedes: Option<&str>,
+    ) -> Result<RememberOutcome, StoreError> {
+        match self.prepare_new_claim(scope_dir, origin, evidence_id, quote, kind, supersedes)? {
+            Ok(claim) => {
+                let id = claim.front.id.clone();
+                atomic_replace(&claim_path(scope_dir, &id)?, &claim.to_bytes()?)?;
+                self.write_overview(scope_dir)?;
+                let all_claims = self.all_claims_dir(scope_dir)?;
+                let suppressions = self.read_suppressions(scope_dir)?;
+                let _ = BankStore::refresh_all(scope_dir, &all_claims, &suppressions, &now());
+                let _ = ProjectionIndex::rebuild(scope_dir);
+                Ok(RememberOutcome::Created {
+                    memory_id: id,
+                    version: 1,
+                })
+            }
+            Err(dedup) => Ok(dedup),
+        }
     }
 
     fn write_overview(&self, scope_dir: &Path) -> Result<(), StoreError> {
         let suppressions = self.read_suppressions(scope_dir)?;
-        let mut claims = self
-            .all_claims_dir(scope_dir)?
-            .into_iter()
+        let claims = self.all_claims_dir(scope_dir)?;
+        let _ = self.refresh_overview_if_changed(scope_dir, &claims, &suppressions)?;
+        Ok(())
+    }
+
+    fn refresh_overview_if_changed(
+        &self,
+        scope_dir: &Path,
+        claims: &[ClaimDocument],
+        suppressions: &[Suppression],
+    ) -> Result<bool, StoreError> {
+        let mut active_claims = claims
+            .iter()
             .filter(|c| {
                 c.front.status == "active"
-                    && !suppressed(&suppressions, &c.front.id)
-                    && !suppressed(&suppressions, &raw_content_hash(&c.body))
+                    && !suppressed(suppressions, &c.front.id)
+                    && !suppressed(suppressions, &raw_content_hash(&c.body))
+                    && !suppressed(suppressions, &c.front.claim_sha256)
             })
+            .cloned()
             .collect::<Vec<_>>();
-        claims.sort_by(|a, b| a.front.created_at.cmp(&b.front.created_at));
+        active_claims.sort_by(|a, b| a.front.created_at.cmp(&b.front.created_at));
+
+        let overview_path = scope_dir.join("MEMORY.md");
+        let existing_overview = if overview_path.exists() {
+            match read_bytes(&overview_path) {
+                Ok(bytes) => memory_file_format::overview::MemoryOverview::parse(&bytes).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let same_items = if let Some(ref ov) = existing_overview {
+            if ov.curated.len() == active_claims.len() {
+                ov.curated
+                    .iter()
+                    .zip(active_claims.iter())
+                    .all(|(r, c)| r.memory_id == c.front.id && r.version == c.front.version)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if same_items {
+            return Ok(false);
+        }
+
         let mut text = format!(
             "---\nriko_format: memory_overview_v1\ndomain_id: user_main\nsource_generation: direct\ngenerated_at: {}\n---\n\n# Memory\n\n## Curated\n",
             now()
         );
-        for claim in claims {
+        for claim in active_claims {
             text.push_str(&format!(
                 "\n<!-- riko:ref memory={} version={} -->\n- {}\n",
                 claim.front.id,
@@ -870,10 +1073,102 @@ impl FileStore {
             ));
         }
         text.push_str("\n## Compact\n");
-        // Parse before commit so MEMORY.md always conforms to the F1 grammar.
         memory_file_format::overview::MemoryOverview::parse(text.as_bytes())?;
-        atomic_replace(&scope_dir.join("MEMORY.md"), text.as_bytes())?;
-        Ok(())
+        atomic_replace(&overview_path, text.as_bytes())?;
+        Ok(true)
+    }
+
+    fn upkeep_locked(&self, scope_dir: &Path) -> Result<UpkeepReport, StoreError> {
+        let mut files_modified = 0usize;
+        let now_time = now();
+
+        // 1. Scan unprocessed evidence -> update LEDGER
+        let ledger_path = scope_dir.join("memory").join("LEDGER");
+        let mut processed_set = std::collections::HashSet::new();
+        if ledger_path.exists() {
+            self.reject_symlink(&ledger_path)?;
+            let bytes = read_bytes(&ledger_path)?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| StoreError::Metadata("non-utf8 ledger".into()))?;
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                validate_uuid(line)?;
+                processed_set.insert(line.to_string());
+            }
+        }
+        let all_evidence = self.all_evidence_dir(scope_dir)?;
+        let mut new_evidence_count = 0usize;
+        for ev in &all_evidence {
+            if processed_set.insert(ev.header.id.clone()) {
+                new_evidence_count += 1;
+            }
+        }
+        if new_evidence_count > 0 {
+            let mut sorted: Vec<&String> = processed_set.iter().collect();
+            sorted.sort();
+            let mut ledger_content = String::new();
+            for id in sorted {
+                ledger_content.push_str(id);
+                ledger_content.push('\n');
+            }
+            atomic_replace(&ledger_path, ledger_content.as_bytes())?;
+            files_modified += 1;
+        }
+
+        // 2. Materialize expired claims (valid_until passed -> status = "expired")
+        let mut expired_materialized = 0usize;
+        let mut all_claims = self.all_claims_dir(scope_dir)?;
+        for claim in &mut all_claims {
+            if claim.front.status == "active" {
+                if let Some(ref until) = claim.front.valid_until {
+                    if until.as_str() <= now_time.as_str() {
+                        claim.front.status = "expired".into();
+                        claim.front.version += 1;
+                        claim.front.updated_at = now_time.clone();
+                        claim.front.reason_code = "expired".into();
+                        let path = claim_path(scope_dir, &claim.front.id)?;
+                        atomic_replace(&path, &claim.to_bytes()?)?;
+                        expired_materialized += 1;
+                        files_modified += 1;
+                    }
+                }
+            }
+        }
+
+        // 3. Refresh derived views (MEMORY.md and bank facets)
+        let suppressions = self.read_suppressions(scope_dir)?;
+        let mut derived_refreshed = false;
+
+        // 3.1 MEMORY.md
+        let overview_modified =
+            self.refresh_overview_if_changed(scope_dir, &all_claims, &suppressions)?;
+        if overview_modified {
+            derived_refreshed = true;
+            files_modified += 1;
+        }
+
+        // 3.2 Bank facets
+        let bank_modified =
+            BankStore::refresh_all(scope_dir, &all_claims, &suppressions, &now_time)?;
+        if bank_modified {
+            derived_refreshed = true;
+            files_modified += 1;
+        }
+
+        // 4. Index freshness and rebuild
+        let mut index_rebuilt = false;
+        let freshness = ProjectionIndex::check_freshness(scope_dir)?;
+        if freshness != IndexFreshness::Fresh {
+            ProjectionIndex::rebuild(scope_dir)?;
+            index_rebuilt = true;
+        }
+
+        Ok(UpkeepReport {
+            new_evidence_processed: new_evidence_count,
+            expired_materialized,
+            derived_refreshed,
+            index_rebuilt,
+            files_modified,
+        })
     }
 
     fn scope_dir(&self, scope: &ScopeKey) -> Result<PathBuf, StoreError> {
@@ -904,6 +1199,10 @@ impl FileStore {
     }
 
     fn lock_scope(&self, scope_dir: &Path) -> Result<ScopeLock, StoreError> {
+        self.lock_scope_exclusive(scope_dir)
+    }
+
+    fn lock_scope_exclusive(&self, scope_dir: &Path) -> Result<ScopeLock, StoreError> {
         let path = scope_dir.join("LOCK");
         if path.exists() {
             self.reject_symlink(&path)?;
@@ -914,6 +1213,20 @@ impl FileStore {
             .create(true)
             .open(path)?;
         file.lock_exclusive()?;
+        Ok(ScopeLock { file })
+    }
+
+    fn lock_scope_shared(&self, scope_dir: &Path) -> Result<ScopeLock, StoreError> {
+        let path = scope_dir.join("LOCK");
+        if path.exists() {
+            self.reject_symlink(&path)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        file.lock_shared()?;
         Ok(ScopeLock { file })
     }
 
@@ -982,7 +1295,7 @@ impl FileStore {
                 let (object_id, hash) = line
                     .split_once('\t')
                     .ok_or_else(|| StoreError::Metadata("bad suppression record".into()))?;
-                validate_uuid(object_id)?;
+                validate_id_or_hash(object_id)?;
                 validate_hash(hash)?;
                 Ok(Suppression {
                     object_id: object_id.to_owned(),
@@ -1102,6 +1415,16 @@ fn timestamp(value: &DateTime<Utc>) -> String {
 
 fn now() -> String {
     timestamp(&Utc::now())
+}
+
+fn validate_id_or_hash(value: &str) -> Result<(), StoreError> {
+    if validate_uuid(value).is_ok() || validate_hash(value).is_ok() {
+        Ok(())
+    } else {
+        Err(StoreError::Metadata(format!(
+            "invalid suppression id or hash: {value}"
+        )))
+    }
 }
 
 fn validate_uuid(value: &str) -> Result<(), StoreError> {

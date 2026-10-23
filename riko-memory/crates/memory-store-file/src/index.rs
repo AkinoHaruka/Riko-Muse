@@ -123,6 +123,27 @@ impl ProjectionIndex {
             fingerprints.insert("memory/alignment.md".to_string(), sha256_hex(&bytes));
         }
 
+        // 6. Upkeep ledger if present
+        let ledger = scope_dir.join("memory/LEDGER");
+        if ledger.exists() {
+            let bytes = read_bytes(&ledger)?;
+            fingerprints.insert("memory/LEDGER".to_string(), sha256_hex(&bytes));
+        }
+
+        // 7. Bank facets if present
+        let bank_dir = scope_dir.join("memory/bank");
+        if bank_dir.exists() {
+            for entry in fs::read_dir(&bank_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".md") {
+                    let bytes = read_bytes(&entry.path())?;
+                    let rel = format!("memory/bank/{name}");
+                    fingerprints.insert(rel, sha256_hex(&bytes));
+                }
+            }
+        }
+
         Ok(fingerprints)
     }
 
@@ -270,7 +291,10 @@ impl ProjectionIndex {
                     continue;
                 }
                 let raw_hash = raw_content_hash(&claim.body);
-                if suppressed(&suppressions, &claim.front.id) || suppressed(&suppressions, &raw_hash) {
+                if suppressed(&suppressions, &claim.front.id)
+                    || suppressed(&suppressions, &raw_hash)
+                    || suppressed(&suppressions, &claim.front.claim_sha256)
+                {
                     continue;
                 }
 
