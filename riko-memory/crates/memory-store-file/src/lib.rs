@@ -24,6 +24,17 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
+pub mod index;
+pub mod read;
+pub mod vectors;
+
+pub use index::{IndexFreshness, IndexManifest, IndexRebuildReport, ProjectionIndex};
+pub use read::{
+    is_claim_visible, speaker_of, EvidenceDetail, ExplainRelations, FileBundleResult,
+    FileReader, FileSearchHit, MemoryExplain,
+};
+pub use vectors::{cosine_similarity, VectorEntryMeta, VectorManifest, VectorRecord, VectorStore};
+
 const SCOPE_FILE: &str = "SCOPE.toml";
 const SUPPRESSIONS_FILE: &str = "SUPPRESSIONS";
 
@@ -94,9 +105,9 @@ struct ScopeIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Suppression {
-    object_id: String,
-    content_sha256: String,
+pub struct Suppression {
+    pub object_id: String,
+    pub content_sha256: String,
 }
 
 /// A filesystem-backed store. It contains no in-process mutex: independent
@@ -291,6 +302,7 @@ impl FileStore {
         };
         note.blocks.push(block);
         atomic_replace(&path, &note.to_bytes()?)?;
+        let _ = ProjectionIndex::rebuild(&scope_dir);
         Ok(IngestOutcome::Recorded(id))
     }
 
@@ -379,6 +391,7 @@ impl FileStore {
         let old_path = claim_path(&scope_dir, old_memory_id)?;
         atomic_replace(&old_path, &old.to_bytes()?)?;
         self.write_overview(&scope_dir)?;
+        let _ = ProjectionIndex::rebuild(&scope_dir);
         Ok(outcome)
     }
 
@@ -399,6 +412,164 @@ impl FileStore {
             return Ok(None);
         }
         Ok(Some(claim))
+    }
+
+    /// Read a claim with full visibility predicates (valid_until, active status, unsuppressed valid source).
+    pub fn get_memory(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+    ) -> Result<Option<ClaimDocument>, StoreError> {
+        self.get_claim_visible(scope, memory_id, false)
+    }
+
+    /// Read a claim applying visibility predicates with optional history support.
+    pub fn get_claim_visible(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+        include_history: bool,
+    ) -> Result<Option<ClaimDocument>, StoreError> {
+        validate_uuid(memory_id)?;
+        let scope_dir = self.scope_dir(scope)?;
+        let Some(claim) = self.read_claim_file(&scope_dir, memory_id)? else {
+            return Ok(None);
+        };
+        let suppressions = self.read_suppressions(&scope_dir)?;
+        let all_evidence = self.all_evidence_dir(&scope_dir)?;
+        let now_time = now();
+        if !is_claim_visible(&claim, &suppressions, &all_evidence, include_history, &now_time) {
+            return Ok(None);
+        }
+        Ok(Some(claim))
+    }
+
+    /// Rebuild the projection index for the given scope.
+    pub fn rebuild_index(&self, scope: &ScopeKey) -> Result<IndexRebuildReport, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope(&scope_dir)?;
+        ProjectionIndex::rebuild(&scope_dir)
+    }
+
+    /// Check freshness of the projection index for the given scope.
+    pub fn check_index_freshness(&self, scope: &ScopeKey) -> Result<IndexFreshness, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        ProjectionIndex::check_freshness(&scope_dir)
+    }
+
+    /// Upsert a vector embedding for an object and reconcile the index.
+    pub fn set_vector(
+        &self,
+        scope: &ScopeKey,
+        object_id: &str,
+        object_kind: &str,
+        version: u64,
+        content_sha256: &str,
+        model_id: &str,
+        vector: &[f32],
+    ) -> Result<(), StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let _lock = self.lock_scope(&scope_dir)?;
+        let vectors_dir = ProjectionIndex::vectors_dir(&scope_dir);
+        VectorStore::upsert_vector(
+            &vectors_dir,
+            object_id,
+            object_kind,
+            version,
+            content_sha256,
+            model_id,
+            vector,
+        )?;
+        ProjectionIndex::rebuild(&scope_dir)?;
+        Ok(())
+    }
+
+    /// Explain a memory claim with verbatim spans and relation linkage.
+    pub fn explain_memory(
+        &self,
+        scope: &ScopeKey,
+        memory_id: &str,
+        include_history: bool,
+    ) -> Result<Option<MemoryExplain>, StoreError> {
+        validate_uuid(memory_id)?;
+        let scope_dir = self.scope_dir(scope)?;
+        let all_evidence = self.all_evidence_dir(&scope_dir)?;
+        let all_claims = self.all_claims_dir(&scope_dir)?;
+        let suppressions = self.read_suppressions(&scope_dir)?;
+        FileReader::explain(
+            &scope_dir,
+            memory_id,
+            include_history,
+            &all_evidence,
+            &all_claims,
+            &suppressions,
+        )
+    }
+
+    /// Search memories using hybrid lexical + vector RRF, with stale index fallback.
+    pub fn search_memories(
+        &self,
+        scope: &ScopeKey,
+        query: &str,
+        limit: usize,
+        include_history: bool,
+        query_vector: Option<&[f32]>,
+    ) -> Result<(Vec<FileSearchHit>, bool), StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let all_evidence = self.all_evidence_dir(&scope_dir)?;
+        let all_claims = self.all_claims_dir(&scope_dir)?;
+        let suppressions = self.read_suppressions(&scope_dir)?;
+        FileReader::search(
+            &scope_dir,
+            query,
+            limit,
+            include_history,
+            query_vector,
+            &all_evidence,
+            &all_claims,
+            &suppressions,
+        )
+    }
+
+    /// Build context bundle with 4-segment budget (compact → alignment → relationships → retrieved).
+    pub fn context_bundle(
+        &self,
+        scope: &ScopeKey,
+        agent_id: &str,
+        query: &str,
+        alignment_doc: Option<&str>,
+        relationships: Option<&[(String, String, String)]>,
+    ) -> Result<FileBundleResult, StoreError> {
+        self.context_bundle_with_limits(scope, agent_id, query, alignment_doc, relationships, None)
+    }
+
+    /// Build context bundle with optional item limit on compact segment.
+    pub fn context_bundle_with_limits(
+        &self,
+        scope: &ScopeKey,
+        agent_id: &str,
+        query: &str,
+        alignment_doc: Option<&str>,
+        relationships: Option<&[(String, String, String)]>,
+        compact_max_items: Option<usize>,
+    ) -> Result<FileBundleResult, StoreError> {
+        let scope_dir = self.scope_dir(scope)?;
+        let overview = self.get_overview(scope)?;
+        let all_evidence = self.all_evidence_dir(&scope_dir)?;
+        let all_claims = self.all_claims_dir(&scope_dir)?;
+        let suppressions = self.read_suppressions(&scope_dir)?;
+        FileReader::context_bundle(
+            &scope_dir,
+            agent_id,
+            query,
+            overview.as_ref(),
+            alignment_doc,
+            relationships,
+            compact_max_items,
+            &all_evidence,
+            &all_claims,
+            &suppressions,
+        )
     }
 
     /// Read non-forgotten, non-suppressed claims in deterministic creation order.
@@ -462,7 +633,9 @@ impl FileStore {
         claim.front.updated_at = now();
         claim.front.reason_code = "forgotten".into();
         atomic_replace(&claim_path(&scope_dir, memory_id)?, &claim.to_bytes()?)?;
-        self.write_overview(&scope_dir)
+        self.write_overview(&scope_dir)?;
+        let _ = ProjectionIndex::rebuild(&scope_dir);
+        Ok(())
     }
 
     pub fn get_soul(
@@ -665,6 +838,7 @@ impl FileStore {
         };
         atomic_replace(&claim_path(scope_dir, &id)?, &claim.to_bytes()?)?;
         self.write_overview(scope_dir)?;
+        let _ = ProjectionIndex::rebuild(scope_dir);
         Ok(RememberOutcome::Created {
             memory_id: id,
             version: 1,

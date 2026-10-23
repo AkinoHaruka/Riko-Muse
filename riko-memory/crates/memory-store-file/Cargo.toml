@@ -6,18 +6,22 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+memory-contract.workspace = true
 memory-domain.workspace = true
 memory-file-format.workspace = true
+memory-recall.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-serde.workspace = true
+serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 sha2 = "0.10"
 hex = "0.4"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 uuid = { version = "1", features = ["v7"] }
 rand = "0.8"
 base64 = "0.22"
 fs2 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

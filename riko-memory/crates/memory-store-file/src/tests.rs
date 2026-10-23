@@ -642,3 +642,551 @@ fn concurrent_mixed_operations_do_not_corrupt_scope() {
         assert_eq!(soul.body, format!("soul-body-{i}"));
     }
 }
+
+#[test]
+fn golden_search_lexical_vector_and_hybrid_rrf() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            1,
+            "user",
+            "user",
+            &at(1),
+            "用户喜欢在晚上九点阅读科技书籍，特别是操作系统与编译器相关的书",
+        )
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(
+            &scope,
+            &origin,
+            &ev1,
+            "用户喜欢在晚上九点阅读科技书籍",
+            MemoryKind::Preference,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            2,
+            "user",
+            "user",
+            &at(2),
+            "Rust memory management provides safety without garbage collection",
+        )
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember(
+            &scope,
+            &origin,
+            &ev2,
+            "Rust memory management provides safety without garbage collection",
+            MemoryKind::Fact,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Also a conversation entry in daily evidence
+    let _ev3 = store
+        .record_evidence(
+            &scope,
+            &origin,
+            3,
+            "user",
+            "user",
+            &at(3),
+            "今天早上和朋友一起讨论了分布式存储系统架构",
+        )
+        .unwrap();
+
+    // 1. Lexical search for Chinese
+    let (hits_cn, degraded) = store
+        .search_memories(&scope, "科技书籍", 10, false, None)
+        .unwrap();
+    assert!(!degraded);
+    assert!(!hits_cn.is_empty());
+    assert_eq!(hits_cn[0].id, c1);
+    assert!(hits_cn[0].channels.contains(&"lexical".to_string()));
+
+    // 2. Lexical search for Latin
+    let (hits_en, degraded) = store
+        .search_memories(&scope, "garbage collection", 10, false, None)
+        .unwrap();
+    assert!(!degraded);
+    assert!(!hits_en.is_empty());
+    assert_eq!(hits_en[0].id, c2);
+    assert!(hits_en[0].channels.contains(&"lexical".to_string()));
+
+    // 3. Conversation entry search (entries merged into search results)
+    let (hits_entry, degraded) = store
+        .search_memories(&scope, "分布式存储", 10, false, None)
+        .unwrap();
+    assert!(!degraded);
+    assert!(!hits_entry.is_empty());
+    assert_eq!(hits_entry[0].kind, "entry");
+
+    // 4. Vector search with injected embeddings
+    let vec1 = vec![0.9, 0.1, 0.0, 0.0];
+    let vec2 = vec![0.0, 0.1, 0.9, 0.0];
+    store
+        .set_vector(
+            &scope,
+            &c1,
+            "claim",
+            1,
+            &raw_content_hash("用户喜欢在晚上九点阅读科技书籍"),
+            "test-emb",
+            &vec1,
+        )
+        .unwrap();
+    store
+        .set_vector(
+            &scope,
+            &c2,
+            "claim",
+            1,
+            &raw_content_hash("Rust memory management provides safety without garbage collection"),
+            "test-emb",
+            &vec2,
+        )
+        .unwrap();
+
+    let q_vec = vec![0.85, 0.15, 0.0, 0.0];
+    // Query that semantically prefers c1
+    let (hits_hybrid, degraded) = store
+        .search_memories(&scope, "阅读", 10, false, Some(&q_vec))
+        .unwrap();
+    assert!(!degraded);
+    assert!(!hits_hybrid.is_empty());
+    assert_eq!(hits_hybrid[0].id, c1);
+    assert!(hits_hybrid[0].channels.contains(&"lexical".to_string()));
+    assert!(hits_hybrid[0].channels.contains(&"semantic".to_string()));
+}
+
+#[test]
+fn rebuild_index_restores_identical_active_set_versions_sources_and_ranking() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "事实一：Alice 居住在上海")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, "事实一：Alice 居住在上海", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "事实二：Bob 居住在北京")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember(&scope, &origin, &ev2, "事实二：Bob 居住在北京", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Vector injection for c1 & c2
+    store
+        .set_vector(
+            &scope,
+            &c1,
+            "claim",
+            1,
+            &raw_content_hash("事实一：Alice 居住在上海"),
+            "model-v1",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+    store
+        .set_vector(
+            &scope,
+            &c2,
+            "claim",
+            1,
+            &raw_content_hash("事实二：Bob 居住在北京"),
+            "model-v1",
+            &[0.0, 1.0],
+        )
+        .unwrap();
+
+    let (before_hits, before_deg) = store
+        .search_memories(&scope, "居住", 10, false, Some(&[0.9, 0.1]))
+        .unwrap();
+    assert!(!before_deg);
+    assert_eq!(before_hits.len(), 4);
+    let before_c1_explain = store.explain_memory(&scope, &c1, false).unwrap().unwrap();
+
+    // Delete projection db and manifest (vectors shard kept in index/vectors)
+    let scope_dir = store.scope_dir(&scope).unwrap();
+    let db_p = ProjectionIndex::db_path(&scope_dir);
+    let mf_p = ProjectionIndex::manifest_path(&scope_dir);
+    if db_p.exists() {
+        fs::remove_file(&db_p).unwrap();
+    }
+    if mf_p.exists() {
+        fs::remove_file(&mf_p).unwrap();
+    }
+    assert!(!db_p.exists());
+    assert!(!mf_p.exists());
+
+    // Rebuild index
+    let report = store.rebuild_index(&scope).unwrap();
+    assert_eq!(report.claims_indexed, 2);
+    assert_eq!(report.vectors_retained, 2);
+
+    // Search after rebuild
+    let (after_hits, after_deg) = store
+        .search_memories(&scope, "居住", 10, false, Some(&[0.9, 0.1]))
+        .unwrap();
+    assert!(!after_deg);
+    assert_eq!(before_hits.len(), after_hits.len());
+    for (b, a) in before_hits.iter().zip(after_hits.iter()) {
+        assert_eq!(b.id, a.id);
+        assert_eq!(b.version, a.version);
+        assert_eq!(b.content, a.content);
+        assert_eq!(b.channels, a.channels);
+    }
+
+    let after_c1_explain = store.explain_memory(&scope, &c1, false).unwrap().unwrap();
+    assert_eq!(before_c1_explain.memory_id, after_c1_explain.memory_id);
+    assert_eq!(before_c1_explain.version, after_c1_explain.version);
+    assert_eq!(before_c1_explain.evidence.len(), after_c1_explain.evidence.len());
+    assert_eq!(
+        before_c1_explain.evidence[0].evidence_id,
+        after_c1_explain.evidence[0].evidence_id
+    );
+    assert_eq!(
+        before_c1_explain.evidence[0].quote,
+        after_c1_explain.evidence[0].quote
+    );
+}
+
+#[test]
+fn forgotten_and_expired_items_are_invisible_in_search_explain_and_bundle() {
+    let (_temp, store, scope, origin) = fixture();
+    // 1. Normal active claim
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "正常记忆条目")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, "正常记忆条目", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 2. Claim to be forgotten
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "即将遗忘的记忆条目")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember(&scope, &origin, &ev2, "即将遗忘的记忆条目", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+    store.forget_claim(&scope, &c2).unwrap();
+
+    // 3. Expired claim (valid_until in the past)
+    let ev3 = match store
+        .record_evidence(&scope, &origin, 3, "user", "user", &at(3), "已经过期的记忆条目")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3 = match store
+        .remember(&scope, &origin, &ev3, "已经过期的记忆条目", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+    // Modify c3 claim file to have past valid_until
+    let scope_dir = store.scope_dir(&scope).unwrap();
+    let c3_path = claim_path(&scope_dir, &c3).unwrap();
+    let mut c3_doc = ClaimDocument::parse(&fs::read(&c3_path).unwrap()).unwrap();
+    c3_doc.front.valid_until = Some("2020-01-01T00:00:00Z".to_string());
+    atomic_replace(&c3_path, &c3_doc.to_bytes().unwrap()).unwrap();
+    store.rebuild_index(&scope).unwrap();
+
+    // Verification 1: search_memories
+    let (hits, _) = store.search_memories(&scope, "记忆条目", 10, false, None).unwrap();
+    let hit_ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+    assert!(hit_ids.contains(&c1));
+    assert!(!hit_ids.contains(&c2), "forgotten claim must not appear in search");
+    assert!(!hit_ids.contains(&c3), "expired claim must not appear in search");
+
+    // Verification 2: explain_memory & get_memory
+    assert!(store.get_memory(&scope, &c1).unwrap().is_some());
+    assert!(store.get_memory(&scope, &c2).unwrap().is_none(), "forgotten claim get_memory is None");
+    assert!(store.get_memory(&scope, &c3).unwrap().is_none(), "expired claim get_memory is None");
+
+    assert!(store.explain_memory(&scope, &c1, false).unwrap().is_some());
+    assert!(store.explain_memory(&scope, &c2, false).unwrap().is_none(), "forgotten claim explain is None");
+    assert!(store.explain_memory(&scope, &c3, false).unwrap().is_none(), "expired claim explain without history is None");
+
+    // Verification 3: context_bundle
+    let bundle = store
+        .context_bundle(&scope, "agent", "记忆条目", None, None)
+        .unwrap();
+    let bundle_json = serde_json::to_string(&bundle).unwrap();
+    assert!(bundle_json.contains(&c1), "active claim c1 must be present in bundle");
+    assert!(!bundle_json.contains(&c2), "forgotten claim c2 must not be in bundle");
+    assert!(!bundle_json.contains(&c3), "expired claim c3 must not be in bundle");
+}
+
+#[test]
+fn context_bundle_segments_order_budget_empty_and_deduplication() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "常驻与检索重合的记忆")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, "常驻与检索重合的记忆", MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "纯检索召回的记忆")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember(&scope, &origin, &ev2, "纯检索召回的记忆", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 1. Without alignment or relationships (empty segments present)
+    // Pass compact_max_items: Some(1) so c1 is in compact, while c2 overflows to retrieved!
+    let bundle_empty = store
+        .context_bundle_with_limits(&scope, "agent", "记忆", None, None, Some(1))
+        .unwrap();
+    let segs = bundle_empty.segments.as_array().unwrap();
+    assert_eq!(segs.len(), 4);
+    assert_eq!(segs[0]["segment"], "compact");
+    assert_eq!(segs[1]["segment"], "alignment");
+    assert_eq!(segs[2]["segment"], "relationships");
+    assert_eq!(segs[3]["segment"], "retrieved");
+
+    // Empty segments assertions
+    assert_eq!(segs[1]["char_count"], 0);
+    assert_eq!(segs[1]["complete"], true);
+    assert_eq!(segs[2]["char_count"], 0);
+    assert_eq!(segs[2]["total"], 0);
+
+    // Deduplication assertion: c1 is in compact (via MEMORY.md), so it must NOT appear in retrieved text!
+    let ret_text = segs[3]["text"].as_str().unwrap();
+    assert!(ret_text.contains(&c2));
+    assert!(!ret_text.contains(&c1), "c1 is covered in compact and must be deduped from retrieved");
+    assert_eq!(segs[3]["deduped"], 1, "deduped count must be 1");
+
+    // 2. With alignment and relationships populated
+    let align_text = "这是系统的对齐合成指引文本，用于约束行为风格。";
+    let rel_data = vec![
+        ("e1".to_string(), "璃".to_string(), "我的伙伴".to_string()),
+        ("e2".to_string(), "Alice".to_string(), "同事".to_string()),
+    ];
+    let bundle_full = store
+        .context_bundle(&scope, "agent", "记忆", Some(align_text), Some(&rel_data))
+        .unwrap();
+    let full_segs = bundle_full.segments.as_array().unwrap();
+    assert_eq!(full_segs[1]["char_count"], align_text.chars().count());
+    assert_eq!(full_segs[1]["body"], align_text);
+    assert_eq!(full_segs[2]["total"], 2);
+
+    // Budget checks
+    let total_used = bundle_full.budget["used_chars"].as_u64().unwrap();
+    let total_budget = bundle_full.budget["total_chars"].as_u64().unwrap();
+    assert_eq!(total_budget, 8000);
+    assert!(total_used <= 8000);
+}
+
+#[test]
+fn index_stale_fallback_walks_direct_files_with_degraded_flag() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "原始待匹配事实内容")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, "原始待匹配事实内容", MemoryKind::Fact)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Initially fresh
+    assert_eq!(
+        store.check_index_freshness(&scope).unwrap(),
+        IndexFreshness::Fresh
+    );
+    let (hits, degraded) = store.search_memories(&scope, "待匹配", 10, false, None).unwrap();
+    assert!(!degraded);
+    assert_eq!(hits[0].id, c1);
+
+    // Make the index stale artificially: directly edit a claim file without rebuilding index
+    let scope_dir = store.scope_dir(&scope).unwrap();
+    let c1_path = claim_path(&scope_dir, &c1).unwrap();
+    let mut doc = ClaimDocument::parse(&fs::read(&c1_path).unwrap()).unwrap();
+    doc.body = "外部修改后的新事实内容包含关键字独角兽".to_string();
+    doc.front.claim_sha256 = memory_domain::claim_sha256(MemoryKind::Fact, &doc.body);
+    doc.front.normalized_claim = memory_domain::normalize_v1(&doc.body);
+    atomic_replace(&c1_path, &doc.to_bytes().unwrap()).unwrap();
+
+    // Now freshness check must detect fingerprint mismatch -> Stale
+    assert_eq!(
+        store.check_index_freshness(&scope).unwrap(),
+        IndexFreshness::Stale
+    );
+
+    // Search when stale: must fall back to direct scan, find the updated content, and flag degraded!
+    let (stale_hits, degraded) = store.search_memories(&scope, "独角兽", 10, false, None).unwrap();
+    assert!(degraded, "search must report degraded=true when index is stale");
+    assert!(!stale_hits.is_empty());
+    assert_eq!(stale_hits[0].id, c1);
+    assert_eq!(stale_hits[0].content, "外部修改后的新事实内容包含关键字独角兽");
+
+    // Bundle also reports index_degraded
+    let bundle = store.context_bundle(&scope, "agent", "独角兽", None, None).unwrap();
+    assert_eq!(bundle.lexical_status, "index_degraded");
+
+    // Rebuild brings it back to Fresh
+    store.rebuild_index(&scope).unwrap();
+    assert_eq!(
+        store.check_index_freshness(&scope).unwrap(),
+        IndexFreshness::Fresh
+    );
+    let (rebuilt_hits, degraded) = store.search_memories(&scope, "独角兽", 10, false, None).unwrap();
+    assert!(!degraded, "search must report degraded=false after rebuild");
+    assert_eq!(rebuilt_hits[0].id, c1);
+}
+
+#[test]
+fn explain_memory_returns_verbatim_spans_speaker_and_relations() {
+    let (_temp, store, scope, origin) = fixture();
+    let payload = "前缀文本，用户喜欢的书是《计算理论导引》，后缀文本。";
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), payload)
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let quote = "用户喜欢的书是《计算理论导引》";
+    let c1 = match store
+        .remember(&scope, &origin, &ev1, quote, MemoryKind::Preference)
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let explain = store.explain_memory(&scope, &c1, false).unwrap().unwrap();
+    assert_eq!(explain.memory_id, c1);
+    assert_eq!(explain.claim, quote);
+    assert_eq!(explain.speaker, Some("user".to_string()));
+    assert_eq!(explain.subject, None);
+    assert_eq!(explain.subject_source, "none");
+    assert_eq!(explain.stable_ref, format!("riko://memory/{c1}"));
+    assert_eq!(explain.evidence.len(), 1);
+    assert_eq!(explain.evidence[0].quote, quote);
+    assert_eq!(explain.evidence[0].span_exact, true);
+    assert_eq!(explain.evidence[0].evidence_id, ev1);
+    assert_eq!(explain.relations.supersedes, None);
+    assert_eq!(explain.relations.superseded_by, None);
+
+    // Supersede creates link
+    let ev2 = match store
+        .record_evidence(
+            &scope,
+            &origin,
+            2,
+            "user",
+            "user",
+            &at(2),
+            "纠正：用户喜欢的书是《统计学习方法》",
+        )
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .supersede(
+            &scope,
+            &c1,
+            &origin,
+            &ev2,
+            "用户喜欢的书是《统计学习方法》",
+            MemoryKind::Preference,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // Old claim explain (with history)
+    let old_explain = store.explain_memory(&scope, &c1, true).unwrap().unwrap();
+    assert_eq!(old_explain.status, "superseded");
+    assert_eq!(old_explain.relations.superseded_by, Some(c2.clone()));
+
+    // New claim explain
+    let new_explain = store.explain_memory(&scope, &c2, false).unwrap().unwrap();
+    assert_eq!(new_explain.status, "active");
+    assert_eq!(new_explain.relations.supersedes, Some(c1));
+}
