@@ -60,7 +60,7 @@
                     * Please avoid commands that may produce a very large amount of output.
                     * Please run long lived commands in the background, e.g. 'Start-Job' or 'Start-Process'.
           - id: riko-dsh
-            name: '@riko/dsh'
+            name: '@aki_riko/dsh'
             disabled: !!js "!(process.env.AGENT_MEMORY_TOKEN_FILE && process.env.AGENT_MEMORY_SPOOL_DIR && process.env.AGENT_MEMORY_HOST_ID)"
             config:
               memoryUrl: http://127.0.0.1:8791

@@ -20,12 +20,12 @@ github:AkinoHaruka/Riko-Muse#path:/riko-dsh
 
 ### 2. npm 包名安装（发布后生效）
 
-> **注意**：`@riko/dsh` 发布至 npm registry 后生效。当前尚未正式发布到 npm，请使用上述 GitHub 方式安装。
+> **注意**：`@aki_riko/dsh` 发布至 npm registry 后生效。当前尚未正式发布到 npm，请使用上述 GitHub 方式安装。
 
 发布后可直接通过包名安装：
 
 ```bash
-dsh plugin --profile <profile> add @riko/dsh
+dsh plugin --profile <profile> add @aki_riko/dsh
 ```
 
 安装完成后，在 Agent preset 选择器中选择 **Riko** 即可。Minimal 及其他 preset 保持不变。
@@ -48,7 +48,7 @@ The token file must remain outside Git and outside the plugin package. Do not pu
 
 The single authoritative source of truth for agent personality is the kernel Soul (`GET /v1/soul`, injected as `riko-dsh:soul` at order 10300, isolated per agent).
 
-The bundle includes an editable `soul.md` at the `@riko/dsh` package root for optional local override. File-based personality injection (`twin-soul` at order 100) is deprecated and disabled by default. If file-based override is needed, explicitly opt in via `fileSoulEnabled: true` (or `RIKO_DSH_FILE_SOUL=1`). When enabled, it routes through the Soul assembly path (`riko-dsh:soul` at order 10300) with identical per-agent and child-session isolation semantics, rather than injecting as a parallel section.
+The bundle includes an editable `soul.md` at the `@aki_riko/dsh` package root for optional local override. File-based personality injection (`twin-soul` at order 100) is deprecated and disabled by default. If file-based override is needed, explicitly opt in via `fileSoulEnabled: true` (or `RIKO_DSH_FILE_SOUL=1`). When enabled, it routes through the Soul assembly path (`riko-dsh:soul` at order 10300) with identical per-agent and child-session isolation semantics, rather than injecting as a parallel section.
 
 ## Relationship guidance
 
