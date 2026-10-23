@@ -4,13 +4,31 @@ This directory is both the DSH adapter package and an installable DSH bundle. Th
 
 ## Install
 
-Install this package from the public Riko-Memory repository into a DSH profile that loads the Agent preset registry and Minimal preset:
+### 1. GitHub 仓库安装（当前可用，已实测）
 
-```text
-github:AkinoHaruka/Riko-Memory#path:/adapters/dsh
+在包含 Agent preset 注册表与 Minimal preset 的 DSH profile 中执行以下命令安装：
+
+```bash
+dsh plugin --profile <profile> add github:AkinoHaruka/Riko-Muse#path:/riko-dsh
 ```
 
-In Creator mode, use `plugin_manager` with `action: install_bundle` and the specifier above as `target`. The DSH plugin page or `dsh plugin --profile <profile> add <specifier>` can also install the bundle. After installation, select **Riko** in the Agent preset selector. Minimal and other presets are untouched.
+在 Creator 模式下，可以使用 `plugin_manager` 工具（`action: install_bundle`），将 target 设为：
+
+```text
+github:AkinoHaruka/Riko-Muse#path:/riko-dsh
+```
+
+### 2. npm 包名安装（发布后生效）
+
+> **注意**：`@riko/dsh` 发布至 npm registry 后生效。当前尚未正式发布到 npm，请使用上述 GitHub 方式安装。
+
+发布后可直接通过包名安装：
+
+```bash
+dsh plugin --profile <profile> add @riko/dsh
+```
+
+安装完成后，在 Agent preset 选择器中选择 **Riko** 即可。Minimal 及其他 preset 保持不变。
 
 ## Configure the local connection
 
@@ -38,7 +56,7 @@ Kernel alignment synthesis from `memoryd` (`POST /v1/context/bundle` segment `al
 
 ## Riko-App API Bridge
 
-The Android app's HTTP bridge is a separate DSH bundle in the repository's `riko-app-bridge/` directory. Install it independently from this memory adapter. It owns the `/riko-app-api/v1` routes, model settings proxy, app-only bearer token, and Riko-App session registry. See `../../../riko-app-bridge/README.md` for installation and configuration. Installing this memory bundle alone does not install or activate the Bridge.
+The Android app's HTTP bridge is a separate DSH bundle in the repository's `riko-app-bridge/` directory. Install it independently from this memory adapter. It owns the `/riko-app-api/v1` routes, model settings proxy, app-only bearer token, and Riko-App session registry. See `../riko-app-bridge/README.md` for installation and configuration. Installing this memory bundle alone does not install or activate the Bridge.
 
 ## Package contents
 

@@ -2,9 +2,12 @@
   "name": "@riko/dsh",
   "version": "0.5.2",
   "description": "Riko Memory 的 DSH Riko preset bundle 与记忆宿主适配器",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AkinoHaruka/Riko-Memory.git",
+    "url": "git+https://github.com/AkinoHaruka/Riko-Muse.git",
     "directory": "riko-dsh"
   },
   "type": "module",
