@@ -60,3 +60,18 @@ fn claim_full_evidence_reference_uses_paired_null_spans() {
     assert_eq!(parsed.front.evidence[0].start_byte, None);
     assert_eq!(parsed.to_bytes().unwrap(), changed.as_bytes());
 }
+
+#[test]
+fn claim_slot_and_precedence_round_trip() {
+    let mut doc = ClaimDocument::parse(GOOD).unwrap();
+    doc.front.slot = Some("reading_preference".into());
+    doc.front.precedence = Some("session".into());
+    let bytes = doc.to_bytes().unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("slot: \"reading_preference\"\n"));
+    assert!(text.contains("precedence: session\n"));
+    let reparsed = ClaimDocument::parse(&bytes).unwrap();
+    assert_eq!(reparsed.front.slot.as_deref(), Some("reading_preference"));
+    assert_eq!(reparsed.front.precedence.as_deref(), Some("session"));
+    assert_eq!(reparsed.to_bytes().unwrap(), bytes);
+}

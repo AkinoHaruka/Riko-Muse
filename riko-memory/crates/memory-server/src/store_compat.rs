@@ -2031,6 +2031,8 @@ impl Store {
                                     reason_code: "remember".into(),
                                     reason_text: None,
                                     supersedes: None,
+                                    slot: None,
+                                    precedence: None,
                                     evidence: vec![memory_file_format::claim::ClaimEvidenceRef {
                                         id: c.source_event_id.clone(),
                                         start_byte: None,

@@ -31,6 +31,8 @@ pub struct ClaimFrontMatter {
     pub reason_code: String,
     pub reason_text: Option<String>,
     pub supersedes: Option<String>,
+    pub slot: Option<String>,
+    pub precedence: Option<String>,
     pub evidence: Vec<ClaimEvidenceRef>,
 }
 
@@ -120,9 +122,16 @@ impl ClaimDocument {
             ("valid_until", &f.valid_until),
             ("reason_text", &f.reason_text),
             ("supersedes", &f.supersedes),
+            ("slot", &f.slot),
+            ("precedence", &f.precedence),
         ] {
             if let Some(value) = value {
                 validate_control_text(value, field)?;
+            }
+        }
+        if let Some(ref prec) = f.precedence {
+            if !matches!(prec.as_str(), "session" | "project" | "global") {
+                return Err(FormatError::new(ReasonCode::InvalidField, Some("precedence")));
             }
         }
         let Some(kind) = kind(&f.kind) else {
@@ -192,8 +201,8 @@ impl ClaimDocument {
     pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
         self.validate()?;
         let f = &self.front;
-        let mut out = format!(
-            "---\nriko_format: {CLAIM_FORMAT}\nid: {}\ndomain_id: {}\nkind: {}\nstatus: {}\nversion: {}\nsource_class: {}\nclaim_sha256: {}\nnormalized_claim: {}\noccurred_at: {}\nvalid_from: {}\nvalid_until: {}\norigin_host_id: {}\norigin_agent_id: {}\ncreated_at: {}\nupdated_at: {}\nreason_code: {}\nreason_text: {}\nsupersedes: {}\nevidence:\n",
+        let mut header_str = format!(
+            "---\nriko_format: {CLAIM_FORMAT}\nid: {}\ndomain_id: {}\nkind: {}\nstatus: {}\nversion: {}\nsource_class: {}\nclaim_sha256: {}\nnormalized_claim: {}\noccurred_at: {}\nvalid_from: {}\nvalid_until: {}\norigin_host_id: {}\norigin_agent_id: {}\ncreated_at: {}\nupdated_at: {}\nreason_code: {}\nreason_text: {}\nsupersedes: {}\n",
             f.id,
             f.domain_id,
             f.kind,
@@ -212,8 +221,15 @@ impl ClaimDocument {
             f.reason_code,
             optional(&f.reason_text),
             optional(&f.supersedes),
-        )
-        .into_bytes();
+        );
+        if let Some(ref slot) = f.slot {
+            header_str.push_str(&format!("slot: {}\n", json_string(slot)));
+        }
+        if let Some(ref prec) = f.precedence {
+            header_str.push_str(&format!("precedence: {}\n", prec));
+        }
+        header_str.push_str("evidence:\n");
+        let mut out = header_str.into_bytes();
         for evidence in &f.evidence {
             out.extend_from_slice(
                 format!(
@@ -276,11 +292,26 @@ impl ClaimDocument {
         let reason_code = take(&mut lines, "reason_code: ")?.to_owned();
         let reason_text = parse_optional(take(&mut lines, "reason_text: ")?, "reason_text")?;
         let supersedes = parse_optional(take(&mut lines, "supersedes: ")?, "supersedes")?;
-        if lines.next() != Some("evidence:") {
-            return Err(FormatError::new(
-                ReasonCode::InvalidSyntax,
-                Some("evidence"),
-            ));
+        let mut slot = None;
+        let mut precedence = None;
+        loop {
+            let Some(line) = lines.next() else {
+                return Err(FormatError::new(
+                    ReasonCode::InvalidSyntax,
+                    Some("evidence"),
+                ));
+            };
+            if line == "evidence:" {
+                break;
+            }
+            if let Some(s) = line.strip_prefix("slot: ") {
+                slot = Some(parse_json_string(s, "slot")?);
+            } else if let Some(p) = line.strip_prefix("precedence: ") {
+                validate_control_text(p, "precedence")?;
+                precedence = Some(p.to_owned());
+            } else {
+                return Err(FormatError::new(ReasonCode::InvalidSyntax, None));
+            }
         }
         let mut evidence = Vec::new();
         while let Some(line) = lines.next() {
@@ -333,6 +364,8 @@ impl ClaimDocument {
                 reason_code,
                 reason_text,
                 supersedes,
+                slot,
+                precedence,
                 evidence,
             },
             body: body.to_owned(),

@@ -1813,6 +1813,8 @@ fn f5prime_golden_bundle_three_categories_rendering() {
             reason_code: "manual".to_string(),
             reason_text: None,
             supersedes: None,
+            slot: None,
+            precedence: None,
             evidence: vec![ClaimEvidenceRef {
                 id: missing_ev_id.to_string(),
                 start_byte: None,
@@ -1880,24 +1882,40 @@ fn f5prime_golden_bundle_three_categories_rendering() {
     // 打印 golden bundle 渲染全文
     println!("=== GOLDEN BUNDLE FULL RENDERING ===\n{}\n====================================", ret_text);
 
-    // 验收项 1: 规则头部固定输出
+    // 验收项 1: 版本头与裁决链头部固定输出（对齐 doc8/07 §1）
+    assert!(ret_text.contains("[VERSION HEADER]"));
+    assert!(ret_text.contains("version: v1"));
+    assert!(ret_text.contains("timezone: UTC"));
     assert!(ret_text.contains("[PRIORITY & CONFLICT RULES]"));
-    assert!(ret_text.contains("soul > 用户显式更正 > 时间较新条目 > 种子默认"));
-    assert!(ret_text.contains("session > project > global"));
+    assert!(ret_text.contains("本轮显式指令 > 用户显式更正 > session > project > global > 无记忆"));
+    assert!(ret_text.contains("不覆盖系统/开发者指令、本轮用户明确指令优先"));
 
-    // 验收项 2: 冲突对出现时块内有显式冲突提示
+    // 验收项 2: 冲突对出现时块内有 conflict_notes 与显式冲突提示；正文段 memories 无冲突项
+    assert!(ret_text.contains("[CONFLICT NOTES]"));
     assert!(ret_text.contains("[CONFLICT DETECTED]"));
     assert!(ret_text.contains(&c3_a));
     assert!(ret_text.contains(&c3_b));
     assert!(ret_text.contains("未替模型做选择"));
+    // 验证 memories 段中无冲突项正文
+    let memories_section = ret_text
+        .split("[MEMORIES]")
+        .nth(1)
+        .unwrap()
+        .split("[CONFLICT NOTES]")
+        .next()
+        .unwrap();
+    assert!(!memories_section.contains(&c3_a), "冲突项 c3_a 绝不注入正文段");
+    assert!(!memories_section.contains(&c3_b), "冲突项 c3_b 绝不注入正文段");
 
-    // 验收项 3: 行形状带齐身份、时间、来源（类型+定位+摘录）、标量
-    assert!(ret_text.contains(&format!("- [claim: {}] 主人在对话中说最喜欢吃红富士苹果", c1)));
-    assert!(ret_text.contains("身份: speaker=user"));
-    assert!(ret_text.contains("时间: occurred_at=2026-10-23T12:00:10"));
-    assert!(ret_text.contains("来源: [user_explicit] session#"));
-    assert!(ret_text.contains("原文摘录: \"主人在对话中说最喜欢吃红富士苹果\""));
-    assert!(ret_text.contains("标量: precedence=session, version=v1, indexed_as_of="));
+    // 验收项 3: 行形状单行带齐身份、时间、来源（类型+定位）、标量、内容放末尾
+    assert!(ret_text.contains(&format!("- [claim: {}]", c1)));
+    assert!(ret_text.contains("主人在对话中说最喜欢吃红富士苹果"));
+    assert!(ret_text.contains("speaker=user"));
+    assert!(ret_text.contains("occurred_at=2026-10-23T12:00:10"));
+    assert!(ret_text.contains("source=[user_explicit] session#"));
+    assert!(ret_text.contains("slot=<missing>"));
+    assert!(ret_text.contains("precedence=global"));
+    assert!(ret_text.contains("version=v1, indexed_as_of="));
 
     // 验收项 4: 无来源条目在 bundle 两段均不可见
     assert!(!ret_text.contains(&c2_id), "无来源条目 c2 不得进入 retrieved 段");
@@ -1912,12 +1930,21 @@ fn f5prime_golden_bundle_three_categories_rendering() {
     assert!(ret_text.contains("预算略过条数 (omitted_count): 0"));
     assert!(ret_text.contains("未命中主题 (unmatched_topics): [\"宇宙航行\"] (库里没有相关记录)"));
 
+    // 验收项 6: 覆盖信号三层（override_signal，块尾）
+    assert!(ret_text.contains("[OVERRIDE SIGNALS]"));
+    assert!(ret_text.contains("override_by_id"));
+    assert!(ret_text.contains("override_by_slot"));
+    assert!(ret_text.contains("override_all"));
+    assert!(ret_text.contains("\"忽略记忆\"默认只对当前轮/会话生效，不覆盖系统/开发者指令"));
+
     // JSON 结构字段断言
     assert_eq!(bundle.retrieved["matched_count"], 6);
     assert_eq!(bundle.retrieved["omitted_count"], 0);
     assert_eq!(bundle.retrieved["unmatched_topics"], serde_json::json!(["宇宙航行"]));
     let conflicts = bundle.retrieved["conflicts"].as_array().unwrap();
     assert!(!conflicts.is_empty(), "必须检测到冲突对");
+    assert_eq!(bundle.override_signal["mode"], "none");
+    assert_eq!(bundle.override_signal["system_instruction_priority"], true);
 
     // 验证 compact 段中条目的元数据完整性
     let bundle_compact = store
@@ -1931,7 +1958,7 @@ fn f5prime_golden_bundle_three_categories_rendering() {
     let c1_item = found_c1_in_comp.unwrap();
     assert_eq!(c1_item["speaker"], "user");
     assert_eq!(c1_item["has_source"], true);
-    assert_eq!(c1_item["precedence"], "session");
+    assert_eq!(c1_item["precedence"], "global");
     assert_eq!(c1_item["version"], 1);
 }
 
@@ -1964,6 +1991,8 @@ fn f5prime_no_source_claim_invisible_in_bundle_both_segments() {
             reason_code: "manual".to_string(),
             reason_text: None,
             supersedes: None,
+            slot: None,
+            precedence: None,
             evidence: vec![ClaimEvidenceRef {
                 id: fake_ev.to_string(),
                 start_byte: None,
@@ -2149,6 +2178,8 @@ fn f5prime_missing_fields_explicitly_marked_and_degraded_indexed_as_of() {
             reason_code: "legacy".to_string(),
             reason_text: None,
             supersedes: None,
+            slot: None,
+            precedence: None,
             evidence: vec![ClaimEvidenceRef {
                 id: ev.clone(),
                 start_byte: None, // 缺失 span 定位！
@@ -2206,3 +2237,774 @@ fn f5prime_missing_fields_explicitly_marked_and_degraded_indexed_as_of() {
         "degraded_direct_scan"
     );
 }
+
+#[test]
+fn f6prime_settled_sort_order_four_tiers() {
+    // 1. 纯函数单元测试：验证 4 类条目同题命中时的定案排序链
+    // 规则：相关性/当前任务 > 显式 pin/会话指令 > precedence (session > project > global) > 新近度 (updated_at)
+    let make_hit = |id: &str, score: f64, is_pinned: bool, memory_kind: &str, precedence: &str, updated_at: &str| FileSearchHit {
+        id: id.to_string(),
+        kind: "claim".to_string(),
+        memory_kind: memory_kind.to_string(),
+        content: format!("测试内容 {}", id),
+        score,
+        channels: vec!["lexical".to_string()],
+        occurred_at: Some(updated_at.to_string()),
+        created_at: Some(updated_at.to_string()),
+        updated_at: Some(updated_at.to_string()),
+        valid_from: None,
+        valid_until: None,
+        version: 1,
+        speaker: Some("user".to_string()),
+        agent_id: Some("agent".to_string()),
+        has_source: true,
+        source_type: Some("user_explicit".to_string()),
+        source_locator: Some("session#1".to_string()),
+        source_quote: Some("quote".to_string()),
+        slot: Some("coding_standard".to_string()),
+        precedence: precedence.to_string(),
+        status: "active".to_string(),
+        superseded_by: None,
+        confidence: 1.0,
+        is_pinned,
+        indexed_as_of: "2026-10-24T00:00:00Z".to_string(),
+    };
+
+    let mut hits = vec![
+        make_hit("item5_older_global", 0.80, false, "fact", "global", "2026-01-01T00:00:00Z"),
+        make_hit("item4_newer_global", 0.80, false, "fact", "global", "2026-10-24T12:00:00Z"),
+        make_hit("item3_session_prec", 0.80, false, "fact", "session", "2026-01-01T00:00:00Z"),
+        make_hit("item2_pinned_instr", 0.80, true, "instruction", "global", "2026-01-01T00:00:00Z"),
+        make_hit("item1_high_relevance", 0.95, false, "fact", "global", "2026-01-01T00:00:00Z"),
+    ];
+
+    sort_hits_by_settled_order(&mut hits);
+
+    assert_eq!(hits[0].id, "item1_high_relevance", "Tier 1: 高相关度优先");
+    assert_eq!(hits[1].id, "item2_pinned_instr", "Tier 2: 显式 pin / 会话指令优先");
+    assert_eq!(hits[2].id, "item3_session_prec", "Tier 3: session 优先级高于 global");
+    assert_eq!(hits[3].id, "item4_newer_global", "Tier 4: 同优先级下较新更新时间优先");
+    assert_eq!(hits[4].id, "item5_older_global", "Tier 4: 同优先级下较旧更新时间排后");
+
+    // 2. 端到端 Store 级别测试：构造 4 类真实文件条目，验证 search_memories 排序
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "编码规范 核心规定一律采用UTF-8无BOM格式")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev1,
+            "编码规范 核心规定一律采用UTF-8无BOM格式",
+            MemoryKind::Fact,
+            Some("encoding"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "编码规范 指令规定缩进使用4空格")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev2,
+            "编码规范 指令规定缩进使用4空格",
+            MemoryKind::Instruction,
+            Some("indent"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev3 = match store
+        .record_evidence(&scope, &origin, 3, "user", "user", &at(3), "编码规范 会话层规定函数不超过50行")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev3,
+            "编码规范 会话层规定函数不超过50行",
+            MemoryKind::Fact,
+            Some("function_size"),
+            Some("session"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev4 = match store
+        .record_evidence(&scope, &origin, 4, "user", "user", &at(4), "编码规范 全局层规定单行不超过120字符")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c4 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev4,
+            "编码规范 全局层规定单行不超过120字符",
+            MemoryKind::Fact,
+            Some("line_length"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    store.rebuild_index(&scope).unwrap();
+
+    let (search_hits, _) = store
+        .search_memories(&scope, "编码规范 UTF-8", 10, false, None)
+        .unwrap();
+    assert!(search_hits.len() >= 4);
+
+    let ids: Vec<&str> = search_hits.iter().map(|h| h.id.as_str()).collect();
+    let pos_c1 = ids.iter().position(|&id| id == c1).unwrap();
+    let pos_c2 = ids.iter().position(|&id| id == c2).unwrap();
+    let pos_c3 = ids.iter().position(|&id| id == c3).unwrap();
+    let pos_c4 = ids.iter().position(|&id| id == c4).unwrap();
+
+    assert!(pos_c1 < pos_c2, "相关性高分 c1 ({}) 应排在 instruction c2 ({}) 前", pos_c1, pos_c2);
+    assert!(pos_c2 < pos_c3, "指令 c2 ({}) 应排在普通 session c3 ({}) 前", pos_c2, pos_c3);
+    assert!(pos_c3 < pos_c4, "session 优先级 c3 ({}) 应排在 global 优先级 c4 ({}) 前", pos_c3, pos_c4);
+}
+
+#[test]
+fn f6prime_superseded_summary_vs_audit_rendering() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "用户在2025年最喜欢Neovim编辑器")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev1,
+            "用户在2025年最喜欢Neovim编辑器",
+            MemoryKind::Preference,
+            Some("editor_choice"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "用户更正说现在改用VSCode编辑器")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .supersede_ext(
+            &scope,
+            &c1,
+            &origin,
+            &ev2,
+            "用户更正说现在改用VSCode编辑器",
+            MemoryKind::Preference,
+            Some("editor_choice"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    store.rebuild_index(&scope).unwrap();
+
+    // 1. 默认形态 (audit = false)：被取代条目只留一行更正链摘要，不注入原正文
+    let bundle_default = store
+        .context_bundle_ext(&scope, "agent", "编辑器", None, None, Some(0), true, false)
+        .unwrap();
+    let ret_text_default = bundle_default.retrieved["text"].as_str().unwrap();
+
+    // c1 作为 superseded 条目，必须有摘要行且指明新条目 c2
+    assert!(ret_text_default.contains(&format!("- [claim: {}] status=superseded", c1)));
+    assert!(ret_text_default.contains(&format!("[更正链摘要: 本条已被新条目 {} 取代]", c2)));
+    // 默认形态绝不包含原旧正文 "Neovim"
+    assert!(!ret_text_default.contains("Neovim"), "默认形态严禁注入旧正文 Neovim");
+    assert!(ret_text_default.contains("VSCode"), "新条目正常注入");
+
+    // 2. 审计形态 (audit = true)：显式请求时在摘要行中带旧正文
+    let bundle_audit = store
+        .context_bundle_ext(&scope, "agent", "编辑器", None, None, Some(0), true, true)
+        .unwrap();
+    let ret_text_audit = bundle_audit.retrieved["text"].as_str().unwrap();
+
+    assert!(ret_text_audit.contains(&format!("- [claim: {}] status=superseded", c1)));
+    assert!(ret_text_audit.contains(&format!("[更正链摘要: 本条已被新条目 {} 取代 | 原正文: 用户在2025年最喜欢Neovim编辑器]", c2)));
+    assert!(ret_text_audit.contains("Neovim"), "审计形态显式输出原正文");
+}
+
+#[test]
+fn f6prime_event_time_window_missing_marker() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "用户于2026年夏季参加了黑客松比赛")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+
+    // 事件条目 1: 具有完整的 valid_from / valid_until
+    let c1 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev1,
+            "用户于2026年夏季参加了黑客松比赛",
+            MemoryKind::Episode,
+            Some("hackathon_event"),
+            Some("project"),
+            Some("2026-07-01T00:00:00Z"),
+            Some("2026-12-31T23:59:59Z"),
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 事件条目 2: 缺失有效窗（valid_from / valid_until 为 None）
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(2), "用户参加了某次未记录具体日期的线下聚会")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev2,
+            "用户参加了某次未记录具体日期的线下聚会",
+            MemoryKind::Episode,
+            Some("meetup_event"),
+            Some("project"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 普通事实条目 3: 无时间窗（不应渲染时间窗噪声）
+    let ev3 = match store
+        .record_evidence(&scope, &origin, 3, "user", "user", &at(3), "用户常驻北京海淀")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev3,
+            "用户常驻北京海淀",
+            MemoryKind::Fact,
+            Some("location"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    store.rebuild_index(&scope).unwrap();
+
+    let bundle = store
+        .context_bundle_with_limits(&scope, "agent", "黑客松 聚会 北京", None, None, Some(0))
+        .unwrap();
+    let ret_text = bundle.retrieved["text"].as_str().unwrap();
+
+    // c1 渲染带有效窗
+    assert!(ret_text.contains(&format!("- [claim: {}]", c1)));
+    assert!(ret_text.contains("valid_from=2026-07-01T00:00:00Z, valid_to=2026-12-31T23:59:59Z"));
+
+    // c2 渲染显式标注缺失 <missing>
+    assert!(ret_text.contains(&format!("- [claim: {}]", c2)));
+    assert!(ret_text.contains("valid_from=<missing>, valid_to=<missing>"));
+
+    // c3 普通事实无时间窗干扰
+    let line_c3 = ret_text.lines().find(|l| l.contains(&c3)).unwrap();
+    assert!(!line_c3.contains("valid_from"), "普通事实无时间窗时不输出 valid_from");
+    assert!(!line_c3.contains("valid_to"), "普通事实无时间窗时不输出 valid_to");
+}
+
+#[test]
+fn f6prime_conflict_exclusion_and_adjudication_chain() {
+    let (_temp, store, scope, origin) = fixture();
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(1), "用户设置深色主题模式")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev1,
+            "用户设置深色主题模式",
+            MemoryKind::Preference,
+            Some("theme_mode"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(1), "用户设置浅色主题模式")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev2,
+            "用户设置浅色主题模式",
+            MemoryKind::Preference,
+            Some("theme_mode"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let scope_dir = store.scope_dir(&scope).unwrap();
+    let c1_path = claim_path(&scope_dir, &c1).unwrap();
+    let mut c1_doc = ClaimDocument::parse(&fs::read(&c1_path).unwrap()).unwrap();
+    c1_doc.front.updated_at = "2026-10-24T12:00:00Z".to_string();
+    atomic_replace(&c1_path, &c1_doc.to_bytes().unwrap()).unwrap();
+
+    let c2_path = claim_path(&scope_dir, &c2).unwrap();
+    let mut c2_doc = ClaimDocument::parse(&fs::read(&c2_path).unwrap()).unwrap();
+    c2_doc.front.updated_at = "2026-10-24T12:00:00Z".to_string();
+    atomic_replace(&c2_path, &c2_doc.to_bytes().unwrap()).unwrap();
+
+    store.rebuild_index(&scope).unwrap();
+
+    // 1. 同 slot 同 precedence 同时间冲突：正文段彻底排除冲突项，仅在 conflict_notes 标注
+    let bundle = store
+        .context_bundle_with_limits(&scope, "agent", "主题模式", None, None, Some(0))
+        .unwrap();
+    let ret_text = bundle.retrieved["text"].as_str().unwrap();
+
+    assert!(ret_text.contains("[CONFLICT NOTES]"));
+    assert!(ret_text.contains("[CONFLICT DETECTED]"));
+    assert!(ret_text.contains(&c1));
+    assert!(ret_text.contains(&c2));
+    assert!(ret_text.contains("slot: theme_mode"));
+    assert!(ret_text.contains("precedence: global"));
+
+    let memories_part = ret_text
+        .split("[MEMORIES]")
+        .nth(1)
+        .unwrap()
+        .split("[CONFLICT NOTES]")
+        .next()
+        .unwrap();
+    assert!(!memories_part.contains(&c1), "冲突项 c1 绝不可注入正文段");
+    assert!(!memories_part.contains(&c2), "冲突项 c2 绝不可注入正文段");
+
+    // 2. 引入更高优先级 session 条目 c3：session > global 自动裁决，覆盖 c1 与 c2
+    let ev3 = match store
+        .record_evidence(&scope, &origin, 3, "user", "user", &at(2), "用户在当前会话明确要求深色主题模式")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev3,
+            "用户在当前会话明确要求深色主题模式",
+            MemoryKind::Preference,
+            Some("theme_mode"),
+            Some("session"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    store.rebuild_index(&scope).unwrap();
+
+    let bundle_adjudicated = store
+        .context_bundle_with_limits(&scope, "agent", "主题模式", None, None, Some(0))
+        .unwrap();
+    let ret_text_adj = bundle_adjudicated.retrieved["text"].as_str().unwrap();
+
+    // c3 胜出注入正文段
+    assert!(ret_text_adj.contains(&format!("- [claim: {}]", c3)));
+    assert!(ret_text_adj.contains("precedence=session"));
+    // 被裁决覆盖的低优先级 c1 和 c2 不再构成未决冲突
+    let conflicts = bundle_adjudicated.retrieved["conflicts"].as_array().unwrap();
+    assert!(conflicts.is_empty(), "定案链已裁决，未决冲突应清空");
+}
+
+#[test]
+fn f6prime_golden_bundle_doc8_07_full_conformance() {
+    let (_temp, store, scope, origin) = fixture();
+
+    // 1. 常规偏好（带 slot 与 global precedence）
+    let ev1 = match store
+        .record_evidence(&scope, &origin, 1, "user", "user", &at(10), "用户喜欢喝云南高山黑咖啡")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c1 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev1,
+            "用户喜欢喝云南高山黑咖啡",
+            MemoryKind::Preference,
+            Some("beverage_coffee"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 2. 会话指令（带 session precedence 与 pin）
+    let ev2 = match store
+        .record_evidence(&scope, &origin, 2, "user", "user", &at(11), "今天会话全程使用简洁中文回答")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c2 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev2,
+            "今天会话全程使用简洁中文回答",
+            MemoryKind::Instruction,
+            Some("response_style"),
+            Some("session"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 3. 事件条目（带时间窗 valid_from/valid_to）
+    let ev3 = match store
+        .record_evidence(&scope, &origin, 3, "user", "user", &at(12), "用户参加2026秋季技术研讨会")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c3 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev3,
+            "用户参加2026秋季技术研讨会",
+            MemoryKind::Episode,
+            Some("tech_conference"),
+            Some("project"),
+            Some("2026-10-20T09:00:00Z"),
+            Some("2026-10-30T18:00:00Z"),
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 4. 事件条目（缺时间窗）
+    let ev4 = match store
+        .record_evidence(&scope, &origin, 4, "user", "user", &at(13), "用户完成了一次系统安全审计")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c4 = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev4,
+            "用户完成了一次系统安全审计",
+            MemoryKind::Episode,
+            Some("security_audit"),
+            Some("project"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 5. 冲突对（同 slot: ide_theme，同 global，无法裁决）
+    let ev5_a = match store
+        .record_evidence(&scope, &origin, 5, "user", "user", &at(14), "用户要求IDE使用深色配色")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c5_a = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev5_a,
+            "用户要求IDE使用深色配色",
+            MemoryKind::Preference,
+            Some("ide_theme"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev5_b = match store
+        .record_evidence(&scope, &origin, 6, "user", "user", &at(14), "用户要求IDE使用浅色配色")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c5_b = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev5_b,
+            "用户要求IDE使用浅色配色",
+            MemoryKind::Preference,
+            Some("ide_theme"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    // 6. 更正链（c6_old 被 c6_new 取代）
+    let ev6_old = match store
+        .record_evidence(&scope, &origin, 7, "user", "user", &at(15), "用户手机型号为iPhone 13")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c6_old = match store
+        .remember_ext(
+            &scope,
+            &origin,
+            &ev6_old,
+            "用户手机型号为iPhone 13",
+            MemoryKind::Fact,
+            Some("phone_model"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let ev6_new = match store
+        .record_evidence(&scope, &origin, 8, "user", "user", &at(16), "用户手机型号为iPhone 16 Pro")
+        .unwrap()
+    {
+        IngestOutcome::Recorded(id) => id,
+        _ => unreachable!(),
+    };
+    let c6_new = match store
+        .supersede_ext(
+            &scope,
+            &c6_old,
+            &origin,
+            &ev6_new,
+            "用户手机型号为iPhone 16 Pro",
+            MemoryKind::Fact,
+            Some("phone_model"),
+            Some("global"),
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        RememberOutcome::Created { memory_id, .. } => memory_id,
+        _ => unreachable!(),
+    };
+
+    let scope_dir = store.scope_dir(&scope).unwrap();
+    let c5_a_path = claim_path(&scope_dir, &c5_a).unwrap();
+    let mut c5_a_doc = ClaimDocument::parse(&fs::read(&c5_a_path).unwrap()).unwrap();
+    c5_a_doc.front.updated_at = "2026-10-24T12:00:00Z".to_string();
+    atomic_replace(&c5_a_path, &c5_a_doc.to_bytes().unwrap()).unwrap();
+
+    let c5_b_path = claim_path(&scope_dir, &c5_b).unwrap();
+    let mut c5_b_doc = ClaimDocument::parse(&fs::read(&c5_b_path).unwrap()).unwrap();
+    c5_b_doc.front.updated_at = "2026-10-24T12:00:00Z".to_string();
+    atomic_replace(&c5_b_path, &c5_b_doc.to_bytes().unwrap()).unwrap();
+
+    store.rebuild_index(&scope).unwrap();
+
+    // 生成 Golden Bundle（查询覆盖咖啡、中文回答、研讨会、安全审计、配色、手机、以及零命中的「火星探测」）
+    let bundle = store
+        .context_bundle_ext(
+            &scope,
+            "agent",
+            "咖啡 中文回答 研讨会 安全审计 配色 手机 火星探测",
+            None,
+            None,
+            Some(0),
+            true,  // include_history 为 true，以便展示 superseded 条目的更正链摘要行
+            false, // audit = false 默认形态
+        )
+        .unwrap();
+
+    let full_text = bundle.retrieved["text"].as_str().unwrap();
+
+    println!("\n==================== F6' GOLDEN BUNDLE FULL TEXT ====================\n{}\n====================================================================\n", full_text);
+
+    // 六项定案逐项断言：
+    // 1. slot 与 precedence 成对，缺 slot 标 <missing>
+    assert!(full_text.contains(&c1));
+    assert!(full_text.contains("slot=beverage_coffee, speaker=user"));
+    assert!(full_text.contains("source=[user_explicit]"));
+    assert!(full_text.contains("precedence=global") || full_text.contains("precedence=session"));
+    assert!(full_text.contains(&c2));
+    assert!(full_text.contains(&c3));
+    assert!(full_text.contains(&c4));
+
+    // 2. 裁决链对齐
+    assert!(full_text.contains("[PRIORITY & CONFLICT RULES]"));
+    assert!(full_text.contains("1. 裁决链顺位：本轮显式指令 > 用户显式更正 > session > project > global > 无记忆。"));
+    assert!(full_text.contains("2. 权威约束：不覆盖系统/开发者指令、本轮用户明确指令优先。"));
+    assert!(full_text.contains("3. 同层裁决：同 slot 同层级条目取 updated_at 较新者。"));
+    assert!(full_text.contains("4. 冲突标注：若仍存在同 slot/同层级冲突，系统不注入冲突项，仅在 conflict_notes 显式标注。"));
+
+    // 冲突项不进正文段，仅在 conflict_notes 出现
+    let memories_block = full_text.split("[MEMORIES]").nth(1).unwrap().split("[CONFLICT NOTES]").next().unwrap();
+    assert!(!memories_block.contains(&c5_a), "冲突项 c5_a 不注入正文段");
+    assert!(!memories_block.contains(&c5_b), "冲突项 c5_b 不注入正文段");
+    assert!(full_text.contains("[CONFLICT NOTES]"));
+    assert!(full_text.contains(&c5_a));
+    assert!(full_text.contains(&c5_b));
+
+    // 3. 事件时间窗：带窗与缺窗标注
+    assert!(full_text.contains("valid_from=2026-10-20T09:00:00Z, valid_to=2026-10-30T18:00:00Z"));
+    assert!(full_text.contains("valid_from=<missing>, valid_to=<missing>"));
+
+    // 4. superseded 摘要行：默认不注入旧正文，只留一行更正链摘要
+    assert!(full_text.contains(&format!("- [claim: {}] status=superseded", c6_old)));
+    assert!(full_text.contains(&format!("[更正链摘要: 本条已被新条目 {} 取代]", c6_new)));
+    assert!(!full_text.contains("iPhone 13"), "默认形态不得注入被取代的旧正文 iPhone 13");
+    assert!(full_text.contains("iPhone 16 Pro"), "新条目正常注入");
+
+    // 5. coverage signals
+    assert!(full_text.contains("[COVERAGE SIGNALS]"));
+    assert!(full_text.contains("未命中主题 (unmatched_topics): [\"火星探测\"] (库里没有相关记录)"));
+
+    // 6. override_signal 三层
+    assert!(full_text.contains("[OVERRIDE SIGNALS]"));
+    assert!(full_text.contains("1. 按 ID 覆盖 (override_by_id)"));
+    assert!(full_text.contains("2. 按 Slot 覆盖 (override_by_slot)"));
+    assert!(full_text.contains("3. 整块覆盖 (override_all)"));
+    assert!(full_text.contains("\"忽略记忆\"默认只对当前轮/会话生效，不覆盖系统/开发者指令"));
+}
+

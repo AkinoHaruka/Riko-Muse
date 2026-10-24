@@ -35,9 +35,12 @@ pub use bank::{
 };
 pub use index::{IndexFreshness, IndexManifest, IndexRebuildReport, ProjectionIndex};
 pub use read::{
-    detect_conflicts, format_bundle_entry, is_claim_visible, is_claim_visible_with_options,
-    speaker_of, BundleConflict, EvidenceDetail, ExplainRelations, FileBundleResult, FileReader,
-    FileSearchHit, MemoryExplain, ResolvedSourceInfo, BUNDLE_PRIORITY_RULES_HEADER,
+    derive_claim_precedence, derive_claim_slot, detect_conflicts, detect_conflicts_and_adjudicate,
+    format_bundle_entry, format_bundle_entry_with_audit, is_claim_visible,
+    is_claim_visible_with_options, is_pin_or_instruction, precedence_rank, resolve_claim_source,
+    resolve_entry_source, sort_hits_by_precedence_and_time, sort_hits_by_settled_order, speaker_of,
+    BundleConflict, EvidenceDetail, ExplainRelations, FileBundleResult, FileReader, FileSearchHit,
+    MemoryExplain, ResolvedSourceInfo, BUNDLE_PRIORITY_RULES_HEADER,
 };
 pub use vectors::{cosine_similarity, VectorEntryMeta, VectorManifest, VectorRecord, VectorStore};
 
@@ -386,9 +389,35 @@ impl FileStore {
         quote: &str,
         kind: MemoryKind,
     ) -> Result<RememberOutcome, StoreError> {
+        self.remember_ext(scope, origin, user_evidence_id, quote, kind, None, None, None, None)
+    }
+
+    pub fn remember_ext(
+        &self,
+        scope: &ScopeKey,
+        origin: &Origin,
+        user_evidence_id: &str,
+        quote: &str,
+        kind: MemoryKind,
+        slot: Option<&str>,
+        precedence: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+    ) -> Result<RememberOutcome, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
         let _lock = self.lock_scope_exclusive(&scope_dir)?;
-        self.remember_locked(&scope_dir, origin, user_evidence_id, quote, kind, None)
+        self.remember_locked(
+            &scope_dir,
+            origin,
+            user_evidence_id,
+            quote,
+            kind,
+            None,
+            slot,
+            precedence,
+            valid_from,
+            valid_until,
+        )
     }
 
     pub fn supersede(
@@ -399,6 +428,22 @@ impl FileStore {
         user_evidence_id: &str,
         quote: &str,
         kind: MemoryKind,
+    ) -> Result<RememberOutcome, StoreError> {
+        self.supersede_ext(scope, old_memory_id, origin, user_evidence_id, quote, kind, None, None, None, None)
+    }
+
+    pub fn supersede_ext(
+        &self,
+        scope: &ScopeKey,
+        old_memory_id: &str,
+        origin: &Origin,
+        user_evidence_id: &str,
+        quote: &str,
+        kind: MemoryKind,
+        slot: Option<&str>,
+        precedence: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
     ) -> Result<RememberOutcome, StoreError> {
         validate_uuid(old_memory_id)?;
         let scope_dir = self.scope_dir(scope)?;
@@ -416,6 +461,10 @@ impl FileStore {
             quote,
             kind,
             Some(old_memory_id),
+            slot,
+            precedence,
+            valid_from,
+            valid_until,
         )?;
         let new_claim = match doc_or_dedup {
             Ok(c) => c,
@@ -610,6 +659,30 @@ impl FileStore {
         relationships: Option<&[(String, String, String)]>,
         compact_max_items: Option<usize>,
     ) -> Result<FileBundleResult, StoreError> {
+        self.context_bundle_ext(
+            scope,
+            agent_id,
+            query,
+            alignment_doc,
+            relationships,
+            compact_max_items,
+            false,
+            false,
+        )
+    }
+
+    /// Build context bundle with history and audit control options.
+    pub fn context_bundle_ext(
+        &self,
+        scope: &ScopeKey,
+        agent_id: &str,
+        query: &str,
+        alignment_doc: Option<&str>,
+        relationships: Option<&[(String, String, String)]>,
+        compact_max_items: Option<usize>,
+        include_history: bool,
+        audit: bool,
+    ) -> Result<FileBundleResult, StoreError> {
         let scope_dir = self.scope_dir(scope)?;
         let _lock = self.lock_scope_shared(&scope_dir)?;
         let overview = self.get_overview(scope)?;
@@ -617,7 +690,7 @@ impl FileStore {
         let all_claims = self.all_claims_dir(&scope_dir)?;
         let suppressions = self.read_suppressions(&scope_dir)?;
         let soul_doc = self.get_soul_locked(&scope_dir, agent_id)?;
-        FileReader::context_bundle(
+        FileReader::context_bundle_ext(
             &scope_dir,
             agent_id,
             soul_doc.as_ref(),
@@ -629,6 +702,8 @@ impl FileStore {
             &all_evidence,
             &all_claims,
             &suppressions,
+            include_history,
+            audit,
         )
     }
 
@@ -980,6 +1055,10 @@ impl FileStore {
         quote: &str,
         kind: MemoryKind,
         supersedes: Option<&str>,
+        slot: Option<&str>,
+        precedence: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
     ) -> Result<Result<ClaimDocument, RememberOutcome>, StoreError> {
         validate_uuid(evidence_id)?;
         let evidence = self
@@ -1060,8 +1139,8 @@ impl FileStore {
                 claim_sha256: c_sha256,
                 normalized_claim: normalize_v1(&body),
                 occurred_at: Some(evidence.header.occurred_at.clone()),
-                valid_from: None,
-                valid_until: None,
+                valid_from: valid_from.map(str::to_owned),
+                valid_until: valid_until.map(str::to_owned),
                 origin_host_id: origin.host_id.clone(),
                 origin_agent_id: origin.agent_id.clone(),
                 created_at: time.clone(),
@@ -1073,6 +1152,8 @@ impl FileStore {
                 },
                 reason_text: None,
                 supersedes: supersedes.map(str::to_owned),
+                slot: slot.map(str::to_owned),
+                precedence: precedence.map(str::to_owned),
                 evidence: vec![ClaimEvidenceRef {
                     id: evidence_id.to_owned(),
                     start_byte: Some(start as u64),
@@ -1093,8 +1174,23 @@ impl FileStore {
         quote: &str,
         kind: MemoryKind,
         supersedes: Option<&str>,
+        slot: Option<&str>,
+        precedence: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
     ) -> Result<RememberOutcome, StoreError> {
-        match self.prepare_new_claim(scope_dir, origin, evidence_id, quote, kind, supersedes)? {
+        match self.prepare_new_claim(
+            scope_dir,
+            origin,
+            evidence_id,
+            quote,
+            kind,
+            supersedes,
+            slot,
+            precedence,
+            valid_from,
+            valid_until,
+        )? {
             Ok(claim) => {
                 let id = claim.front.id.clone();
                 atomic_replace(&claim_path(scope_dir, &id)?, &claim.to_bytes()?)?;
