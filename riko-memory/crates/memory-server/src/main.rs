@@ -21,10 +21,9 @@ use memory_contract::{
     SCHEMA_VERSION, SEARCH_QUERY_MAX_CHARS,
 };
 use memory_domain::{find_quote_span, MemoryKind, Origin, ScopeKey};
-use memory_store_sqlite::{
-    CandidateDetail, ComposeResult, FlushOutcome, IngestOutcome, JobDoctorStats, RememberOutcome,
-    SearchHit, Store, StoreError,
-};
+mod store_compat;
+use store_compat as memory_store_sqlite;
+use store_compat::*;
 use serde::Deserialize;
 use uuid::Uuid;
 

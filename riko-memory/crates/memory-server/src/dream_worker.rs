@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use memory_domain::{claim_sha256, fold_whitespace, MemoryKind, ScopeKey};
 use memory_extract::{ExtractError, ExtractModel};
+use crate::store_compat as memory_store_sqlite;
 use memory_store_sqlite::adjudication::{
     parse_adjudicate_v1, AdjudicationCandidate, AdjudicationJobRow, AdjudicationProposal,
     AdjudicationRecall, AdjudicationRedecision, ADJUDICATE_V1_PROMPT, ADJUDICATE_V2_PROMPT,
@@ -171,7 +172,7 @@ async fn process_dream_extract<M: ExtractModel>(
             }
             Err(FreezeError::Store(e)) => {
                 eprintln!("[dream] 重裁 {} 冻结失败: {e}", job.id);
-                let mut g = state.store.lock().unwrap();
+                let g = state.store.lock().unwrap();
                 let _ = g.dream_dead(
                     scope,
                     &job.id,
@@ -197,7 +198,7 @@ async fn process_dream_extract<M: ExtractModel>(
             }
             Err(e) => {
                 eprintln!("[dream] job {} 冻结输入读取失败: {e}", job.id);
-                let mut g = state.store.lock().unwrap();
+                let g = state.store.lock().unwrap();
                 let _ = g.dream_dead(scope, &job.id, job.claim_generation, "FROZEN_INPUT_MISSING");
                 return;
             }
@@ -208,7 +209,7 @@ async fn process_dream_extract<M: ExtractModel>(
         memory_store_sqlite::dream_jobs::DREAM_EXTRACT_V1 => DREAM_EXTRACT_V1_PROMPT,
         memory_store_sqlite::dream_jobs::DREAM_EXTRACT_V2 => DREAM_EXTRACT_V2_PROMPT,
         _ => {
-            let mut g = state.store.lock().unwrap();
+            let g = state.store.lock().unwrap();
             let _ = g.dream_dead(
                 scope,
                 &job.id,
@@ -260,7 +261,7 @@ async fn process_dream_extract<M: ExtractModel>(
         }
         Err(_) => {
             // 坏 JSON/未知 kind = 确定性失败：dead 不重试（doc6/09 §7）。
-            let mut g = state.store.lock().unwrap();
+            let g = state.store.lock().unwrap();
             let _ = g.dream_dead(scope, &job.id, job.claim_generation, "BAD_JSON");
             eprintln!("[dream] job {} 抽取输出坏 JSON → dead", job.id);
             return;

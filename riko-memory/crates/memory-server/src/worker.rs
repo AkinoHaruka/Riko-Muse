@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use memory_domain::{Origin, ScopeKey};
 use memory_extract::{Admission, ExtractError, ExtractModel, ExtractOutput, Extraction};
+use crate::store_compat as memory_store_sqlite;
 use memory_store_sqlite::{FailOutcome, JobRow, StoreError};
 
 use crate::AppState;

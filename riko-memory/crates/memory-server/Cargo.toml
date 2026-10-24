@@ -12,9 +12,12 @@ path = "src/main.rs"
 [dependencies]
 memory-contract.workspace = true
 memory-domain.workspace = true
-memory-store-sqlite.workspace = true
+memory-file-format.workspace = true
+memory-store-file.workspace = true
 memory-extract.workspace = true
 memory-recall.workspace = true
+thiserror.workspace = true
+sha2 = "0.10"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 serde.workspace = true
